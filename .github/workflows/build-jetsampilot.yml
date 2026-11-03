@@ -3,9 +3,16 @@ name: build-jetsampilot
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
+    tags:
+      - "v*"
     paths:
       - "src/**"
       - ".github/workflows/build-jetsampilot.yml"
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -46,3 +53,10 @@ jobs:
         with:
           name: JetsamPilot
           path: src/JetsamPilot.tipa
+
+      # 打 tag（如 v0.1.1）并 push 后，自动把 .tipa 挂到对应 Release 下
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: src/JetsamPilot.tipa
