@@ -2269,11 +2269,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 - (void)refreshKilledStatsIfNeeded:(BOOL)force {
     if (!self.killedStatsCard) return;
 
-    // 签名 = JetsamEvent 文件数 + 最新文件名 + 规则数；只列目录，不读文件，开销很小
+    // 签名 = 当天日期 + JetsamEvent 文件数 + 最新文件名 + 规则数；只列目录，不读文件，开销很小
+    // 日期保证半夜无新日志时 7 天窗口也能往前滚（每天最多因此多解析一次）
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDateComponents *dc = [cal components:(NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay)
+                                  fromDate:[NSDate date]];
+    NSString *day = [NSString stringWithFormat:@"%ld-%02ld-%02ld",
+                     (long)dc.year, (long)dc.month, (long)dc.day];
     NSArray *files = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:kCrashReporterDir error:nil]
         filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"SELF BEGINSWITH 'JetsamEvent-'"]];
     NSString *newest = [[files sortedArrayUsingSelector:@selector(compare:)] lastObject] ?: @"";
-    NSString *sig = [NSString stringWithFormat:@"%lu|%@|%lu",
+    NSString *sig = [NSString stringWithFormat:@"%@|%lu|%@|%lu", day,
                      (unsigned long)files.count, newest, (unsigned long)self.rules.count];
     if (!force && [sig isEqualToString:self.killStatsLastSig]) return;
 
