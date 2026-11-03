@@ -104,6 +104,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) unsigned long setFailTotal;
 @property (nonatomic, assign) BOOL hasSetFailTotal;
 @property (nonatomic, assign) int lastErrorErrno;
+@property (nonatomic, copy) NSString *lastErrorText;
 @property (nonatomic, assign) pid_t lastErrorPid;
 @property (nonatomic, assign) int lastErrorTarget;
 @property (nonatomic, copy) NSString *lastErrorTime;
@@ -163,6 +164,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     st.setFailTotal = 0;
     st.hasSetFailTotal = NO;
     st.lastErrorErrno = 0;
+    st.lastErrorText = @"";
     st.lastErrorPid = 0;
     st.lastErrorTarget = 0;
     st.lastErrorTime = @"";
@@ -207,11 +209,22 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             @try {
                 NSString *rawErr = [line substringFromIndex:11];
                 NSArray<NSString *> *parts = [rawErr componentsSeparatedByString:@"|"];
+                // 5 字段：errno|errtext|pid|target|time（v0.5.1+ daemon）；4 字段为旧版（无 errtext）
                 if (parts.count >= 4) {
-                    NSString *eStr = [parts[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                    NSString *pStr = [parts[1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                    NSString *tStr = [parts[2] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                    NSString *timeStr = [parts[3] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
+                    NSString *eStr = [parts[0] stringByTrimmingCharactersInSet:ws];
+                    NSString *errText = @"";
+                    NSString *pStr, *tStr, *timeStr;
+                    if (parts.count >= 5) {
+                        errText = [parts[1] stringByTrimmingCharactersInSet:ws];
+                        pStr = [parts[2] stringByTrimmingCharactersInSet:ws];
+                        tStr = [parts[3] stringByTrimmingCharactersInSet:ws];
+                        timeStr = [parts[4] stringByTrimmingCharactersInSet:ws];
+                    } else {
+                        pStr = [parts[1] stringByTrimmingCharactersInSet:ws];
+                        tStr = [parts[2] stringByTrimmingCharactersInSet:ws];
+                        timeStr = [parts[3] stringByTrimmingCharactersInSet:ws];
+                    }
 
                     int eVal = 0, pVal = 0, tVal = 0;
                     NSScanner *s1 = [NSScanner scannerWithString:eStr];
@@ -224,6 +237,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
                         timeStr.length > 0) {
                         st.hasLastError = YES;
                         st.lastErrorErrno = eVal;
+                        st.lastErrorText = errText;
                         st.lastErrorPid = (pid_t)pVal;
                         st.lastErrorTarget = tVal;
                         st.lastErrorTime = timeStr;
@@ -303,26 +317,17 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 #pragma mark - Matching Helpers & Jetsam Models
 
 static BOOL FragmentMatchesProcessName(NSString *frag, NSString *procName) {
-    if (!frag || frag.length == 0 || !procName || procName.length == 0) return NO;
-    if ([procName rangeOfString:frag options:NSCaseInsensitiveSearch].location != NSNotFound) {
-        return YES;
-    }
-    if ([frag rangeOfString:procName options:NSCaseInsensitiveSearch].location != NSNotFound) {
-        return YES;
-    }
-    NSString *cleanFrag = frag;
-    if ([cleanFrag hasSuffix:@"/"]) {
-        cleanFrag = [cleanFrag substringToIndex:cleanFrag.length - 1];
-    }
-    if ([[cleanFrag pathExtension] localizedCaseInsensitiveCompare:@"app"] == NSOrderedSame) {
-        cleanFrag = [cleanFrag stringByDeletingPathExtension];
-    }
-    if ([procName rangeOfString:cleanFrag options:NSCaseInsensitiveSearch].location != NSNotFound ||
-        [cleanFrag rangeOfString:procName options:NSCaseInsensitiveSearch].location != NSNotFound) {
-        return YES;
-    }
-    return NO;
+    if (frag.length == 0 || procName.length == 0) return NO;
+    NSString *clean = frag;
+    if ([clean hasSuffix:@"/"]) clean = [clean substringToIndex:clean.length - 1];
+    if ([clean.pathExtension caseInsensitiveCompare:@"app"] == NSOrderedSame)
+        clean = [clean stringByDeletingPathExtension];
+    if (clean.length < 3) return NO;   // 太短的片段不参与匹配，避免误判
+    return [procName rangeOfString:clean options:NSCaseInsensitiveSearch].location != NSNotFound;
 }
+
+// 真机待测：Reynard 的扩展子进程在 JetsamEvent 里的 name 可能不带 "Reynard"，
+// 装好后看一份真实日志，必要时给规则加别名。
 
 static NSString *ResolveDisplayNameHelper(NSString *frag, NSArray<JPInstalledApp *> *apps) {
     if (!frag || frag.length == 0) return @"";
@@ -955,8 +960,9 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         self.failureCountLabel.text = [NSString stringWithFormat:@"提权失败 ×%lu", status.setFailTotal];
 
         if (status.hasLastError) {
-            NSString *errName = ErrnoName(status.lastErrorErrno);
-            NSString *errnoStr = errName ? [NSString stringWithFormat:@"errno %d (%@)", status.lastErrorErrno, errName]
+            // daemon 直接给的错误文本优先（v0.5.1+）；旧版只有错误号时用本地映射兜底
+            NSString *errText = status.lastErrorText.length > 0 ? status.lastErrorText : ErrnoName(status.lastErrorErrno);
+            NSString *errnoStr = errText ? [NSString stringWithFormat:@"errno %d (%@)", status.lastErrorErrno, errText]
                                          : [NSString stringWithFormat:@"errno %d", status.lastErrorErrno];
             NSString *timeStr = FormatShortTimestamp(status.lastErrorTime);
             self.failureDetailLabel.text = [NSString stringWithFormat:@"最近：pid %d → 目标 %d · %@ · %@",
@@ -1789,6 +1795,9 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 @property (nonatomic, strong) JPStatusCardView *statusCard;
 @property (nonatomic, strong) JPKilledStatsCardView *killedStatsCard;
+// 被杀统计的后台串行队列 + 世代计数：解析放后台，过期结果丢弃
+@property (nonatomic, strong) dispatch_queue_t killStatsQueue;
+@property (nonatomic, assign) NSInteger killStatsGeneration;
 @property (nonatomic, strong) UILabel *rulesSectionHeaderLabel;
 @property (nonatomic, strong) UIStackView *rulesStackView;
 @property (nonatomic, strong) UIView *addRuleCard;
@@ -1807,6 +1816,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.navigationController.navigationBar.prefersLargeTitles = YES;
 
     self.rules = [NSMutableArray array];
+    self.killStatsQueue = dispatch_queue_create("com.lili.jetsampilot.killstats", DISPATCH_QUEUE_SERIAL);
 
     NSFileManager *fm = NSFileManager.defaultManager;
     [fm createDirectoryAtPath:kDir withIntermediateDirectories:YES
@@ -2189,10 +2199,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         }
     }
     self.rulesSectionHeaderLabel.text = [NSString stringWithFormat:@"保护规则 (%lu)", (unsigned long)self.rules.count];
-    if (self.killedStatsCard) {
-        JPKilledStatsInfo *stats = [JPKilledStatsInfo loadStatsForRules:self.rules installedApps:self.installedApps];
-        [self.killedStatsCard updateWithStats:stats];
-    }
+    [self refreshKilledStatsCardAsync];
 }
 
 #pragma mark - Daemon Control
@@ -2254,13 +2261,30 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [self refreshStatus];
 }
 
+// 被杀统计涉及磁盘 IO + JSON 解析，放后台串行队列执行，结果回主线程刷 UI。
+// 世代计数保证快速连续刷新时只有最后一次的结果生效。
+- (void)refreshKilledStatsCardAsync {
+    if (!self.killedStatsCard) return;
+    self.killStatsGeneration++;
+    NSInteger gen = self.killStatsGeneration;
+    NSArray *rulesCopy = [self.rules copy];
+    NSArray *appsCopy = [self.installedApps copy];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(self.killStatsQueue, ^{
+        JPKilledStatsInfo *stats = [JPKilledStatsInfo loadStatsForRules:rulesCopy installedApps:appsCopy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || strongSelf.killStatsGeneration != gen) return;
+            [strongSelf.killedStatsCard updateWithStats:stats];
+        });
+    });
+}
+
 - (void)refreshStatus {
     BOOL running = [self isDaemonRunning];
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     [self.statusCard updateWithStatus:st isRunning:running];
-
-    JPKilledStatsInfo *stats = [JPKilledStatsInfo loadStatsForRules:self.rules installedApps:self.installedApps];
-    [self.killedStatsCard updateWithStats:stats];
+    [self refreshKilledStatsCardAsync];
 }
 
 #pragma mark - JPRuleCardViewDelegate

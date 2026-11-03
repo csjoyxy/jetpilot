@@ -87,6 +87,7 @@ static int g_locked_passes = 0;
 /* set_priority 失败记录：供 App 在状态页红字展示（不用 stderr，常驻进程 setsid 后没人读） */
 static unsigned long g_set_fail_total = 0;
 static int      g_last_err_no = 0;
+static char     g_last_err_text[128] = "";
 static pid_t    g_last_err_pid = 0;
 static int32_t  g_last_err_target = 0;
 static char     g_last_err_time[64] = "";
@@ -140,6 +141,17 @@ static int set_priority(pid_t pid, int32_t band) {
         /* EPERM 多半是缺权限；记下来写进 status.txt，App 端红字展示 */
         g_set_fail_total++;
         g_last_err_no = errno;
+        {
+            /* 错误文本一并记录；管道符替换掉以免破坏字段分隔 */
+            const char *es = strerror(errno);
+            size_t n = 0;
+            while (es[n] && n < sizeof(g_last_err_text) - 1) {
+                char c = es[n];
+                g_last_err_text[n] = (c == '|') ? '/' : c;
+                n++;
+            }
+            g_last_err_text[n] = '\0';
+        }
         g_last_err_pid = pid;
         g_last_err_target = band;
         time_t t = time(NULL);
@@ -191,7 +203,10 @@ typedef struct {
 
 static void write_status(int protected_now, int demoted_now,
                          protected_entry_t *plist, int nplist) {
-    FILE *f = fopen(STATUS_PATH, "w");
+    /* 先写临时文件再 rename，原子替换：App 永远读不到写一半的 status.txt */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", STATUS_PATH);
+    FILE *f = fopen(tmp, "w");
     if (!f) return;
     time_t t = time(NULL);
     char ts[64]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
@@ -201,12 +216,16 @@ static void write_status(int protected_now, int demoted_now,
     /* 失败记录：无失败时只写总数 0，App 端隐藏红色区域 */
     fprintf(f, "set_fail_total=%lu\n", g_set_fail_total);
     if (g_set_fail_total > 0)
-        fprintf(f, "last_error=%d|%d|%d|%s\n",
-                g_last_err_no, (int)g_last_err_pid, g_last_err_target, g_last_err_time);
+        fprintf(f, "last_error=%d|%s|%d|%d|%s\n",
+                g_last_err_no, g_last_err_text,
+                (int)g_last_err_pid, g_last_err_target, g_last_err_time);
     for (int i = 0; i < nplist; i++)
         fprintf(f, "protected_app=%s|%d|%d|%d\n",
                 plist[i].frag, (int)plist[i].pid, plist[i].cur, plist[i].target);
+    int werr = ferror(f);  /* 必须在 fclose 之前查 */
     fclose(f);
+    if (werr) { unlink(tmp); return; }  /* 写坏了就不转正，保留旧 status.txt */
+    rename(tmp, STATUS_PATH);
 }
 
 static int g_locked = 0;
