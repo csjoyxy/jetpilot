@@ -62,6 +62,16 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @implementation JPRule
 @end
 
+@interface JPProtectedApp : NSObject
+@property (nonatomic, copy) NSString *pathFragment;
+@property (nonatomic, assign) pid_t pid;
+@property (nonatomic, assign) NSInteger currentBand;
+@property (nonatomic, assign) NSInteger targetBand;
+@end
+
+@implementation JPProtectedApp
+@end
+
 @interface JPStatusInfo : NSObject
 @property (nonatomic, copy) NSString *updated;
 @property (nonatomic, assign) NSInteger protectRules;
@@ -69,16 +79,64 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) NSInteger protectedPids;
 @property (nonatomic, assign) NSInteger demotedPids;
 @property (nonatomic, assign) unsigned long reassertsTotal;
+@property (nonatomic, copy) NSArray<JPProtectedApp *> *protectedApps;
+@property (nonatomic, assign) BOOL hasProtectedAppLines;
 + (JPStatusInfo *)loadCurrentStatus;
++ (JPProtectedApp *)parseProtectedAppLine:(NSString *)line;
 @end
 
 @implementation JPStatusInfo
+
++ (JPProtectedApp *)parseProtectedAppLine:(NSString *)line {
+    if (!line || ![line hasPrefix:@"protected_app="]) return nil;
+    NSString *raw = [line substringFromIndex:14];
+    NSArray<NSString *> *parts = [raw componentsSeparatedByString:@"|"];
+    if (parts.count != 4) return nil;
+
+    NSString *frag = [parts[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (frag.length == 0) return nil;
+
+    NSString *pidStr = [parts[1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (pidStr.length == 0) return nil;
+    NSScanner *pidScanner = [NSScanner scannerWithString:pidStr];
+    int pidVal = 0;
+    if (![pidScanner scanInt:&pidVal] || ![pidScanner isAtEnd] || pidVal <= 0) {
+        return nil;
+    }
+
+    NSString *curStr = [parts[2] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (curStr.length == 0) return nil;
+    NSScanner *curScanner = [NSScanner scannerWithString:curStr];
+    int curVal = 0;
+    if (![curScanner scanInt:&curVal] || ![curScanner isAtEnd]) {
+        return nil;
+    }
+
+    NSString *targetStr = [parts[3] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (targetStr.length == 0) return nil;
+    NSScanner *targetScanner = [NSScanner scannerWithString:targetStr];
+    int targetVal = 0;
+    if (![targetScanner scanInt:&targetVal] || ![targetScanner isAtEnd]) {
+        return nil;
+    }
+
+    JPProtectedApp *app = [JPProtectedApp new];
+    app.pathFragment = frag;
+    app.pid = (pid_t)pidVal;
+    app.currentBand = curVal;
+    app.targetBand = targetVal;
+    return app;
+}
+
 + (JPStatusInfo *)loadCurrentStatus {
     JPStatusInfo *st = [JPStatusInfo new];
     st.updated = @"";
+    st.protectedApps = @[];
+    st.hasProtectedAppLines = NO;
     NSString *raw = [NSString stringWithContentsOfFile:kStatus encoding:NSUTF8StringEncoding error:nil];
     if (!raw || raw.length == 0) return st;
 
+    NSMutableArray<JPProtectedApp *> *apps = [NSMutableArray array];
     NSArray<NSString *> *lines = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
     for (NSString *line in lines) {
         if ([line hasPrefix:@"updated="]) {
@@ -93,8 +151,15 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             st.demotedPids = [[line substringFromIndex:13] integerValue];
         } else if ([line hasPrefix:@"reasserts_total="]) {
             st.reassertsTotal = (unsigned long)[[line substringFromIndex:16] longLongValue];
+        } else if ([line hasPrefix:@"protected_app="]) {
+            st.hasProtectedAppLines = YES;
+            JPProtectedApp *app = [self parseProtectedAppLine:line];
+            if (app) {
+                [apps addObject:app];
+            }
         }
     }
+    st.protectedApps = [apps copy];
     return st;
 }
 @end
@@ -170,7 +235,9 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, strong) UILabel *demotedCountLabel;
 @property (nonatomic, strong) UILabel *reassertCountLabel;
 @property (nonatomic, strong) UIButton *actionButton;
+@property (nonatomic, strong) UIView *protectedColumn;
 @property (nonatomic, copy) void (^onActionToggle)(void);
+@property (nonatomic, copy) void (^onTapProtected)(void);
 
 - (void)updateWithStatus:(JPStatusInfo *)status isRunning:(BOOL)isRunning;
 @end
@@ -237,15 +304,24 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     div1.backgroundColor = UIColor.separatorColor;
 
     UILabel *pLabel = nil;
-    UIView *col1 = [self createColumnWithTitle:@"保护中进程" numberLabel:&pLabel tintColor:UIColor.systemGreenColor];
+    UIView *col1 = [self createColumnWithTitle:@"保护中进程" numberLabel:&pLabel tintColor:UIColor.systemGreenColor hasChevron:YES];
     self.protectedCountLabel = pLabel;
+    self.protectedColumn = col1;
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(protectedColumnTapped)];
+    [col1 addGestureRecognizer:tap];
+    col1.userInteractionEnabled = YES;
+    col1.isAccessibilityElement = YES;
+    col1.accessibilityTraits = UIAccessibilityTraitButton;
+    col1.accessibilityLabel = @"保护中进程";
+    col1.accessibilityHint = @"点击查看受保护的 App 名单";
 
     UILabel *dLabel = nil;
-    UIView *col2 = [self createColumnWithTitle:@"降级中进程" numberLabel:&dLabel tintColor:UIColor.systemOrangeColor];
+    UIView *col2 = [self createColumnWithTitle:@"降级中进程" numberLabel:&dLabel tintColor:UIColor.systemOrangeColor hasChevron:NO];
     self.demotedCountLabel = dLabel;
 
     UILabel *rLabel = nil;
-    UIView *col3 = [self createColumnWithTitle:@"累计生效" numberLabel:&rLabel tintColor:UIColor.systemBlueColor];
+    UIView *col3 = [self createColumnWithTitle:@"累计生效" numberLabel:&rLabel tintColor:UIColor.systemBlueColor hasChevron:NO];
     self.reassertCountLabel = rLabel;
 
     UIStackView *metricsStack = [[UIStackView alloc] initWithArrangedSubviews:@[col1, col2, col3]];
@@ -299,7 +375,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     ]];
 }
 
-- (UIView *)createColumnWithTitle:(NSString *)title numberLabel:(UILabel **)labelOut tintColor:(UIColor *)tint {
+- (UIView *)createColumnWithTitle:(NSString *)title numberLabel:(UILabel **)labelOut tintColor:(UIColor *)tint hasChevron:(BOOL)hasChevron {
     UIView *box = [UIView new];
     box.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -318,21 +394,64 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     txt.text = title;
 
     [box addSubview:num];
-    [box addSubview:txt];
 
     [NSLayoutConstraint activateConstraints:@[
         [num.topAnchor constraintEqualToAnchor:box.topAnchor],
         [num.leadingAnchor constraintEqualToAnchor:box.leadingAnchor],
         [num.trailingAnchor constraintEqualToAnchor:box.trailingAnchor],
-
-        [txt.topAnchor constraintEqualToAnchor:num.bottomAnchor constant:4],
-        [txt.leadingAnchor constraintEqualToAnchor:box.leadingAnchor],
-        [txt.trailingAnchor constraintEqualToAnchor:box.trailingAnchor],
-        [txt.bottomAnchor constraintEqualToAnchor:box.bottomAnchor]
     ]];
+
+    if (hasChevron) {
+        UIImageView *chev = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+        chev.translatesAutoresizingMaskIntoConstraints = NO;
+        chev.tintColor = UIColor.tertiaryLabelColor;
+        chev.contentMode = UIViewContentModeScaleAspectFit;
+
+        UIStackView *titleStack = [[UIStackView alloc] initWithArrangedSubviews:@[txt, chev]];
+        titleStack.translatesAutoresizingMaskIntoConstraints = NO;
+        titleStack.axis = UILayoutConstraintAxisHorizontal;
+        titleStack.alignment = UIStackViewAlignmentCenter;
+        titleStack.spacing = 2;
+        titleStack.userInteractionEnabled = NO;
+
+        [box addSubview:titleStack];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [chev.widthAnchor constraintEqualToConstant:7],
+            [chev.heightAnchor constraintEqualToConstant:10],
+
+            [titleStack.topAnchor constraintEqualToAnchor:num.bottomAnchor constant:4],
+            [titleStack.centerXAnchor constraintEqualToAnchor:box.centerXAnchor],
+            [titleStack.bottomAnchor constraintEqualToAnchor:box.bottomAnchor],
+            [titleStack.leadingAnchor constraintGreaterThanOrEqualToAnchor:box.leadingAnchor],
+            [titleStack.trailingAnchor constraintLessThanOrEqualToAnchor:box.trailingAnchor]
+        ]];
+    } else {
+        [box addSubview:txt];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [txt.topAnchor constraintEqualToAnchor:num.bottomAnchor constant:4],
+            [txt.leadingAnchor constraintEqualToAnchor:box.leadingAnchor],
+            [txt.trailingAnchor constraintEqualToAnchor:box.trailingAnchor],
+            [txt.bottomAnchor constraintEqualToAnchor:box.bottomAnchor]
+        ]];
+    }
 
     if (labelOut) *labelOut = num;
     return box;
+}
+
+- (void)protectedColumnTapped {
+    [UIView animateWithDuration:0.1 animations:^{
+        self.protectedColumn.alpha = 0.5;
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.15 animations:^{
+            self.protectedColumn.alpha = 1.0;
+        }];
+    }];
+    if (self.onTapProtected) {
+        self.onTapProtected();
+    }
 }
 
 - (void)actionButtonTapped {
@@ -803,6 +922,192 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 
 @end
 
+#pragma mark - Controllers: Protected List
+
+@interface JPProtectedListViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, strong) UIView *emptyView;
+@property (nonatomic, strong) UIImageView *emptyIconView;
+@property (nonatomic, strong) UILabel *emptyLabel;
+@property (nonatomic, strong) NSTimer *pollingTimer;
+@property (nonatomic, strong) JPStatusInfo *status;
+@property (nonatomic, copy) NSString * (^nameResolver)(NSString *frag);
+@end
+
+@implementation JPProtectedListViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"保护中";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"arrow.clockwise"]
+                                                                              style:UIBarButtonItemStylePlain
+                                                                             target:self
+                                                                             action:@selector(refreshData)];
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+
+    UIRefreshControl *rc = [UIRefreshControl new];
+    [rc addTarget:self action:@selector(refreshData) forControlEvents:UIControlEventValueChanged];
+    self.tableView.refreshControl = rc;
+
+    [self.view addSubview:self.tableView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.tableView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
+
+    [self setupEmptyView];
+    [self refreshData];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(refreshData)
+                                                 name:UIApplicationDidBecomeActiveNotification
+                                               object:nil];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self refreshData];
+    [self startPollingTimer];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self stopPollingTimer];
+}
+
+- (void)dealloc {
+    [self stopPollingTimer];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)startPollingTimer {
+    [self stopPollingTimer];
+    __weak typeof(self) weakSelf = self;
+    self.pollingTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        [weakSelf refreshData];
+    }];
+}
+
+- (void)stopPollingTimer {
+    [self.pollingTimer invalidate];
+    self.pollingTimer = nil;
+}
+
+- (void)setupEmptyView {
+    self.emptyView = [UIView new];
+    self.emptyView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.emptyView.hidden = YES;
+
+    self.emptyIconView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"shield.slash"]];
+    self.emptyIconView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.emptyIconView.tintColor = UIColor.tertiaryLabelColor;
+    self.emptyIconView.contentMode = UIViewContentModeScaleAspectFit;
+
+    self.emptyLabel = [UILabel new];
+    self.emptyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.emptyLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    self.emptyLabel.textColor = UIColor.secondaryLabelColor;
+    self.emptyLabel.textAlignment = NSTextAlignmentCenter;
+    self.emptyLabel.numberOfLines = 0;
+    self.emptyLabel.text = @"暂无受保护的 App";
+
+    [self.emptyView addSubview:self.emptyIconView];
+    [self.emptyView addSubview:self.emptyLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.emptyIconView.centerXAnchor constraintEqualToAnchor:self.emptyView.centerXAnchor],
+        [self.emptyIconView.topAnchor constraintEqualToAnchor:self.emptyView.topAnchor],
+        [self.emptyIconView.widthAnchor constraintEqualToConstant:44],
+        [self.emptyIconView.heightAnchor constraintEqualToConstant:44],
+
+        [self.emptyLabel.topAnchor constraintEqualToAnchor:self.emptyIconView.bottomAnchor constant:12],
+        [self.emptyLabel.leadingAnchor constraintEqualToAnchor:self.emptyView.leadingAnchor constant:24],
+        [self.emptyLabel.trailingAnchor constraintEqualToAnchor:self.emptyView.trailingAnchor constant:-24],
+        [self.emptyLabel.bottomAnchor constraintEqualToAnchor:self.emptyView.bottomAnchor]
+    ]];
+
+    [self.view addSubview:self.emptyView];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.emptyView.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [self.emptyView.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor]
+    ]];
+}
+
+- (void)refreshData {
+    self.status = [JPStatusInfo loadCurrentStatus];
+    [self updateUI];
+    if (self.tableView.refreshControl.isRefreshing) {
+        [self.tableView.refreshControl endRefreshing];
+    }
+}
+
+- (void)updateUI {
+    NSInteger count = self.status.protectedApps.count;
+    if (count == 0) {
+        self.tableView.hidden = YES;
+        self.emptyView.hidden = NO;
+        if (!self.status.hasProtectedAppLines && self.status.protectedPids > 0) {
+            self.emptyIconView.image = [UIImage systemImageNamed:@"exclamationmark.triangle"];
+            self.emptyLabel.text = @"暂无数据（守护进程版本过旧）";
+        } else {
+            self.emptyIconView.image = [UIImage systemImageNamed:@"shield.slash"];
+            self.emptyLabel.text = @"暂无受保护的 App";
+        }
+    } else {
+        self.emptyView.hidden = YES;
+        self.tableView.hidden = NO;
+        [self.tableView reloadData];
+    }
+}
+
+#pragma mark - Table View
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return self.status.protectedApps.count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (self.status.protectedApps.count == 0) return nil;
+    return [NSString stringWithFormat:@"受保护进程 (%lu)", (unsigned long)self.status.protectedApps.count];
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *const kCellId = @"JPProtectedAppCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kCellId];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:kCellId];
+    }
+
+    JPProtectedApp *app = self.status.protectedApps[indexPath.row];
+    NSString *name = self.nameResolver ? self.nameResolver(app.pathFragment) : app.pathFragment;
+    if (!name || name.length == 0) {
+        name = app.pathFragment ?: @"";
+    }
+
+    cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    cell.textLabel.textColor = UIColor.labelColor;
+    cell.textLabel.text = name;
+
+    NSString *humanStatus = (app.currentBand < app.targetBand) ? @"已抬升保护中" : @"已达标";
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"pid %d · 当前 %ld → 目标 %ld · %@",
+                                 (int)app.pid, (long)app.currentBand, (long)app.targetBand, humanStatus];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    return cell;
+}
+
+@end
+
 #pragma mark - Controllers: Main ViewController
 
 @interface MainViewController : UIViewController <JPRuleCardViewDelegate>
@@ -927,6 +1232,9 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     __weak typeof(self) weakSelf = self;
     self.statusCard.onActionToggle = ^{
         [weakSelf toggleDaemon];
+    };
+    self.statusCard.onTapProtected = ^{
+        [weakSelf showProtectedList];
     };
 
     [self.contentStackView addArrangedSubview:statusHeader];
@@ -1344,6 +1652,28 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
         sheet.prefersGrabberVisible = YES;
     }
     [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)showProtectedList {
+    JPProtectedListViewController *vc = [JPProtectedListViewController new];
+    __weak typeof(self) weakSelf = self;
+    vc.nameResolver = ^NSString *(NSString *frag) {
+        return [weakSelf resolveDisplayNameForFragment:frag];
+    };
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+        vc.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                                                               style:UIBarButtonItemStylePlain
+                                                                              target:self
+                                                                              action:@selector(dismissPresentedController)];
+        [self presentViewController:nav animated:YES completion:nil];
+    }
+}
+
+- (void)dismissPresentedController {
+    [self dismissViewControllerAnimated:YES completion:nil];
 }
 
 @end

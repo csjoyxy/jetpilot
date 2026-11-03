@@ -38,6 +38,8 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #include <sys/types.h>
 #include <signal.h>
 #include <notify.h>   /* 锁屏状态：com.apple.springboard.lockstate（libSystem 自带） */
+#include <sys/select.h>
+#include <sys/time.h>
 
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
@@ -81,6 +83,7 @@ typedef struct {
 static rule_t g_protect[MAX_RULES];  static int g_nprotect = 0;
 static rule_t g_demote[MAX_RULES];   static int g_ndemote  = 0;
 static unsigned long g_reassert_count = 0;
+static int g_locked_passes = 0;
 
 static int load_config(void) {
     FILE *f = fopen(CONFIG_PATH, "r");
@@ -149,17 +152,32 @@ static memorystatus_priority_entry_t *get_list(int *count_out) {
     return buf;
 }
 
-static int path_matches(const char *path, rule_t *rules, int n, int32_t *target_out) {
+static int path_matches(const char *path, rule_t *rules, int n,
+                        int32_t *target_out, const char **frag_out) {
     for (int i = 0; i < n; i++) {
         if (strstr(path, rules[i].frag)) {
             if (target_out) *target_out = rules[i].target;
+            if (frag_out) *frag_out = rules[i].frag;
             return 1;
         }
     }
     return 0;
 }
 
-static void write_status(int protected_now, int demoted_now) {
+/* status.txt 格式（App 端解析）：
+ *   原有 key=value 行保持不变；新增 protected_app 行（可多行）：
+ *     protected_app=<路径片段>|<pid>|<当前档位>|<目标档位>
+ *   旧版 App 忽略不认识的行；新版 App 读不到这些行时显示"暂无数据"。 */
+#define MAX_PROTECTED_LIST 64
+typedef struct {
+    const char *frag;   /* 指向 g_protect 规则的 frag，本轮 scan 内有效 */
+    pid_t       pid;
+    int32_t     cur;
+    int32_t     target;
+} protected_entry_t;
+
+static void write_status(int protected_now, int demoted_now,
+                         protected_entry_t *plist, int nplist) {
     FILE *f = fopen(STATUS_PATH, "w");
     if (!f) return;
     time_t t = time(NULL);
@@ -167,35 +185,50 @@ static void write_status(int protected_now, int demoted_now) {
     fprintf(f, "updated=%s\nprotect_rules=%d\ndemote_rules=%d\n"
                "protected_pids=%d\ndemoted_pids=%d\nreasserts_total=%lu\n",
             ts, g_nprotect, g_ndemote, protected_now, demoted_now, g_reassert_count);
+    for (int i = 0; i < nplist; i++)
+        fprintf(f, "protected_app=%s|%d|%d|%d\n",
+                plist[i].frag, (int)plist[i].pid, plist[i].cur, plist[i].target);
     fclose(f);
 }
 
-static volatile int g_locked = 0;
+static int g_locked = 0;
 static int g_lock_token = -1;
+static int g_lock_fd = -1;
 
-/* 锁屏监听：SpringBoard 在锁屏/解锁时发 com.apple.springboard.lockstate，
- * state=1 表示已锁屏。注册失败则保持 unlocked 语义（fail-open，保护逻辑不受影响）。 */
-static void lockmon_init(void) {
-    if (notify_register_check("com.apple.springboard.lockstate", &g_lock_token)
-            != NOTIFY_STATUS_OK) {
-        g_lock_token = -1;
-        return;
-    }
+static void lock_refresh(void) {
     uint64_t st = 0;
-    if (notify_get_state(g_lock_token, &st) == NOTIFY_STATUS_OK)
+    if (g_lock_token >= 0 &&
+        notify_get_state(g_lock_token, &st) == NOTIFY_STATUS_OK)
         g_locked = (st != 0);
 }
 
-static int screen_locked(void) {
-    if (g_lock_token >= 0) {
-        int changed = 0;
-        if (notify_check(g_lock_token, &changed) == NOTIFY_STATUS_OK && changed) {
-            uint64_t st = 0;
-            if (notify_get_state(g_lock_token, &st) == NOTIFY_STATUS_OK)
-                g_locked = (st != 0);
-        }
+static void lockmon_init(void) {
+    if (notify_register_file_descriptor("com.apple.springboard.lockstate",
+            &g_lock_fd, 0, &g_lock_token) != NOTIFY_STATUS_OK) {
+        g_lock_fd = -1; g_lock_token = -1;   /* fail-open：保持常速 */
+        return;
     }
-    return g_locked;
+    lock_refresh();
+}
+
+/* 睡 secs 秒，锁屏状态一变就提前醒。返回 1 表示状态变了 */
+static int wait_lock_change(int secs) {
+    if (g_lock_fd < 0) { sleep(secs); return 0; }
+    fd_set rf; FD_ZERO(&rf); FD_SET(g_lock_fd, &rf);
+    struct timeval tv = { secs, 0 };
+    if (select(g_lock_fd + 1, &rf, NULL, NULL, &tv) > 0) {
+        int tok;
+        while (read(g_lock_fd, &tok, sizeof(tok)) == sizeof(tok)) {
+            /* 一次可能来多条，读空即可 */
+            fd_set r2; FD_ZERO(&r2); FD_SET(g_lock_fd, &r2);
+            struct timeval z = {0, 0};
+            if (select(g_lock_fd + 1, &r2, NULL, NULL, &z) <= 0) break;
+        }
+        int was = g_locked;
+        lock_refresh();
+        return was != g_locked;
+    }
+    return 0;
 }
 
 int main(void) {
@@ -227,6 +260,8 @@ int main(void) {
         int count = 0;
         memorystatus_priority_entry_t *list = get_list(&count);
         int protected_now = 0, demoted_now = 0;
+        protected_entry_t plist[MAX_PROTECTED_LIST];
+        int nplist = 0;
 
         if (list) {
             for (int i = 0; i < count; i++) {
@@ -240,12 +275,15 @@ int main(void) {
                 if (!strstr(path, "/var/containers/Bundle/Application/")) continue;
 
                 int32_t target = 0;
-                if (path_matches(path, g_protect, g_nprotect, &target)) {
+                const char *frag = NULL;
+                if (path_matches(path, g_protect, g_nprotect, &target, &frag)) {
                     protected_now++;
+                    if (nplist < MAX_PROTECTED_LIST)
+                        plist[nplist++] = (protected_entry_t){frag, pid, cur, target};
                     if (cur < target) {
                         if (set_priority(pid, target) == 0) g_reassert_count++;
                     }
-                } else if (path_matches(path, g_demote, g_ndemote, NULL)) {
+                } else if (path_matches(path, g_demote, g_ndemote, NULL, NULL)) {
                     /* 只在非前台时降，且只降到 BACKGROUND，避免误杀正在用的 App */
                     if (cur < BAND_FOREGROUND && cur > BAND_BACKGROUND) {
                         demoted_now++;
@@ -256,19 +294,20 @@ int main(void) {
             free(list);
         }
 
-        write_status(protected_now, demoted_now);
+        write_status(protected_now, demoted_now, plist, nplist);
 
-        /* 省电策略：亮屏 5~10 秒随机抖动轮询；锁屏 60 秒大间隔，
-         * 但每 5 秒看一眼是否解锁——解锁后立刻恢复快轮询 */
-        if (screen_locked()) {
-            for (int i = 0; i < 12; i++) {
-                sleep(5);
-                if (should_stop() || !screen_locked()) break;
-            }
+        if (g_locked) {
+            /* 刚锁屏的前两轮用 10 秒间隔，盖住系统降档的窗口；之后 60 秒 */
+            int secs = (g_locked_passes < 2) ? 10 : 60;
+            g_locked_passes++;
+            wait_lock_change(secs);       /* 解锁会立刻唤醒 */
         } else {
-            int jitter = rand() % 6;
-            sleep(5 + jitter);
+            g_locked_passes = 0;
+            /* 亮屏 5~10 秒；一锁屏立刻醒来补一轮抬档 */
+            wait_lock_change(5 + rand() % 6);
         }
+        /* 注意：锁屏时最长 60 秒才发现 running.flag 被删（停止变慢），
+         * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
     }
 
     unlink(PID_PATH);
