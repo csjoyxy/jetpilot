@@ -45,6 +45,7 @@ jobs:
         run: |
           mkdir -p Payload/JetsamPilot.app
           cp app/Info.plist Payload/JetsamPilot.app/
+          cp app/Icon-*.png Payload/JetsamPilot.app/
           cp JetsamPilot jetsampilotd Payload/JetsamPilot.app/
           chmod 755 Payload/JetsamPilot.app/JetsamPilot Payload/JetsamPilot.app/jetsampilotd
           zip -qr JetsamPilot.tipa Payload
