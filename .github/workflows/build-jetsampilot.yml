@@ -1,0 +1,48 @@
+name: build-jetsampilot
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - ".github/workflows/build-jetsampilot.yml"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build daemon
+        working-directory: src
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall \
+            -miphoneos-version-min=15.0 \
+            jetsampilotd.c -o jetsampilotd
+          ldid -Sentitlements-daemon.plist jetsampilotd
+
+      - name: Build app
+        working-directory: src
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall -fobjc-arc \
+            -miphoneos-version-min=15.0 \
+            -framework UIKit -framework Foundation \
+            app/main.m -o JetsamPilot
+          ldid -Sentitlements-app.plist JetsamPilot
+
+      - name: Package tipa
+        working-directory: src
+        run: |
+          mkdir -p Payload/JetsamPilot.app
+          cp app/Info.plist Payload/JetsamPilot.app/
+          cp JetsamPilot jetsampilotd Payload/JetsamPilot.app/
+          chmod 755 Payload/JetsamPilot.app/JetsamPilot Payload/JetsamPilot.app/jetsampilotd
+          zip -qr JetsamPilot.tipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JetsamPilot
+          path: src/JetsamPilot.tipa
