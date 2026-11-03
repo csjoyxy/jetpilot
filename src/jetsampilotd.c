@@ -37,6 +37,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <signal.h>
+#include <notify.h>   /* 锁屏状态：com.apple.springboard.lockstate（libSystem 自带） */
 
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
@@ -169,10 +170,32 @@ static void write_status(int protected_now, int demoted_now) {
     fclose(f);
 }
 
+static volatile int g_locked = 0;
+static int g_lock_token = -1;
+
+/* 锁屏监听：SpringBoard 在锁屏/解锁时发 com.apple.springboard.lockstate，
+ * state=1 表示已锁屏。注册失败则保持 unlocked 语义（fail-open，保护逻辑不受影响）。 */
+static void lockmon_init(void) {
+    if (notify_register_check("com.apple.springboard.lockstate", &g_lock_token)
+            != NOTIFY_STATUS_OK) {
+        g_lock_token = -1;
+        return;
+    }
+    uint64_t st = 0;
+    if (notify_get_state(g_lock_token, &st) == NOTIFY_STATUS_OK)
+        g_locked = (st != 0);
+}
+
 static int screen_locked(void) {
-    /* 没有可靠的公开方法判断锁屏；这里恒返回 0，循环间隔用固定值。
-     * 如需省电，可改为读取 backboardd 状态（需额外权限，暂不做）。 */
-    return 0;
+    if (g_lock_token >= 0) {
+        int changed = 0;
+        if (notify_check(g_lock_token, &changed) == NOTIFY_STATUS_OK && changed) {
+            uint64_t st = 0;
+            if (notify_get_state(g_lock_token, &st) == NOTIFY_STATUS_OK)
+                g_locked = (st != 0);
+        }
+    }
+    return g_locked;
 }
 
 int main(void) {
@@ -196,6 +219,7 @@ int main(void) {
 
     setsid();  /* 脱离拉起它的 App 会话 */
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
+    lockmon_init();  /* 锁屏监听（失败则保持常速轮询，不影响保护） */
 
     while (!should_stop()) {
         if (load_config() != 0) { sleep(5); continue; }
@@ -234,10 +258,17 @@ int main(void) {
 
         write_status(protected_now, demoted_now);
 
-        /* 5~10 秒随机抖动；锁屏时放长到 20~30 秒 */
-        int base = screen_locked() ? 20 : 5;
-        int jitter = rand() % 6;
-        sleep(base + jitter);
+        /* 省电策略：亮屏 5~10 秒随机抖动轮询；锁屏 60 秒大间隔，
+         * 但每 5 秒看一眼是否解锁——解锁后立刻恢复快轮询 */
+        if (screen_locked()) {
+            for (int i = 0; i < 12; i++) {
+                sleep(5);
+                if (should_stop() || !screen_locked()) break;
+            }
+        } else {
+            int jitter = rand() % 6;
+            sleep(5 + jitter);
+        }
     }
 
     unlink(PID_PATH);
