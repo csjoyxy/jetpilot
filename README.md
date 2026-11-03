@@ -21,8 +21,9 @@ src/
 
 1. 改代码后直接 `push` 到 `main`（或在 Actions 页手动 Run workflow）。
 2. `build-jetsampilot` 自动跑：编译守护进程 → 编译 App → `ldid` 签名 → 打包 `JetsamPilot.tipa` → 上传到 Artifacts（保留 90 天）。
-3. 手机上从 Artifacts 下载 `.tipa`，用 TrollStore 安装，打开点「启动」。
-4. 发版：打 tag（如 `v0.1.0`），版本历史见下方。
+3. 发版：`git tag v0.x.y && git push origin v0.x.y`（先 push 代码再打 tag）→ Actions 自动把 `JetsamPilot.tipa` 挂到对应 Release 下，仓库首页 Releases 栏直接下载，无需手动传。
+4. 手机上从 Release 下载 `.tipa`，用 TrollStore 安装，打开点「启动」。
+5. 版本历史见下方。
 
 ## 规则配置
 
