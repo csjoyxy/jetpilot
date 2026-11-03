@@ -36,7 +36,7 @@ jobs:
         run: |
           xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall -fobjc-arc \
             -miphoneos-version-min=15.0 \
-            -framework UIKit -framework Foundation -framework CoreGraphics \
+            -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
             app/main.m -o JetsamPilot
           ldid -Sentitlements-app.plist JetsamPilot
 
