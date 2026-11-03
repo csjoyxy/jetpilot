@@ -84,6 +84,12 @@ static rule_t g_protect[MAX_RULES];  static int g_nprotect = 0;
 static rule_t g_demote[MAX_RULES];   static int g_ndemote  = 0;
 static unsigned long g_reassert_count = 0;
 static int g_locked_passes = 0;
+/* set_priority 失败记录：供 App 在状态页红字展示（不用 stderr，常驻进程 setsid 后没人读） */
+static unsigned long g_set_fail_total = 0;
+static int      g_last_err_no = 0;
+static pid_t    g_last_err_pid = 0;
+static int32_t  g_last_err_target = 0;
+static char     g_last_err_time[64] = "";
 
 static int load_config(void) {
     FILE *f = fopen(CONFIG_PATH, "r");
@@ -131,7 +137,14 @@ static int set_priority(pid_t pid, int32_t band) {
     int rc = memorystatus_control(MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES,
                                   pid, 0, &props, sizeof(props));
     if (rc != 0) {
-        /* EPERM 多半是缺权限；记录一次方便排查 */
+        /* EPERM 多半是缺权限；记下来写进 status.txt，App 端红字展示 */
+        g_set_fail_total++;
+        g_last_err_no = errno;
+        g_last_err_pid = pid;
+        g_last_err_target = band;
+        time_t t = time(NULL);
+        strftime(g_last_err_time, sizeof(g_last_err_time),
+                 "%Y-%m-%d %H:%M:%S", localtime(&t));
         fprintf(stderr, "[JetsamPilot] set pid %d -> %d 失败: %s\n",
                 pid, band, strerror(errno));
     }
@@ -185,6 +198,11 @@ static void write_status(int protected_now, int demoted_now,
     fprintf(f, "updated=%s\nprotect_rules=%d\ndemote_rules=%d\n"
                "protected_pids=%d\ndemoted_pids=%d\nreasserts_total=%lu\n",
             ts, g_nprotect, g_ndemote, protected_now, demoted_now, g_reassert_count);
+    /* 失败记录：无失败时只写总数 0，App 端隐藏红色区域 */
+    fprintf(f, "set_fail_total=%lu\n", g_set_fail_total);
+    if (g_set_fail_total > 0)
+        fprintf(f, "last_error=%d|%d|%d|%s\n",
+                g_last_err_no, (int)g_last_err_pid, g_last_err_target, g_last_err_time);
     for (int i = 0; i < nplist; i++)
         fprintf(f, "protected_app=%s|%d|%d|%d\n",
                 plist[i].frag, (int)plist[i].pid, plist[i].cur, plist[i].target);

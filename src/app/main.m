@@ -1,5 +1,5 @@
 /*
- * JetsamPilot — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetsamPilot v0.5.0 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
@@ -45,6 +45,26 @@ static NSString *BandDescription(NSInteger band) {
     return @"30 · 系统默认后台";
 }
 
+static NSString *FormatShortTimestamp(NSString *raw) {
+    if (!raw || raw.length == 0) return @"";
+    NSString *trimmed = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (trimmed.length >= 16 && [trimmed characterAtIndex:4] == '-' && [trimmed characterAtIndex:7] == '-') {
+        return [trimmed substringWithRange:NSMakeRange(5, 11)];
+    }
+    return trimmed;
+}
+
+static NSString *ErrnoName(int err) {
+    switch (err) {
+        case 1:  return @"EPERM";
+        case 3:  return @"ESRCH";
+        case 22: return @"EINVAL";
+        default: return nil;
+    }
+}
+
+static NSString *const kCrashReporterDir = @"/var/mobile/Library/Logs/CrashReporter";
+
 #pragma mark - Models
 
 typedef NS_ENUM(NSInteger, JPRuleType) {
@@ -81,6 +101,13 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) unsigned long reassertsTotal;
 @property (nonatomic, copy) NSArray<JPProtectedApp *> *protectedApps;
 @property (nonatomic, assign) BOOL hasProtectedAppLines;
+@property (nonatomic, assign) unsigned long setFailTotal;
+@property (nonatomic, assign) BOOL hasSetFailTotal;
+@property (nonatomic, assign) int lastErrorErrno;
+@property (nonatomic, assign) pid_t lastErrorPid;
+@property (nonatomic, assign) int lastErrorTarget;
+@property (nonatomic, copy) NSString *lastErrorTime;
+@property (nonatomic, assign) BOOL hasLastError;
 + (JPStatusInfo *)loadCurrentStatus;
 + (JPProtectedApp *)parseProtectedAppLine:(NSString *)line;
 @end
@@ -133,6 +160,13 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     st.updated = @"";
     st.protectedApps = @[];
     st.hasProtectedAppLines = NO;
+    st.setFailTotal = 0;
+    st.hasSetFailTotal = NO;
+    st.lastErrorErrno = 0;
+    st.lastErrorPid = 0;
+    st.lastErrorTarget = 0;
+    st.lastErrorTime = @"";
+    st.hasLastError = NO;
     NSString *raw = [NSString stringWithContentsOfFile:kStatus encoding:NSUTF8StringEncoding error:nil];
     if (!raw || raw.length == 0) return st;
 
@@ -156,6 +190,47 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             JPProtectedApp *app = [self parseProtectedAppLine:line];
             if (app) {
                 [apps addObject:app];
+            }
+        } else if ([line hasPrefix:@"set_fail_total="]) {
+            @try {
+                st.hasSetFailTotal = YES;
+                NSString *valStr = [[line substringFromIndex:15] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                NSScanner *scanner = [NSScanner scannerWithString:valStr];
+                long long val = 0;
+                if ([scanner scanLongLong:&val] && [scanner isAtEnd] && val >= 0) {
+                    st.setFailTotal = (unsigned long)val;
+                }
+            } @catch (NSException *ex) {
+                // Ignore dirty line, never crash
+            }
+        } else if ([line hasPrefix:@"last_error="]) {
+            @try {
+                NSString *rawErr = [line substringFromIndex:11];
+                NSArray<NSString *> *parts = [rawErr componentsSeparatedByString:@"|"];
+                if (parts.count >= 4) {
+                    NSString *eStr = [parts[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    NSString *pStr = [parts[1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    NSString *tStr = [parts[2] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    NSString *timeStr = [parts[3] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+
+                    int eVal = 0, pVal = 0, tVal = 0;
+                    NSScanner *s1 = [NSScanner scannerWithString:eStr];
+                    NSScanner *s2 = [NSScanner scannerWithString:pStr];
+                    NSScanner *s3 = [NSScanner scannerWithString:tStr];
+
+                    if ([s1 scanInt:&eVal] && [s1 isAtEnd] &&
+                        [s2 scanInt:&pVal] && [s2 isAtEnd] &&
+                        [s3 scanInt:&tVal] && [s3 isAtEnd] &&
+                        timeStr.length > 0) {
+                        st.hasLastError = YES;
+                        st.lastErrorErrno = eVal;
+                        st.lastErrorPid = (pid_t)pVal;
+                        st.lastErrorTarget = tVal;
+                        st.lastErrorTime = timeStr;
+                    }
+                }
+            } @catch (NSException *ex) {
+                // Ignore dirty line, never crash
             }
         }
     }
@@ -225,6 +300,351 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 }
 @end
 
+#pragma mark - Matching Helpers & Jetsam Models
+
+static BOOL FragmentMatchesProcessName(NSString *frag, NSString *procName) {
+    if (!frag || frag.length == 0 || !procName || procName.length == 0) return NO;
+    if ([procName rangeOfString:frag options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        return YES;
+    }
+    if ([frag rangeOfString:procName options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        return YES;
+    }
+    NSString *cleanFrag = frag;
+    if ([cleanFrag hasSuffix:@"/"]) {
+        cleanFrag = [cleanFrag substringToIndex:cleanFrag.length - 1];
+    }
+    if ([[cleanFrag pathExtension] localizedCaseInsensitiveCompare:@"app"] == NSOrderedSame) {
+        cleanFrag = [cleanFrag stringByDeletingPathExtension];
+    }
+    if ([procName rangeOfString:cleanFrag options:NSCaseInsensitiveSearch].location != NSNotFound ||
+        [cleanFrag rangeOfString:procName options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        return YES;
+    }
+    return NO;
+}
+
+static NSString *ResolveDisplayNameHelper(NSString *frag, NSArray<JPInstalledApp *> *apps) {
+    if (!frag || frag.length == 0) return @"";
+    for (JPInstalledApp *app in apps) {
+        if ([frag containsString:app.bundleName] || [app.bundleName containsString:frag]) {
+            return app.displayName;
+        }
+    }
+    return frag;
+}
+
+static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInstalledApp *> *apps) {
+    if (!rule || !procName || procName.length == 0) return NO;
+    if (FragmentMatchesProcessName(rule.pathFragment, procName)) return YES;
+    if (apps) {
+        for (JPInstalledApp *app in apps) {
+            if ([rule.pathFragment containsString:app.bundleName] || [app.bundleName containsString:rule.pathFragment]) {
+                if (FragmentMatchesProcessName(app.bundleName, procName)) return YES;
+                if (app.bundleId.length > 0 && [procName localizedCaseInsensitiveCompare:app.bundleId] == NSOrderedSame) return YES;
+                if (app.displayName.length > 0 && [procName localizedCaseInsensitiveCompare:app.displayName] == NSOrderedSame) return YES;
+                break;
+            }
+        }
+    }
+    return NO;
+}
+
+@interface JPJetsamDaySummary : NSObject
+@property (nonatomic, copy) NSString *dateKey;
+@property (nonatomic, copy) NSString *dateFormatted;
+@property (nonatomic, copy) NSString *displayName;
+@property (nonatomic, copy) NSString *pathFragment;
+@property (nonatomic, assign) NSInteger killCount;
+@property (nonatomic, copy) NSString *primaryReason;
+@end
+
+@implementation JPJetsamDaySummary
+@end
+
+@interface JPKilledStatsInfo : NSObject
+@property (nonatomic, assign) NSInteger totalKills;
+@property (nonatomic, copy) NSArray<JPJetsamDaySummary *> *daySummaries;
+@property (nonatomic, assign) NSInteger skippedFilesCount;
++ (JPKilledStatsInfo *)loadStatsForRules:(NSArray<JPRule *> *)rules installedApps:(NSArray<JPInstalledApp *> *)apps;
+@end
+
+@implementation JPKilledStatsInfo
+
++ (JPKilledStatsInfo *)loadStatsForRules:(NSArray<JPRule *> *)rules installedApps:(NSArray<JPInstalledApp *> *)apps {
+    JPKilledStatsInfo *result = [JPKilledStatsInfo new];
+    result.totalKills = 0;
+    result.daySummaries = @[];
+    result.skippedFilesCount = 0;
+
+    @try {
+        NSMutableArray<JPRule *> *protectRules = [NSMutableArray array];
+        for (JPRule *r in rules) {
+            if (r.type == JPRuleTypeProtect && r.pathFragment.length > 0) {
+                [protectRules addObject:r];
+            }
+        }
+        if (protectRules.count == 0) {
+            return result;
+        }
+
+        NSFileManager *fm = NSFileManager.defaultManager;
+        BOOL isDir = NO;
+        if (![fm fileExistsAtPath:kCrashReporterDir isDirectory:&isDir] || !isDir) {
+            return result;
+        }
+
+        NSError *dirErr = nil;
+        NSArray<NSString *> *allFiles = [fm contentsOfDirectoryAtPath:kCrashReporterDir error:&dirErr];
+        if (!allFiles || allFiles.count == 0) {
+            return result;
+        }
+
+        NSCalendar *calendar = [NSCalendar currentCalendar];
+        NSDate *now = [NSDate date];
+        NSDate *startOfToday = nil;
+        if (![calendar rangeOfUnit:NSCalendarUnitDay startDate:&startOfToday interval:NULL forDate:now]) {
+            startOfToday = now;
+        }
+        NSDateComponents *sub7Comps = [NSDateComponents new];
+        sub7Comps.day = -6;
+        NSDate *sevenDaysAgo = [calendar dateByAddingComponents:sub7Comps toDate:startOfToday options:0] ?: [now dateByAddingTimeInterval:-7*86400];
+
+        // Regex for JetsamEvent-YYYY-MM-DD-HHMMSS.ips
+        // TODO: [iOS 16.4.1 真机待测] 日志文件名时间提取：文件名通常为 JetsamEvent-YYYY-MM-DD-HHMMSS.ips，部分系统版本可能附带 .synced 或序号后缀。若文件名无法提取时间，跳过并计入 skippedCount；后续可在真机验证后补充从 JSON 头部 timestamp 字段提取备选时间的逻辑。
+        static NSRegularExpression *fileRegex = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            fileRegex = [NSRegularExpression regularExpressionWithPattern:@"^JetsamEvent-(\\d{4})-(\\d{2})-(\\d{2})(?:-(\\d{2})(\\d{2})(\\d{2}))?"
+                                                                  options:0
+                                                                    error:nil];
+        });
+
+        NSArray<NSString *> *weekdayNames = @[@"周日", @"周一", @"周二", @"周三", @"周四", @"周五", @"周六"];
+
+        NSMutableDictionary<NSString *, NSMutableDictionary *> *groups = [NSMutableDictionary dictionary];
+        NSInteger totalKills = 0;
+        NSInteger skippedCount = 0;
+
+        for (NSString *filename in allFiles) {
+            if (![filename hasPrefix:@"JetsamEvent-"] || ![filename.pathExtension isEqualToString:@"ips"]) {
+                continue;
+            }
+
+            NSTextCheckingResult *match = [fileRegex firstMatchInString:filename options:0 range:NSMakeRange(0, filename.length)];
+            NSDate *fileDate = nil;
+            NSString *dateKey = nil;
+            NSString *dateFormatted = nil;
+
+            if (match && match.numberOfRanges >= 4) {
+                NSInteger year = [[filename substringWithRange:[match rangeAtIndex:1]] integerValue];
+                NSInteger month = [[filename substringWithRange:[match rangeAtIndex:2]] integerValue];
+                NSInteger day = [[filename substringWithRange:[match rangeAtIndex:3]] integerValue];
+                NSInteger hour = 0, minute = 0, second = 0;
+                if (match.numberOfRanges >= 7 && [match rangeAtIndex:4].location != NSNotFound) {
+                    hour = [[filename substringWithRange:[match rangeAtIndex:4]] integerValue];
+                    minute = [[filename substringWithRange:[match rangeAtIndex:5]] integerValue];
+                    second = [[filename substringWithRange:[match rangeAtIndex:6]] integerValue];
+                }
+
+                NSDateComponents *c = [NSDateComponents new];
+                c.year = year;
+                c.month = month;
+                c.day = day;
+                c.hour = hour;
+                c.minute = minute;
+                c.second = second;
+                c.timeZone = [NSTimeZone systemTimeZone];
+                fileDate = [calendar dateFromComponents:c];
+
+                dateKey = [NSString stringWithFormat:@"%04ld-%02ld-%02ld", (long)year, (long)month, (long)day];
+
+                NSDateComponents *wc = [calendar components:NSCalendarUnitWeekday fromDate:fileDate];
+                NSInteger wd = wc.weekday;
+                NSString *wdStr = (wd >= 1 && wd <= 7) ? weekdayNames[wd - 1] : @"周日";
+                dateFormatted = [NSString stringWithFormat:@"%02ld-%02ld（%@）", (long)month, (long)day, wdStr];
+            }
+
+            if (!fileDate || !dateKey) {
+                skippedCount++;
+                continue;
+            }
+
+            if ([fileDate compare:sevenDaysAgo] == NSOrderedAscending) {
+                continue;
+            }
+            if ([fileDate timeIntervalSinceDate:now] > 86400) {
+                continue;
+            }
+
+            NSString *fullPath = [kCrashReporterDir stringByAppendingPathComponent:filename];
+            @try {
+                NSError *readErr = nil;
+                NSString *fileContent = [NSString stringWithContentsOfFile:fullPath encoding:NSUTF8StringEncoding error:&readErr];
+                if (!fileContent || fileContent.length == 0) {
+                    skippedCount++;
+                    continue;
+                }
+
+                NSRange nlRange = [fileContent rangeOfString:@"\n"];
+                NSString *jsonBody = nil;
+                if (nlRange.location != NSNotFound) {
+                    jsonBody = [[fileContent substringFromIndex:nlRange.location + 1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                }
+                if (!jsonBody || jsonBody.length == 0) {
+                    jsonBody = fileContent;
+                }
+
+                NSData *jsonData = [jsonBody dataUsingEncoding:NSUTF8StringEncoding];
+                if (!jsonData) {
+                    skippedCount++;
+                    continue;
+                }
+
+                NSError *jsonErr = nil;
+                id jsonRoot = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&jsonErr];
+                if (!jsonRoot || ![jsonRoot isKindOfClass:[NSDictionary class]]) {
+                    if (jsonBody != fileContent) {
+                        jsonRoot = [NSJSONSerialization JSONObjectWithData:[fileContent dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+                    }
+                    if (!jsonRoot || ![jsonRoot isKindOfClass:[NSDictionary class]]) {
+                        skippedCount++;
+                        continue;
+                    }
+                }
+
+                NSDictionary *rootDict = (NSDictionary *)jsonRoot;
+
+                // TODO: [iOS 16.4.1 真机待测] 进程列表 JSON 键名：标准字段为 "processes"，此处做多字段兼容：依次尝试 "processes"、"processList"、"sortedByResidentSize"、"processes_list"。
+                id procs = rootDict[@"processes"];
+                if (!procs) procs = rootDict[@"processList"];
+                if (!procs) procs = rootDict[@"sortedByResidentSize"];
+                if (!procs) procs = rootDict[@"processes_list"];
+
+                if (!procs || ![procs isKindOfClass:[NSArray class]]) {
+                    skippedCount++;
+                    continue;
+                }
+
+                NSArray *procArray = (NSArray *)procs;
+
+                for (id procItem in procArray) {
+                    if (![procItem isKindOfClass:[NSDictionary class]]) continue;
+                    NSDictionary *pDict = (NSDictionary *)procItem;
+
+                    // TODO: [iOS 16.4.1 真机待测] 进程名称 JSON 键名：标准字段为 "name"，此处做多字段兼容：依次尝试 "name"、"process_name"、"procName"、"proc_name"、"bundleID"、"bundleIdentifier"。
+                    NSString *procName = pDict[@"name"];
+                    if (![procName isKindOfClass:[NSString class]] || procName.length == 0) procName = pDict[@"process_name"];
+                    if (![procName isKindOfClass:[NSString class]] || procName.length == 0) procName = pDict[@"procName"];
+                    if (![procName isKindOfClass:[NSString class]] || procName.length == 0) procName = pDict[@"proc_name"];
+                    if (![procName isKindOfClass:[NSString class]] || procName.length == 0) procName = pDict[@"bundleID"];
+                    if (![procName isKindOfClass:[NSString class]] || procName.length == 0) procName = pDict[@"bundleIdentifier"];
+
+                    if (![procName isKindOfClass:[NSString class]] || procName.length == 0) {
+                        continue;
+                    }
+
+                    // TODO: [iOS 16.4.1 真机待测] 被杀原因 JSON 键名：iOS Jetsam 日志中仅真正被杀的进程带有 reason 字段（未被杀的存活进程快照无此字段）。此处做多字段兼容：依次尝试 "reason"、"terminationReason"、"exitReason"、"killReason"、"jetsamReason"，并支持字符串或字典类型。
+                    id rObj = pDict[@"reason"];
+                    if (!rObj) rObj = pDict[@"terminationReason"];
+                    if (!rObj) rObj = pDict[@"exitReason"];
+                    if (!rObj) rObj = pDict[@"killReason"];
+                    if (!rObj) rObj = pDict[@"jetsamReason"];
+
+                    if (!rObj || rObj == [NSNull null]) {
+                        continue;
+                    }
+
+                    NSString *reasonStr = nil;
+                    if ([rObj isKindOfClass:[NSString class]]) {
+                        reasonStr = (NSString *)rObj;
+                    } else if ([rObj isKindOfClass:[NSDictionary class]]) {
+                        reasonStr = rObj[@"type"] ?: rObj[@"name"] ?: [rObj description];
+                    } else {
+                        reasonStr = [rObj description];
+                    }
+                    reasonStr = [reasonStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                    if (reasonStr.length == 0) {
+                        reasonStr = @"未知原因";
+                    }
+
+                    for (JPRule *pRule in protectRules) {
+                        if (RuleMatchesProcess(pRule, procName, apps)) {
+                            totalKills++;
+                            NSString *groupKey = [NSString stringWithFormat:@"%@|%@", dateKey, pRule.pathFragment];
+                            NSMutableDictionary *group = groups[groupKey];
+                            if (!group) {
+                                NSString *dName = pRule.displayName;
+                                if (!dName || dName.length == 0) {
+                                    dName = ResolveDisplayNameHelper(pRule.pathFragment, apps);
+                                }
+                                group = [NSMutableDictionary dictionaryWithDictionary:@{
+                                    @"dateKey": dateKey,
+                                    @"dateFormatted": dateFormatted,
+                                    @"pathFragment": pRule.pathFragment,
+                                    @"displayName": dName ?: pRule.pathFragment,
+                                    @"killCount": @(0),
+                                    @"reasons": [NSMutableArray array]
+                                }];
+                                groups[groupKey] = group;
+                            }
+
+                            NSInteger curCount = [group[@"killCount"] integerValue];
+                            group[@"killCount"] = @(curCount + 1);
+                            [group[@"reasons"] addObject:reasonStr];
+                            break;
+                        }
+                    }
+                }
+            } @catch (NSException *ex) {
+                skippedCount++;
+            }
+        }
+
+        NSMutableArray<JPJetsamDaySummary *> *summaries = [NSMutableArray array];
+        for (NSString *key in groups) {
+            NSMutableDictionary *dict = groups[key];
+            JPJetsamDaySummary *s = [JPJetsamDaySummary new];
+            s.dateKey = dict[@"dateKey"];
+            s.dateFormatted = dict[@"dateFormatted"];
+            s.pathFragment = dict[@"pathFragment"];
+            s.displayName = dict[@"displayName"];
+            s.killCount = [dict[@"killCount"] integerValue];
+
+            NSArray<NSString *> *reasons = dict[@"reasons"];
+            NSCountedSet *counts = [NSCountedSet setWithArray:reasons];
+            NSString *bestReason = @"未知原因";
+            NSUInteger maxCount = 0;
+            for (NSString *r in counts) {
+                NSUInteger c = [counts countForObject:r];
+                if (c > maxCount) {
+                    maxCount = c;
+                    bestReason = r;
+                }
+            }
+            s.primaryReason = bestReason;
+            [summaries addObject:s];
+        }
+
+        [summaries sortUsingComparator:^NSComparisonResult(JPJetsamDaySummary *a, JPJetsamDaySummary *b) {
+            NSComparisonResult r = [b.dateKey compare:a.dateKey];
+            if (r != NSOrderedSame) return r;
+            if (a.killCount < b.killCount) return NSOrderedDescending;
+            if (a.killCount > b.killCount) return NSOrderedAscending;
+            return [a.displayName localizedStandardCompare:b.displayName];
+        }];
+
+        result.totalKills = totalKills;
+        result.daySummaries = [summaries copy];
+        result.skippedFilesCount = skippedCount;
+    } @catch (NSException *ex) {
+        // Complete outer protection
+    }
+    return result;
+}
+
+@end
+
 #pragma mark - Views: Status Card
 
 @interface JPStatusCardView : UIView
@@ -238,6 +658,10 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, strong) UIView *protectedColumn;
 @property (nonatomic, copy) void (^onActionToggle)(void);
 @property (nonatomic, copy) void (^onTapProtected)(void);
+@property (nonatomic, strong) UIStackView *metricsAndErrorStack;
+@property (nonatomic, strong) UIView *errorContainerView;
+@property (nonatomic, strong) UILabel *failureCountLabel;
+@property (nonatomic, strong) UILabel *failureDetailLabel;
 
 - (void)updateWithStatus:(JPStatusInfo *)status isRunning:(BOOL)isRunning;
 @end
@@ -330,6 +754,42 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     metricsStack.distribution = UIStackViewDistributionFillEqually;
     metricsStack.alignment = UIStackViewAlignmentCenter;
 
+    self.errorContainerView = [UIView new];
+    self.errorContainerView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.errorContainerView.backgroundColor = [UIColor.systemRedColor colorWithAlphaComponent:0.08];
+    self.errorContainerView.layer.cornerRadius = 8;
+    self.errorContainerView.clipsToBounds = YES;
+    self.errorContainerView.hidden = YES;
+
+    self.failureCountLabel = [UILabel new];
+    self.failureCountLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.failureCountLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    self.failureCountLabel.textColor = UIColor.systemRedColor;
+
+    self.failureDetailLabel = [UILabel new];
+    self.failureDetailLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.failureDetailLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    self.failureDetailLabel.textColor = UIColor.systemRedColor;
+    self.failureDetailLabel.numberOfLines = 0;
+
+    UIStackView *errorStack = [[UIStackView alloc] initWithArrangedSubviews:@[self.failureCountLabel, self.failureDetailLabel]];
+    errorStack.translatesAutoresizingMaskIntoConstraints = NO;
+    errorStack.axis = UILayoutConstraintAxisVertical;
+    errorStack.spacing = 3;
+
+    [self.errorContainerView addSubview:errorStack];
+    [NSLayoutConstraint activateConstraints:@[
+        [errorStack.topAnchor constraintEqualToAnchor:self.errorContainerView.topAnchor constant:8],
+        [errorStack.bottomAnchor constraintEqualToAnchor:self.errorContainerView.bottomAnchor constant:-8],
+        [errorStack.leadingAnchor constraintEqualToAnchor:self.errorContainerView.leadingAnchor constant:12],
+        [errorStack.trailingAnchor constraintEqualToAnchor:self.errorContainerView.trailingAnchor constant:-12]
+    ]];
+
+    self.metricsAndErrorStack = [[UIStackView alloc] initWithArrangedSubviews:@[metricsStack, self.errorContainerView]];
+    self.metricsAndErrorStack.translatesAutoresizingMaskIntoConstraints = NO;
+    self.metricsAndErrorStack.axis = UILayoutConstraintAxisVertical;
+    self.metricsAndErrorStack.spacing = 0;
+
     UIView *div2 = [UIView new];
     div2.translatesAutoresizingMaskIntoConstraints = NO;
     div2.backgroundColor = UIColor.separatorColor;
@@ -344,7 +804,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 
     [self addSubview:topRow];
     [self addSubview:div1];
-    [self addSubview:metricsStack];
+    [self addSubview:self.metricsAndErrorStack];
     [self addSubview:div2];
     [self addSubview:self.actionButton];
 
@@ -358,11 +818,11 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
         [div1.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
         [div1.heightAnchor constraintEqualToConstant:0.5],
 
-        [metricsStack.topAnchor constraintEqualToAnchor:div1.bottomAnchor constant:12],
-        [metricsStack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [metricsStack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [self.metricsAndErrorStack.topAnchor constraintEqualToAnchor:div1.bottomAnchor constant:12],
+        [self.metricsAndErrorStack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.metricsAndErrorStack.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
 
-        [div2.topAnchor constraintEqualToAnchor:metricsStack.bottomAnchor constant:12],
+        [div2.topAnchor constraintEqualToAnchor:self.metricsAndErrorStack.bottomAnchor constant:12],
         [div2.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
         [div2.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
         [div2.heightAnchor constraintEqualToConstant:0.5],
@@ -487,6 +947,216 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     self.protectedCountLabel.text = [NSString stringWithFormat:@"%ld", (long)status.protectedPids];
     self.demotedCountLabel.text = [NSString stringWithFormat:@"%ld", (long)status.demotedPids];
     self.reassertCountLabel.text = [NSString stringWithFormat:@"%lu", status.reassertsTotal];
+
+    BOOL showFailure = (isRunning && status.hasSetFailTotal && status.setFailTotal > 0);
+    if (showFailure) {
+        self.errorContainerView.hidden = NO;
+        self.metricsAndErrorStack.spacing = 10;
+        self.failureCountLabel.text = [NSString stringWithFormat:@"提权失败 ×%lu", status.setFailTotal];
+
+        if (status.hasLastError) {
+            NSString *errName = ErrnoName(status.lastErrorErrno);
+            NSString *errnoStr = errName ? [NSString stringWithFormat:@"errno %d (%@)", status.lastErrorErrno, errName]
+                                         : [NSString stringWithFormat:@"errno %d", status.lastErrorErrno];
+            NSString *timeStr = FormatShortTimestamp(status.lastErrorTime);
+            self.failureDetailLabel.text = [NSString stringWithFormat:@"最近：pid %d → 目标 %d · %@ · %@",
+                                            (int)status.lastErrorPid, status.lastErrorTarget, errnoStr, timeStr];
+            self.failureDetailLabel.hidden = NO;
+        } else {
+            self.failureDetailLabel.text = @"";
+            self.failureDetailLabel.hidden = YES;
+        }
+    } else {
+        self.errorContainerView.hidden = YES;
+        self.metricsAndErrorStack.spacing = 0;
+    }
+}
+
+@end
+
+#pragma mark - Views: Killed Stats Card
+
+@interface JPKilledStatsCardView : UIView
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *subtitleLabel;
+@property (nonatomic, strong) UIView *div1;
+@property (nonatomic, strong) UILabel *summaryLabel;
+@property (nonatomic, strong) UIView *div2;
+@property (nonatomic, strong) UIStackView *rowsStackView;
+@property (nonatomic, strong) UILabel *footnoteLabel;
+@property (nonatomic, strong) UIStackView *bodyStackView;
+
+- (void)updateWithStats:(JPKilledStatsInfo *)stats;
+@end
+
+@implementation JPKilledStatsCardView
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        [self setupUI];
+    }
+    return self;
+}
+
+- (void)setupUI {
+    self.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    self.layer.cornerRadius = 14;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    self.clipsToBounds = YES;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.titleLabel = [UILabel new];
+    self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    self.titleLabel.textColor = UIColor.labelColor;
+    self.titleLabel.text = @"被杀统计";
+
+    self.subtitleLabel = [UILabel new];
+    self.subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.subtitleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    self.subtitleLabel.textColor = UIColor.secondaryLabelColor;
+    self.subtitleLabel.textAlignment = NSTextAlignmentRight;
+    self.subtitleLabel.text = @"最近 7 天 · 系统 Jetsam 日志";
+
+    UIView *topRow = [UIView new];
+    topRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [topRow addSubview:self.titleLabel];
+    [topRow addSubview:self.subtitleLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.titleLabel.leadingAnchor constraintEqualToAnchor:topRow.leadingAnchor],
+        [self.titleLabel.centerYAnchor constraintEqualToAnchor:topRow.centerYAnchor],
+
+        [self.subtitleLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.titleLabel.trailingAnchor constant:8],
+        [self.subtitleLabel.trailingAnchor constraintEqualToAnchor:topRow.trailingAnchor],
+        [self.subtitleLabel.centerYAnchor constraintEqualToAnchor:topRow.centerYAnchor],
+        [topRow.heightAnchor constraintEqualToConstant:24]
+    ]];
+
+    self.div1 = [UIView new];
+    self.div1.translatesAutoresizingMaskIntoConstraints = NO;
+    self.div1.backgroundColor = UIColor.separatorColor;
+
+    self.summaryLabel = [UILabel new];
+    self.summaryLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.summaryLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    self.summaryLabel.textColor = UIColor.systemGreenColor;
+    self.summaryLabel.text = @"无被杀记录";
+
+    self.div2 = [UIView new];
+    self.div2.translatesAutoresizingMaskIntoConstraints = NO;
+    self.div2.backgroundColor = UIColor.separatorColor;
+    self.div2.hidden = YES;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.div2.heightAnchor constraintEqualToConstant:0.5]
+    ]];
+
+    self.rowsStackView = [UIStackView new];
+    self.rowsStackView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.rowsStackView.axis = UILayoutConstraintAxisVertical;
+    self.rowsStackView.spacing = 10;
+    self.rowsStackView.hidden = YES;
+
+    self.footnoteLabel = [UILabel new];
+    self.footnoteLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.footnoteLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    self.footnoteLabel.textColor = UIColor.tertiaryLabelColor;
+    self.footnoteLabel.textAlignment = NSTextAlignmentCenter;
+    self.footnoteLabel.hidden = YES;
+
+    self.bodyStackView = [[UIStackView alloc] initWithArrangedSubviews:@[self.summaryLabel, self.div2, self.rowsStackView, self.footnoteLabel]];
+    self.bodyStackView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.bodyStackView.axis = UILayoutConstraintAxisVertical;
+    self.bodyStackView.spacing = 10;
+
+    [self addSubview:topRow];
+    [self addSubview:self.div1];
+    [self addSubview:self.bodyStackView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [topRow.topAnchor constraintEqualToAnchor:self.topAnchor constant:16],
+        [topRow.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [topRow.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+
+        [self.div1.topAnchor constraintEqualToAnchor:topRow.bottomAnchor constant:12],
+        [self.div1.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.div1.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [self.div1.heightAnchor constraintEqualToConstant:0.5],
+
+        [self.bodyStackView.topAnchor constraintEqualToAnchor:self.div1.bottomAnchor constant:12],
+        [self.bodyStackView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.bodyStackView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [self.bodyStackView.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-16]
+    ]];
+}
+
+- (UIView *)createRowViewForSummary:(JPJetsamDaySummary *)summary {
+    UIView *row = [UIView new];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *line1 = [UILabel new];
+    line1.translatesAutoresizingMaskIntoConstraints = NO;
+    line1.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    line1.textColor = UIColor.labelColor;
+    line1.text = [NSString stringWithFormat:@"%@　%@　×%ld", summary.dateFormatted, summary.displayName, (long)summary.killCount];
+
+    UILabel *line2 = [UILabel new];
+    line2.translatesAutoresizingMaskIntoConstraints = NO;
+    line2.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    line2.textColor = UIColor.secondaryLabelColor;
+    line2.numberOfLines = 1;
+    line2.lineBreakMode = NSLineBreakByTruncatingTail;
+    line2.text = [NSString stringWithFormat:@"主要原因：%@", summary.primaryReason];
+
+    [row addSubview:line1];
+    [row addSubview:line2];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [line1.topAnchor constraintEqualToAnchor:row.topAnchor],
+        [line1.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [line1.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+
+        [line2.topAnchor constraintEqualToAnchor:line1.bottomAnchor constant:3],
+        [line2.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [line2.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [line2.bottomAnchor constraintEqualToAnchor:row.bottomAnchor]
+    ]];
+
+    return row;
+}
+
+- (void)updateWithStats:(JPKilledStatsInfo *)stats {
+    for (UIView *v in self.rowsStackView.arrangedSubviews) {
+        [self.rowsStackView removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+
+    if (stats.totalKills == 0) {
+        self.summaryLabel.textColor = UIColor.systemGreenColor;
+        self.summaryLabel.text = @"无被杀记录";
+        self.div2.hidden = YES;
+        self.rowsStackView.hidden = YES;
+    } else {
+        self.summaryLabel.textColor = UIColor.labelColor;
+        self.summaryLabel.text = [NSString stringWithFormat:@"共被杀 %ld 次", (long)stats.totalKills];
+        self.div2.hidden = NO;
+        self.rowsStackView.hidden = NO;
+
+        for (JPJetsamDaySummary *s in stats.daySummaries) {
+            UIView *row = [self createRowViewForSummary:s];
+            [self.rowsStackView addArrangedSubview:row];
+        }
+    }
+
+    if (stats.skippedFilesCount > 0) {
+        self.footnoteLabel.text = [NSString stringWithFormat:@"跳过 %ld 个无法解析的日志文件", (long)stats.skippedFilesCount];
+        self.footnoteLabel.hidden = NO;
+    } else {
+        self.footnoteLabel.text = @"";
+        self.footnoteLabel.hidden = YES;
+    }
 }
 
 @end
@@ -1118,6 +1788,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, strong) UIStackView *contentStackView;
 
 @property (nonatomic, strong) JPStatusCardView *statusCard;
+@property (nonatomic, strong) JPKilledStatsCardView *killedStatsCard;
 @property (nonatomic, strong) UILabel *rulesSectionHeaderLabel;
 @property (nonatomic, strong) UIStackView *rulesStackView;
 @property (nonatomic, strong) UIView *addRuleCard;
@@ -1240,7 +1911,11 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     [self.contentStackView addArrangedSubview:statusHeader];
     [self.contentStackView addArrangedSubview:self.statusCard];
 
-    // 2. Rules Section
+    // 2. Killed Stats Section
+    self.killedStatsCard = [JPKilledStatsCardView new];
+    [self.contentStackView addArrangedSubview:self.killedStatsCard];
+
+    // 3. Rules Section
     self.rulesSectionHeaderLabel = [self createSectionHeader:@"保护规则"];
     self.rulesStackView = [UIStackView new];
     self.rulesStackView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1514,6 +2189,10 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
         }
     }
     self.rulesSectionHeaderLabel.text = [NSString stringWithFormat:@"保护规则 (%lu)", (unsigned long)self.rules.count];
+    if (self.killedStatsCard) {
+        JPKilledStatsInfo *stats = [JPKilledStatsInfo loadStatsForRules:self.rules installedApps:self.installedApps];
+        [self.killedStatsCard updateWithStats:stats];
+    }
 }
 
 #pragma mark - Daemon Control
@@ -1579,6 +2258,9 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     BOOL running = [self isDaemonRunning];
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     [self.statusCard updateWithStatus:st isRunning:running];
+
+    JPKilledStatsInfo *stats = [JPKilledStatsInfo loadStatsForRules:self.rules installedApps:self.installedApps];
+    [self.killedStatsCard updateWithStats:stats];
 }
 
 #pragma mark - JPRuleCardViewDelegate
