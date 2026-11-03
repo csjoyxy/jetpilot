@@ -1798,6 +1798,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 // 被杀统计的后台串行队列 + 世代计数：解析放后台，过期结果丢弃
 @property (nonatomic, strong) dispatch_queue_t killStatsQueue;
 @property (nonatomic, assign) NSInteger killStatsGeneration;
+@property (nonatomic, copy) NSString *killStatsLastSig;
 @property (nonatomic, strong) UILabel *rulesSectionHeaderLabel;
 @property (nonatomic, strong) UIStackView *rulesStackView;
 @property (nonatomic, strong) UIView *addRuleCard;
@@ -2199,7 +2200,9 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         }
     }
     self.rulesSectionHeaderLabel.text = [NSString stringWithFormat:@"保护规则 (%lu)", (unsigned long)self.rules.count];
-    [self refreshKilledStatsCardAsync];
+    if (self.killedStatsCard) {
+        [self refreshKilledStatsIfNeeded:YES];
+    }
 }
 
 #pragma mark - Daemon Control
@@ -2261,10 +2264,20 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [self refreshStatus];
 }
 
-// 被杀统计涉及磁盘 IO + JSON 解析，放后台串行队列执行，结果回主线程刷 UI。
-// 世代计数保证快速连续刷新时只有最后一次的结果生效。
-- (void)refreshKilledStatsCardAsync {
+// 被杀统计：只在 JetsamEvent 目录或规则变化时才重新解析（签名比对，3 秒轮询不再空转），
+// 解析放后台串行队列（队列本身串行，无需 busy 标志），世代计数丢弃过期结果。
+- (void)refreshKilledStatsIfNeeded:(BOOL)force {
     if (!self.killedStatsCard) return;
+
+    // 签名 = JetsamEvent 文件数 + 最新文件名 + 规则数；只列目录，不读文件，开销很小
+    NSArray *files = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:kCrashReporterDir error:nil]
+        filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"SELF BEGINSWITH 'JetsamEvent-'"]];
+    NSString *newest = [[files sortedArrayUsingSelector:@selector(compare:)] lastObject] ?: @"";
+    NSString *sig = [NSString stringWithFormat:@"%lu|%@|%lu",
+                     (unsigned long)files.count, newest, (unsigned long)self.rules.count];
+    if (!force && [sig isEqualToString:self.killStatsLastSig]) return;
+
+    self.killStatsLastSig = sig;
     self.killStatsGeneration++;
     NSInteger gen = self.killStatsGeneration;
     NSArray *rulesCopy = [self.rules copy];
@@ -2284,7 +2297,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     BOOL running = [self isDaemonRunning];
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     [self.statusCard updateWithStatus:st isRunning:running];
-    [self refreshKilledStatsCardAsync];
+    [self refreshKilledStatsIfNeeded:NO];
 }
 
 #pragma mark - JPRuleCardViewDelegate
