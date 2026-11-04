@@ -141,15 +141,15 @@ static void applied_remove(pid_t pid) {
 #define MAX_OLD_TARGETS 64
 typedef struct {
     pid_t   pid;
-    int32_t band;   /* 上次我们设定的实际档位（cur），不是 target */
+    int32_t target;
 } old_target_t;
 static old_target_t g_old_targets[MAX_OLD_TARGETS];
 static int g_nold_targets = 0;
 
-static int old_target_find(pid_t pid, int32_t *band_out) {
+static int old_target_find(pid_t pid, int32_t *target_out) {
     for (int i = 0; i < g_nold_targets; i++) {
         if (g_old_targets[i].pid == pid) {
-            if (band_out) *band_out = g_old_targets[i].band;
+            if (target_out) *target_out = g_old_targets[i].target;
             return 1;
         }
     }
@@ -166,9 +166,10 @@ static void load_old_targets(void) {
     size_t len = sizeof(boottime);
     int mib[2] = {CTL_KERN, KERN_BOOTTIME};
     if (sysctl(mib, 2, &boottime, &len, NULL, 0) != 0) return;  /* 取不到，不导入 */
+    if (boottime.tv_sec == 0) return;  /* 取到0，不导入，更保守 */
 
-    /* 旧文件比开机还早 → 丢弃 */
-    if (st.st_mtime < boottime.tv_sec) return;
+    /* 旧文件不比开机新 → 丢弃 */
+    if (st.st_mtime <= boottime.tv_sec) return;
 
     FILE *f = fopen(STATUS_PATH, "r");
     if (!f) return;
@@ -178,26 +179,32 @@ static void load_old_targets(void) {
         if (strncmp(line, "protected_app=", 14) != 0) continue;
         char *p = line + 14;
         int pid = 0, cur = 0, target = 0;
-        char *bar1 = strchr(p, '|');
-        if (bar1 && sscanf(bar1 + 1, "%d|%d|%d", &pid, &cur, &target) == 3) {
-            /* 格式: protected_app=frag|pid|cur|target */
-        } else if (sscanf(p, "%d|%d|%d", &pid, &cur, &target) == 3) {
-            /* 容错: protected_app=pid|cur|target */
-        } else {
-            continue;
+        /* 从右往左找3个|，frag 含 | 也不错位；格式: frag|pid|cur|target */
+        char *b3 = strrchr(p, '|');
+        char *b2 = NULL, *b1 = NULL;
+        if (b3) {
+            for (char *q = b3 - 1; q >= p; q--) if (*q == '|') { b2 = q; break; }
         }
+        if (b2) {
+            for (char *q = b2 - 1; q >= p; q--) if (*q == '|') { b1 = q; break; }
+        }
+        if (!b1 || !b2 || !b3) continue;
+        if (sscanf(b1 + 1, "%d", &pid) != 1) continue;
+        if (sscanf(b2 + 1, "%d", &cur) != 1) continue;
+        if (sscanf(b3 + 1, "%d", &target) != 1) continue;
+        if (target <= BAND_BACKGROUND || target > BAND_MAX_PROTECT) continue;
         if (pid > 0 && g_nold_targets < MAX_OLD_TARGETS) {
             int found = 0;
             for (int i = 0; i < g_nold_targets; i++) {
                 if (g_old_targets[i].pid == (pid_t)pid) {
-                    g_old_targets[i].band = cur;
+                    g_old_targets[i].target = target;
                     found = 1;
                     break;
                 }
             }
             if (!found) {
                 g_old_targets[g_nold_targets].pid = (pid_t)pid;
-                g_old_targets[g_nold_targets].band = cur;
+                g_old_targets[g_nold_targets].target = target;
                 g_nold_targets++;
             }
         }
@@ -430,6 +437,14 @@ int main(void) {
                 const char *frag = NULL;
                 applied_t *prev = applied_find(pid);
                 if (prev) prev->seen = 1;
+                /* 首轮认领：上个实例记录过、且当前档位仍等于它设的值 */
+                if (!prev && g_nold_targets > 0 && cur < BAND_FOREGROUND) {
+                    int32_t ot = 0;
+                    if (old_target_find(pid, &ot) && cur == ot) {
+                        applied_set(pid, cur);
+                        prev = applied_find(pid);   /* 表满时为 NULL，安全 */
+                    }
+                }
                 if (path_matches(path, g_protect, g_nprotect, &target, &frag)) {
                     protected_now++;
                     if (nplist < MAX_PROTECTED_LIST)
@@ -441,12 +456,6 @@ int main(void) {
                             applied_set(pid, target);
                         }
                     } else if (cur > target && cur < BAND_FOREGROUND) {
-                        int32_t old_band = 0;
-                        if (!prev && old_target_find(pid, &old_band) && cur == old_band) {
-                            /* 首轮认领旧档位：pid 在旧表里且当前档位等于旧实际档位 */
-                            applied_set(pid, cur);
-                            prev = applied_find(pid);
-                        }
                         if (prev && prev->band == cur) {
                             /* 高于目标且是我们（或旧实例）设的：跟着降 */
                             if (set_priority(pid, target) == 0) {
