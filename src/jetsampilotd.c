@@ -92,6 +92,43 @@ static pid_t    g_last_err_pid = 0;
 static int32_t  g_last_err_target = 0;
 static char     g_last_err_time[64] = "";
 
+/* 记录每个 pid 最后一次由我们设置的档位：
+ * 只有当前档位等于我们上次设的值时才允许往下调，
+ * 避免把系统给的前台 100 等档位误降 */
+#define MAX_APPLIED 64
+typedef struct { pid_t pid; int32_t band; int seen; } applied_t;
+static applied_t g_applied[MAX_APPLIED];
+static int g_napplied = 0;
+
+static applied_t *applied_find(pid_t pid) {
+    for (int i = 0; i < g_napplied; i++)
+        if (g_applied[i].pid == pid) return &g_applied[i];
+    return NULL;
+}
+
+static void applied_set(pid_t pid, int32_t band) {
+    applied_t *a = applied_find(pid);
+    if (!a) {
+        if (g_napplied >= MAX_APPLIED) return;  /* 表满就不记，只是失去降档能力 */
+        a = &g_applied[g_napplied++];
+        a->pid = pid;
+    }
+    a->band = band;
+    a->seen = 1;
+}
+
+/* 每轮结束清掉本轮没出现的 pid（进程已退出），防止 pid 复用误判 */
+static void applied_prune(void) {
+    int j = 0;
+    for (int i = 0; i < g_napplied; i++) {
+        if (g_applied[i].seen) {
+            g_applied[i].seen = 0;
+            g_applied[j++] = g_applied[i];
+        }
+    }
+    g_napplied = j;
+}
+
 static int load_config(void) {
     FILE *f = fopen(CONFIG_PATH, "r");
     if (!f) return -1;
@@ -313,12 +350,25 @@ int main(void) {
 
                 int32_t target = 0;
                 const char *frag = NULL;
+                applied_t *prev = applied_find(pid);
+                if (prev) prev->seen = 1;
                 if (path_matches(path, g_protect, g_nprotect, &target, &frag)) {
                     protected_now++;
                     if (nplist < MAX_PROTECTED_LIST)
                         plist[nplist++] = (protected_entry_t){frag, pid, cur, target};
                     if (cur < target) {
-                        if (set_priority(pid, target) == 0) g_reassert_count++;
+                        /* 低于目标：抬高 */
+                        if (set_priority(pid, target) == 0) {
+                            g_reassert_count++;
+                            applied_set(pid, target);
+                        }
+                    } else if (cur > target && cur < BAND_FOREGROUND &&
+                               prev && prev->band == cur) {
+                        /* 高于目标且是我们上次设的：用户把滑块调低了，跟着降 */
+                        if (set_priority(pid, target) == 0) {
+                            g_reassert_count++;
+                            applied_set(pid, target);
+                        }
                     }
                 } else if (path_matches(path, g_demote, g_ndemote, NULL, NULL)) {
                     /* 只在非前台时降，且只降到 BACKGROUND，避免误杀正在用的 App */
@@ -326,9 +376,15 @@ int main(void) {
                         demoted_now++;
                         set_priority(pid, BAND_BACKGROUND);
                     }
+                } else if (prev && prev->band == cur && cur > BAND_BACKGROUND &&
+                           cur < BAND_FOREGROUND) {
+                    /* 规则被删：把我们抬过的档位还回普通后台 */
+                    if (set_priority(pid, BAND_BACKGROUND) == 0)
+                        prev->band = BAND_BACKGROUND;
                 }
             }
             free(list);
+            applied_prune();
         }
 
         write_status(protected_now, demoted_now, plist, nplist);
