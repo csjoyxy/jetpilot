@@ -322,31 +322,57 @@ typedef struct {
     int32_t     target;
 } protected_entry_t;
 
+/* status.txt 按需写：内容不变时最多每 STATUS_HEARTBEAT_SECS 秒写一次（心跳），省写盘 */
+#define STATUS_HEARTBEAT_SECS 60
+static char  *g_last_body = NULL;   /* 上次成功写盘的内容（不含 updated= 行） */
+static size_t g_last_body_len = 0;
+static time_t g_last_write = 0;     /* 上次成功写盘的 CLOCK_MONOTONIC 秒 */
+
 static void write_status(int protected_now, int demoted_now,
                          protected_entry_t *plist, int nplist) {
-    /* 先写临时文件再 rename，原子替换：App 永远读不到写一半的 status.txt */
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", STATUS_PATH);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    time_t t = time(NULL);
-    char ts[64]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
-    fprintf(f, "updated=%s\nprotect_rules=%d\ndemote_rules=%d\n"
+    /* 1. 先在内存里拼出除 updated= 以外的全部内容 */
+    char *body = NULL; size_t blen = 0;
+    FILE *m = open_memstream(&body, &blen);
+    if (!m) return;
+    fprintf(m, "protect_rules=%d\ndemote_rules=%d\n"
                "protected_pids=%d\ndemoted_pids=%d\nreasserts_total=%lu\n",
-            ts, g_nprotect, g_ndemote, protected_now, demoted_now, g_reassert_count);
+            g_nprotect, g_ndemote, protected_now, demoted_now, g_reassert_count);
     /* 失败记录：无失败时只写总数 0，App 端隐藏红色区域 */
-    fprintf(f, "set_fail_total=%lu\n", g_set_fail_total);
+    fprintf(m, "set_fail_total=%lu\n", g_set_fail_total);
     if (g_set_fail_total > 0)
-        fprintf(f, "last_error=%d|%s|%d|%d|%s\n",
+        fprintf(m, "last_error=%d|%s|%d|%d|%s\n",
                 g_last_err_no, g_last_err_text,
                 (int)g_last_err_pid, g_last_err_target, g_last_err_time);
     for (int i = 0; i < nplist; i++)
-        fprintf(f, "protected_app=%s|%d|%d|%d\n",
+        fprintf(m, "protected_app=%s|%d|%d|%d\n",
                 plist[i].frag, (int)plist[i].pid, plist[i].cur, plist[i].target);
+    int merr = ferror(m);
+    fclose(m);                         /* fclose 后 body/blen 才有效 */
+    if (merr || !body) { free(body); return; }
+
+    /* 2. 内容没变且心跳未到 → 不写盘 */
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    int same = g_last_body && blen == g_last_body_len &&
+               memcmp(body, g_last_body, blen) == 0;
+    if (same && now.tv_sec - g_last_write < STATUS_HEARTBEAT_SECS) { free(body); return; }
+
+    /* 3. 写盘：先写临时文件再 rename，原子替换：App 永远读不到写一半的 status.txt */
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", STATUS_PATH);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { free(body); return; }
+    time_t t = time(NULL);
+    char ts[64]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    fprintf(f, "updated=%s\n", ts);
+    fwrite(body, 1, blen, f);
     int werr = ferror(f);  /* 必须在 fclose 之前查 */
     fclose(f);
-    if (werr) { unlink(tmp); return; }  /* 写坏了就不转正，保留旧 status.txt */
-    rename(tmp, STATUS_PATH);
+    if (werr) { unlink(tmp); free(body); return; }  /* 写坏了就不转正，保留旧 status.txt */
+    if (rename(tmp, STATUS_PATH) != 0) { unlink(tmp); free(body); return; }
+    /* 4. 成功才记账；失败下轮重试 */
+    free(g_last_body);
+    g_last_body = body; g_last_body_len = blen;
+    g_last_write = now.tv_sec;
 }
 
 static int g_locked = 0;

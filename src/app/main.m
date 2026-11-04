@@ -15,6 +15,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
 extern int posix_spawnattr_set_persona_np(const posix_spawnattr_t *, uid_t, uint32_t);
@@ -27,6 +29,21 @@ static NSString *const kConfig  = @"/var/mobile/Library/JetsamPilot/config.txt";
 static NSString *const kFlag    = @"/var/mobile/Library/JetsamPilot/running.flag";
 static NSString *const kStatus  = @"/var/mobile/Library/JetsamPilot/status.txt";
 static NSString *const kPidFile = @"/var/mobile/Library/JetsamPilot/daemon.pid";
+
+typedef NS_ENUM(NSInteger, JPDaemonState) {
+    JPDaemonStateRunning,
+    JPDaemonStateStopped,   /* 用户主动停止：running.flag 不在 */
+    JPDaemonStateDead,      /* flag 在，但开机后没跑过 / 进程已退出 */
+};
+
+/* 本次开机时间（秒）；取不到返回 0 */
+static time_t JPBootTime(void) {
+    struct timeval bt = {0};
+    size_t len = sizeof(bt);
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(mib, 2, &bt, &len, NULL, 0) != 0) return 0;
+    return bt.tv_sec;
+}
 
 static NSString *DefaultConfig(void) {
     return @"# JetsamPilot 规则（iOS 16 档位：后台 30，前台 100）\n"
@@ -1815,6 +1832,8 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, strong) UIView *saveNoticeToast;
 @property (nonatomic, strong) NSTimer *saveNoticeTimer;
 @property (nonatomic, strong) NSTimer *pollingTimer;
+@property (nonatomic, strong) UIButton *deadBanner;
+@property (nonatomic, assign) CFAbsoluteTime lastSpawnTime;
 @end
 
 @implementation MainViewController
@@ -1917,7 +1936,21 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         [self.contentStackView.widthAnchor constraintEqualToAnchor:self.scrollView.frameLayoutGuide.widthAnchor constant:-32]
     ]];
 
+    // 0. 守护进程异常未运行时的红条（默认隐藏，UIStackView 自动收起）
     // 1. Status Section
+    self.deadBanner = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.deadBanner.translatesAutoresizingMaskIntoConstraints = NO;
+    self.deadBanner.backgroundColor = UIColor.systemRedColor;
+    self.deadBanner.layer.cornerRadius = 12;
+    self.deadBanner.layer.cornerCurve = kCACornerCurveContinuous;
+    [self.deadBanner setTitle:@"守护进程未运行，点击启动" forState:UIControlStateNormal];
+    [self.deadBanner setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.deadBanner.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    [self.deadBanner.heightAnchor constraintEqualToConstant:44].active = YES;
+    [self.deadBanner addTarget:self action:@selector(startDaemon) forControlEvents:UIControlEventTouchUpInside];
+    self.deadBanner.hidden = YES;
+    [self.contentStackView addArrangedSubview:self.deadBanner];
+
     UILabel *statusHeader = [self createSectionHeader:@"运行状态"];
     self.statusCard = [JPStatusCardView new];
     __weak typeof(self) weakSelf = self;
@@ -2269,21 +2302,29 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 #pragma mark - Daemon Control
 
-- (BOOL)isDaemonRunning {
+- (JPDaemonState)daemonState {
     NSFileManager *fm = NSFileManager.defaultManager;
-    if (![fm fileExistsAtPath:kFlag]) {
-        return NO;
-    }
+    if (![fm fileExistsAtPath:kFlag]) return JPDaemonStateStopped;
+
+    /* 刚启动的 10 秒宽限：守护进程可能还没写出第一份 status.txt */
+    if (self.lastSpawnTime > 0 && CFAbsoluteTimeGetCurrent() - self.lastSpawnTime < 10.0)
+        return JPDaemonStateRunning;
+
+    /* status.txt 早于本次开机 = 开机后没跑过（不受 pid 复用影响） */
+    NSDate *mtime = [[fm attributesOfItemAtPath:kStatus error:nil] fileModificationDate];
+    time_t boot = JPBootTime();
+    if (!mtime) return JPDaemonStateDead;
+    if (boot > 0 && (time_t)mtime.timeIntervalSince1970 < boot) return JPDaemonStateDead;
+
     NSString *pidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
-    if (pidStr && pidStr.length > 0) {
-        pid_t pid = (pid_t)[pidStr intValue];
-        if (pid > 0) {
-            if (kill(pid, 0) != 0 && errno == ESRCH) {
-                return NO;
-            }
-        }
-    }
-    return YES;
+    pid_t pid = (pid_t)[pidStr intValue];
+    if (pid <= 0) return JPDaemonStateDead;
+    if (kill(pid, 0) != 0 && errno == ESRCH) return JPDaemonStateDead;
+    return JPDaemonStateRunning;   /* 0 或 EPERM（root 进程）都算活着 */
+}
+
+- (BOOL)isDaemonRunning {
+    return [self daemonState] == JPDaemonStateRunning;
 }
 
 - (void)toggleDaemon {
@@ -2295,6 +2336,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)startDaemon {
+    /* 异常未运行时，daemon.pid 里的旧 pid 可能已被别的进程复用，
+     * 会骗过守护进程自己的防重复检查，先删掉 */
+    if ([self daemonState] == JPDaemonStateDead)
+        [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
     [self saveConfig];
     [@"run" writeToFile:kFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
@@ -2310,6 +2355,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     const char *argv[] = { bin.fileSystemRepresentation, NULL };
     int rc = posix_spawn(&pid, bin.fileSystemRepresentation, NULL, &attr, (char **)argv, environ);
     posix_spawnattr_destroy(&attr);
+    if (rc == 0) self.lastSpawnTime = CFAbsoluteTimeGetCurrent();
 
     if (rc != 0) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"启动失败"
@@ -2362,7 +2408,9 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)refreshStatus {
-    BOOL running = [self isDaemonRunning];
+    JPDaemonState state = [self daemonState];
+    BOOL running = (state == JPDaemonStateRunning);
+    self.deadBanner.hidden = (state != JPDaemonStateDead);
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     [self.statusCard updateWithStatus:st isRunning:running];
     [self refreshKilledStatsIfNeeded:NO];
