@@ -141,15 +141,15 @@ static void applied_remove(pid_t pid) {
 #define MAX_OLD_TARGETS 64
 typedef struct {
     pid_t   pid;
-    int32_t target;
+    int32_t band;   /* 上次我们设定的实际档位（cur），不是 target */
 } old_target_t;
 static old_target_t g_old_targets[MAX_OLD_TARGETS];
 static int g_nold_targets = 0;
 
-static int old_target_find(pid_t pid, int32_t *target_out) {
+static int old_target_find(pid_t pid, int32_t *band_out) {
     for (int i = 0; i < g_nold_targets; i++) {
         if (g_old_targets[i].pid == pid) {
-            if (target_out) *target_out = g_old_targets[i].target;
+            if (band_out) *band_out = g_old_targets[i].band;
             return 1;
         }
     }
@@ -190,14 +190,14 @@ static void load_old_targets(void) {
             int found = 0;
             for (int i = 0; i < g_nold_targets; i++) {
                 if (g_old_targets[i].pid == (pid_t)pid) {
-                    g_old_targets[i].target = target;
+                    g_old_targets[i].band = cur;
                     found = 1;
                     break;
                 }
             }
             if (!found) {
                 g_old_targets[g_nold_targets].pid = (pid_t)pid;
-                g_old_targets[g_nold_targets].target = target;
+                g_old_targets[g_nold_targets].band = cur;
                 g_nold_targets++;
             }
         }
@@ -441,9 +441,9 @@ int main(void) {
                             applied_set(pid, target);
                         }
                     } else if (cur > target && cur < BAND_FOREGROUND) {
-                        int32_t old_target = 0;
-                        if (!prev && old_target_find(pid, &old_target) && cur == old_target) {
-                            /* 首轮认领旧档位：pid 在旧表里且当前档位等于旧 target */
+                        int32_t old_band = 0;
+                        if (!prev && old_target_find(pid, &old_band) && cur == old_band) {
+                            /* 首轮认领旧档位：pid 在旧表里且当前档位等于旧实际档位 */
                             applied_set(pid, cur);
                             prev = applied_find(pid);
                         }
