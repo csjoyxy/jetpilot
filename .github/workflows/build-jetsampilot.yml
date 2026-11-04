@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - "review/**"   # 预览分支：推分支即 CI 出包，真机验证 ok 才合 main
     tags:
       - "v*"
     paths:
