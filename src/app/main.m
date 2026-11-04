@@ -24,11 +24,13 @@ extern int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t *, uid_t);
 extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *, uid_t);
 extern char **environ;
 
-static NSString *const kDir     = @"/var/mobile/Library/JetsamPilot";
-static NSString *const kConfig  = @"/var/mobile/Library/JetsamPilot/config.txt";
-static NSString *const kFlag    = @"/var/mobile/Library/JetsamPilot/running.flag";
-static NSString *const kStatus  = @"/var/mobile/Library/JetsamPilot/status.txt";
-static NSString *const kPidFile = @"/var/mobile/Library/JetsamPilot/daemon.pid";
+static NSString *const kDir        = @"/var/mobile/Library/JetsamPilot";
+static NSString *const kConfig     = @"/var/mobile/Library/JetsamPilot/config.txt";
+static NSString *const kFlag       = @"/var/mobile/Library/JetsamPilot/running.flag";
+static NSString *const kStatus     = @"/var/mobile/Library/JetsamPilot/status.txt";
+static NSString *const kPidFile    = @"/var/mobile/Library/JetsamPilot/daemon.pid";
+static NSString *const kLogFile    = @"/var/mobile/Library/JetsamPilot/daemon.log";
+static NSString *const kLogOldFile = @"/var/mobile/Library/JetsamPilot/daemon.log.1";
 
 typedef NS_ENUM(NSInteger, JPDaemonState) {
     JPDaemonStateRunning,
@@ -104,6 +106,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) pid_t pid;
 @property (nonatomic, assign) NSInteger currentBand;
 @property (nonatomic, assign) NSInteger targetBand;
+@property (nonatomic, copy) NSString *procLabel;   /* nil = 旧守护进程未提供 */
 @end
 
 @implementation JPProtectedApp
@@ -190,6 +193,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     if (!raw || raw.length == 0) return st;
 
     NSMutableArray<JPProtectedApp *> *apps = [NSMutableArray array];
+    NSMutableDictionary<NSNumber *, NSString *> *labels = [NSMutableDictionary dictionary];
     NSArray<NSString *> *lines = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
     for (NSString *line in lines) {
         if ([line hasPrefix:@"updated="]) {
@@ -209,6 +213,14 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             JPProtectedApp *app = [self parseProtectedAppLine:line];
             if (app) {
                 [apps addObject:app];
+            }
+        } else if ([line hasPrefix:@"protected_proc="]) {
+            NSString *rest = [line substringFromIndex:15];
+            NSRange bar = [rest rangeOfString:@"|"];
+            if (bar.location != NSNotFound) {
+                int pidVal = [[rest substringToIndex:bar.location] intValue];
+                NSString *lab = [rest substringFromIndex:bar.location + 1];
+                if (pidVal > 0 && lab.length > 0) labels[@(pidVal)] = lab;
             }
         } else if ([line hasPrefix:@"set_fail_total="]) {
             @try {
@@ -265,6 +277,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             }
         }
     }
+    for (JPProtectedApp *a in apps) a.procLabel = labels[@(a.pid)];
     st.protectedApps = [apps copy];
     return st;
 }
@@ -1800,12 +1813,191 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     } else {
         humanStatus = @"高于目标";
     }
+    NSString *kind = @"";
+    if (app.procLabel.length > 0)
+        kind = [app.procLabel isEqualToString:@"main"]
+             ? @"主程序 · "
+             : [NSString stringWithFormat:@"扩展 %@ · ", app.procLabel];
     cell.detailTextLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-    cell.detailTextLabel.text = [NSString stringWithFormat:@"pid %d · 当前 %ld → 目标 %ld · %@",
-                                 (int)app.pid, (long)app.currentBand, (long)app.targetBand, humanStatus];
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@pid %d · 当前 %ld → 目标 %ld · %@",
+                                 kind, (int)app.pid, (long)app.currentBand, (long)app.targetBand, humanStatus];
+    cell.detailTextLabel.numberOfLines = 0;   /* 扩展名长时换行，不截断 */
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     return cell;
+}
+
+@end
+
+#pragma mark - Controllers: Log View Controller
+
+@interface JPLogViewController : UIViewController
+@property (nonatomic, strong) UITextView *textView;
+@property (nonatomic, strong) UIBarButtonItem *clearItem;
+@end
+
+@implementation JPLogViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"调试日志";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+
+    UIBarButtonItem *copyBtn = [[UIBarButtonItem alloc] initWithTitle:@"复制"
+                                                                style:UIBarButtonItemStylePlain
+                                                               target:self
+                                                               action:@selector(copyLog)];
+    self.clearItem = [[UIBarButtonItem alloc] initWithTitle:@"清空"
+                                                      style:UIBarButtonItemStylePlain
+                                                     target:self
+                                                     action:@selector(confirmClearLog)];
+    self.navigationItem.rightBarButtonItems = @[copyBtn, self.clearItem];
+
+    self.textView = [[UITextView alloc] initWithFrame:CGRectZero];
+    self.textView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.textView.editable = NO;
+    self.textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    self.textView.textColor = UIColor.labelColor;
+    self.textView.backgroundColor = UIColor.systemGroupedBackgroundColor;
+    self.textView.alwaysBounceVertical = YES;
+    self.textView.textContainerInset = UIEdgeInsetsMake(12, 12, 12, 12);
+    self.textView.layoutManager.allowsNonContiguousLayout = NO;
+
+    UIRefreshControl *rc = [UIRefreshControl new];
+    [rc addTarget:self action:@selector(loadLog) forControlEvents:UIControlEventValueChanged];
+    self.textView.refreshControl = rc;
+
+    [self.view addSubview:self.textView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.textView.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [self.textView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.textView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.textView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self loadLog];
+}
+
+- (void)loadLog {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:kLogFile]) {
+        self.textView.text = @"暂无日志";
+        self.textView.textColor = UIColor.secondaryLabelColor;
+        self.textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+        [self.textView.refreshControl endRefreshing];
+        return;
+    }
+
+    NSError *err = nil;
+    NSDictionary<NSFileAttributeKey, id> *attrs = [fm attributesOfItemAtPath:kLogFile error:&err];
+    unsigned long long fileSize = [attrs[NSFileSize] unsignedLongLongValue];
+    if (fileSize == 0) {
+        self.textView.text = @"暂无日志";
+        self.textView.textColor = UIColor.secondaryLabelColor;
+        self.textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+        [self.textView.refreshControl endRefreshing];
+        return;
+    }
+
+    NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:kLogFile];
+    if (!handle) {
+        self.textView.text = @"暂无日志";
+        self.textView.textColor = UIColor.secondaryLabelColor;
+        self.textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+        [self.textView.refreshControl endRefreshing];
+        return;
+    }
+
+    const unsigned long long kTailLimit = 64 * 1024;
+    BOOL seeked = NO;
+    if (fileSize > kTailLimit) {
+        [handle seekToFileOffset:(fileSize - kTailLimit)];
+        seeked = YES;
+    }
+    NSData *data = [handle readDataToEndOfFile];
+    [handle closeFile];
+
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!text) {
+        text = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding] ?: @"";
+    }
+
+    if (seeked) {
+        /* 丢掉第一行残行再显示 */
+        NSRange firstNewline = [text rangeOfString:@"\n"];
+        if (firstNewline.location != NSNotFound && firstNewline.location + 1 < text.length) {
+            text = [text substringFromIndex:firstNewline.location + 1];
+        }
+    }
+
+    if (text.length == 0) {
+        self.textView.text = @"暂无日志";
+        self.textView.textColor = UIColor.secondaryLabelColor;
+    } else {
+        self.textView.text = text;
+        self.textView.textColor = UIColor.labelColor;
+        [self scrollToBottom];
+    }
+    self.textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    [self.textView.refreshControl endRefreshing];
+}
+
+- (void)scrollToBottom {
+    if (self.textView.text.length == 0) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSRange bottom = NSMakeRange(self.textView.text.length - 1, 1);
+        [self.textView scrollRangeToVisible:bottom];
+    });
+}
+
+- (void)copyLog {
+    if (self.textView.text.length == 0 || [self.textView.text isEqualToString:@"暂无日志"]) {
+        return;
+    }
+    if (self.presentedViewController) return;
+    [UIPasteboard generalPasteboard].string = self.textView.text;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"已复制"
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:alert animated:YES completion:^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [alert dismissViewControllerAnimated:YES completion:nil];
+        });
+    }];
+}
+
+- (void)confirmClearLog {
+    if (self.presentedViewController) return;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清空日志"
+                                                                   message:@"确定清空全部调试日志吗？"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertAction *clearAction = [UIAlertAction actionWithTitle:@"清空"
+                                                          style:UIAlertActionStyleDestructive
+                                                        handler:^(UIAlertAction * _Nonnull action) {
+        [self clearLog];
+    }];
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消"
+                                                           style:UIAlertActionStyleCancel
+                                                         handler:nil];
+    [alert addAction:clearAction];
+    [alert addAction:cancelAction];
+
+    if (alert.popoverPresentationController) {
+        alert.popoverPresentationController.barButtonItem = self.clearItem;
+    }
+
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)clearLog {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:kLogFile error:nil];
+    [fm removeItemAtPath:kLogOldFile error:nil];
+    [self loadLog];
 }
 
 @end
@@ -2086,8 +2278,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     repoButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
     [repoButton addTarget:self action:@selector(openGitHubRepo) forControlEvents:UIControlEventTouchUpInside];
 
+    UIButton *logButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    logButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [logButton setTitle:@"调试日志 ›" forState:UIControlStateNormal];
+    [logButton setTitleColor:UIColor.systemBlueColor forState:UIControlStateNormal];
+    logButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+    logButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [logButton addTarget:self action:@selector(openLogViewer) forControlEvents:UIControlEventTouchUpInside];
+
     [stack addArrangedSubview:versionLabel];
     [stack addArrangedSubview:repoButton];
+    [stack addArrangedSubview:logButton];
     [card addSubview:stack];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -2102,6 +2303,20 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 - (void)openGitHubRepo {
     [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/csjoyxy/jetsampilot"] options:@{} completionHandler:nil];
+}
+
+- (void)openLogViewer {
+    JPLogViewController *vc = [JPLogViewController new];
+    if (self.navigationController) {
+        [self.navigationController pushViewController:vc animated:YES];
+    } else {
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+        vc.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                                                               style:UIBarButtonItemStylePlain
+                                                                              target:self
+                                                                              action:@selector(dismissPresentedController)];
+        [self presentViewController:nav animated:YES completion:nil];
+    }
 }
 
 - (void)setupSaveNoticeToast {

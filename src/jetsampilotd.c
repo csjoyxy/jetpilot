@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <stdarg.h>
 /* iOS SDK 没有 libproc.h，手动声明 */
 #define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
@@ -74,6 +75,71 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define FLAG_PATH   CONFIG_DIR "/running.flag"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define PID_PATH    CONFIG_DIR "/daemon.pid"
+#define JP_VERSION   "0.5.5"
+#define LOG_PATH     CONFIG_DIR "/daemon.log"
+#define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
+#define LOG_MAX_BYTES (256 * 1024)
+
+static void jp_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void jp_log(const char *fmt, ...) {
+    struct stat st;
+    int existed = (stat(LOG_PATH, &st) == 0);
+    if (existed && st.st_size > LOG_MAX_BYTES) {
+        rename(LOG_PATH, LOG_OLD_PATH);          /* 覆盖旧的 .1 */
+        existed = 0;
+    }
+    FILE *f = fopen(LOG_PATH, "a");
+    if (!f) return;
+    if (!existed) {
+        fchmod(fileno(f), 0644);
+    }
+    time_t t = time(NULL);
+    char ts[32]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    fprintf(f, "%s ", ts);
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+#define MAX_SKIP_DEDUP 64
+typedef struct {
+    pid_t   pid;
+    int32_t cur;
+} skip_dedup_t;
+static skip_dedup_t g_skip_dedup[MAX_SKIP_DEDUP];
+static int g_skip_dedup_count = 0;
+static int g_skip_dedup_head = 0;
+
+static int skip_dedup_seen(pid_t pid, int32_t cur) {
+    for (int i = 0; i < g_skip_dedup_count; i++) {
+        if (g_skip_dedup[i].pid == pid) {
+            if (g_skip_dedup[i].cur == cur) return 1;
+            g_skip_dedup[i].cur = cur;
+            return 0;
+        }
+    }
+    if (g_skip_dedup_count < MAX_SKIP_DEDUP) {
+        g_skip_dedup[g_skip_dedup_count].pid = pid;
+        g_skip_dedup[g_skip_dedup_count].cur = cur;
+        g_skip_dedup_count++;
+    } else {
+        g_skip_dedup[g_skip_dedup_head].pid = pid;
+        g_skip_dedup[g_skip_dedup_head].cur = cur;
+        g_skip_dedup_head = (g_skip_dedup_head + 1) % MAX_SKIP_DEDUP;
+    }
+    return 0;
+}
+
+/* 非 SKIP 路径：清掉该 pid 的去重项，去重只对连续 SKIP 生效 */
+static void skip_dedup_clear(pid_t pid) {
+    for (int i = 0; i < g_skip_dedup_count; i++) {
+        if (g_skip_dedup[i].pid == pid) {
+            g_skip_dedup_count--;
+            g_skip_dedup[i] = g_skip_dedup[g_skip_dedup_count];
+            return;
+        }
+    }
+}
 
 #define MAX_RULES 32
 typedef struct {
@@ -313,6 +379,7 @@ static int path_matches(const char *path, rule_t *rules, int n,
 /* status.txt 格式（App 端解析）：
  *   原有 key=value 行保持不变；新增 protected_app 行（可多行）：
  *     protected_app=<路径片段>|<pid>|<当前档位>|<目标档位>
+ *     protected_proc=<pid>|<标签>
  *   旧版 App 忽略不认识的行；新版 App 读不到这些行时显示"暂无数据"。 */
 #define MAX_PROTECTED_LIST 64
 typedef struct {
@@ -320,7 +387,29 @@ typedef struct {
     pid_t       pid;
     int32_t     cur;
     int32_t     target;
+    char        label[64];  /* "main" 或扩展名（不带 .appex） */
 } protected_entry_t;
+
+/* 从可执行路径得出进程标签：主程序 "main"，扩展取 xxx.appex 的 xxx */
+static void proc_label(const char *path, char *out, size_t outsz) {
+    const char *end = NULL;
+    for (const char *p = strstr(path, ".appex/"); p; p = strstr(p + 1, ".appex/"))
+        end = p;                                   /* 最后一个 .appex/ */
+    if (!end) { snprintf(out, outsz, "main"); return; }
+    const char *start = end;
+    while (start > path && start[-1] != '/') start--;
+    int n = (int)(end - start);
+    if (n <= 0) { snprintf(out, outsz, "main"); return; }
+    snprintf(out, outsz, "%.*s", n, start);        /* 超长自动截断 */
+}
+
+/* 日志标签辅助：单线程静态缓冲区，调用 proc_label 提取主程序或扩展名 */
+static const char *proc_label_log(const char *path) {
+    if (!path) return "main";
+    static char buf[64];
+    proc_label(path, buf, sizeof(buf));
+    return buf;
+}
 
 /* status.txt 按需写：内容不变时最多每 STATUS_HEARTBEAT_SECS 秒写一次（心跳），省写盘 */
 #define STATUS_HEARTBEAT_SECS 60
@@ -346,6 +435,8 @@ static void write_status(int protected_now, int demoted_now,
     for (int i = 0; i < nplist; i++)
         fprintf(m, "protected_app=%s|%d|%d|%d\n",
                 plist[i].frag, (int)plist[i].pid, plist[i].cur, plist[i].target);
+    for (int i = 0; i < nplist; i++)
+        fprintf(m, "protected_proc=%d|%s\n", (int)plist[i].pid, plist[i].label);
     int merr = ferror(m);
     fclose(m);                         /* fclose 后 body/blen 才有效 */
     if (merr || !body) { free(body); return; }
@@ -438,6 +529,8 @@ int main(void) {
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     lockmon_init();  /* 锁屏监听（失败则保持常速轮询，不影响保护） */
     load_old_targets();  /* 启动时导入旧 status.txt 记录供首轮认领 */
+    jp_log("%-6s v%s pid=%d old_records=%d locked=%d",
+           "START", JP_VERSION, (int)getpid(), g_nold_targets, g_locked);
 
     while (!should_stop()) {
         if (load_config() != 0) { sleep(5); continue; }
@@ -461,6 +554,8 @@ int main(void) {
 
                 int32_t target = 0;
                 const char *frag = NULL;
+                const char *demote_frag = NULL;
+                int skip_this_round = 0;   /* 本轮是否走了 SKIP：非 SKIP 路径要清去重项 */
                 applied_t *prev = applied_find(pid);
                 if (prev) prev->seen = 1;
                 /* 首轮认领：上个实例记录过、且当前档位仍等于它设的值 */
@@ -469,41 +564,90 @@ int main(void) {
                     if (old_target_find(pid, &ot) && cur == ot) {
                         applied_set(pid, cur);
                         prev = applied_find(pid);   /* 表满时为 NULL，安全 */
+                        jp_log("%-6s pid=%d band=%d", "CLAIM", (int)pid, (int)cur);
                     }
                 }
                 if (path_matches(path, g_protect, g_nprotect, &target, &frag)) {
                     protected_now++;
-                    if (nplist < MAX_PROTECTED_LIST)
-                        plist[nplist++] = (protected_entry_t){frag, pid, cur, target};
+                    if (nplist < MAX_PROTECTED_LIST) {
+                        protected_entry_t *e = &plist[nplist++];
+                        e->frag = frag; e->pid = pid; e->cur = cur; e->target = target;
+                        proc_label(path, e->label, sizeof(e->label));
+                    }
                     if (cur < target) {
                         /* 低于目标：抬高 */
-                        if (set_priority(pid, target) == 0) {
+                        int rc = set_priority(pid, target);
+                        if (rc == 0) {
                             g_reassert_count++;
                             applied_set(pid, target);
+                            jp_log("%-6s pid=%d %s %s %d->%d ok",
+                                   "RAISE", (int)pid, proc_label_log(path), frag, (int)cur, (int)target);
+                        } else {
+                            /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
+                            jp_log("%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
+                                   "RAISE", (int)pid, proc_label_log(path), frag, (int)cur, (int)target,
+                                   g_last_err_no, strerror(g_last_err_no));
                         }
                     } else if (cur > target && cur < BAND_FOREGROUND) {
                         if (prev && prev->band == cur) {
                             /* 高于目标且是我们（或旧实例）设的：跟着降 */
-                            if (set_priority(pid, target) == 0) {
+                            int rc = set_priority(pid, target);
+                            if (rc == 0) {
                                 g_reassert_count++;
                                 applied_set(pid, target);
+                                jp_log("%-6s pid=%d %s %s %d->%d ok",
+                                       "LOWER", (int)pid, proc_label_log(path), frag, (int)cur, (int)target);
+                            } else {
+                                /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
+                                jp_log("%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
+                                       "LOWER", (int)pid, proc_label_log(path), frag, (int)cur, (int)target,
+                                       g_last_err_no, strerror(g_last_err_no));
+                            }
+                        } else {
+                            /* 本轮走了 SKIP：置位，去重表留待连续 SKIP 判断 */
+                            skip_this_round = 1;
+                            if (!skip_dedup_seen(pid, cur)) {
+                                char ours_str[32];
+                                if (prev) snprintf(ours_str, sizeof(ours_str), "%d", (int)prev->band);
+                                else snprintf(ours_str, sizeof(ours_str), "none");
+                                jp_log("%-6s pid=%d %s %s cur=%d target=%d ours=%s",
+                                       "SKIP", (int)pid, proc_label_log(path), frag, (int)cur, (int)target, ours_str);
                             }
                         }
                     }
-                } else if (path_matches(path, g_demote, g_ndemote, NULL, NULL)) {
+                } else if (path_matches(path, g_demote, g_ndemote, NULL, &demote_frag)) {
                     /* 只在非前台时降，且只降到 BACKGROUND，避免误杀正在用的 App */
                     if (cur < BAND_FOREGROUND && cur > BAND_BACKGROUND) {
                         demoted_now++;
-                        set_priority(pid, BAND_BACKGROUND);
+                        int rc = set_priority(pid, BAND_BACKGROUND);
+                        if (rc == 0) {
+                            jp_log("%-6s pid=%d %s %s %d->%d ok",
+                                   "DEMOTE", (int)pid, proc_label_log(path), demote_frag, (int)cur, BAND_BACKGROUND);
+                        } else {
+                            /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
+                            jp_log("%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
+                                   "DEMOTE", (int)pid, proc_label_log(path), demote_frag, (int)cur, BAND_BACKGROUND,
+                                   g_last_err_no, strerror(g_last_err_no));
+                        }
                     }
                 } else if (prev && prev->band == cur && cur > BAND_BACKGROUND &&
                            cur < BAND_FOREGROUND) {
                     /* 规则被删：把我们抬过的档位还回普通后台 */
-                    if (set_priority(pid, BAND_BACKGROUND) == 0) {
+                    int rc = set_priority(pid, BAND_BACKGROUND);
+                    if (rc == 0) {
                         applied_remove(pid);   /* 还回后不再是我们的档位 */
                         prev = NULL;           /* 指针已失效 */
+                        jp_log("%-6s pid=%d %s %d->%d ok",
+                               "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND);
+                    } else {
+                        /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
+                        jp_log("%-6s pid=%d %s %d->%d FAIL errno=%d %s",
+                               "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND,
+                               g_last_err_no, strerror(g_last_err_no));
                     }
                 }
+                /* 本轮没走 SKIP：清掉该 pid 的去重项，去重只对连续 SKIP 生效 */
+                if (!skip_this_round) skip_dedup_clear(pid);
             }
             free(list);
             applied_prune();
@@ -526,6 +670,7 @@ int main(void) {
          * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
     }
 
+    jp_log("STOP");
     unlink(PID_PATH);
     fprintf(stderr, "[JetsamPilot] 收到停止信号，退出\n");
     return 0;
