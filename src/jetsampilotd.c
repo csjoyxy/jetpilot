@@ -482,12 +482,11 @@ int main(void) {
                             applied_set(pid, target);
                         }
                     } else if (cur > target && cur < BAND_FOREGROUND) {
-                        if (prev && prev->band == cur) {
-                            /* 高于目标且是我们（或旧实例）设的：跟着降 */
-                            if (set_priority(pid, target) == 0) {
-                                g_reassert_count++;
-                                applied_set(pid, target);
-                            }
+                        /* 高于目标：直接降到目标。前台 100 已在外层排除，
+                         * 后台中间档位（如 75）无论谁设的都应降到目标 */
+                        if (set_priority(pid, target) == 0) {
+                            g_reassert_count++;
+                            applied_set(pid, target);
                         }
                     }
                 } else if (path_matches(path, g_demote, g_ndemote, NULL, NULL)) {
