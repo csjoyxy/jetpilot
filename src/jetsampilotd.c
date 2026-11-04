@@ -36,6 +36,7 @@
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #include <sys/sysctl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <notify.h>   /* 锁屏状态：com.apple.springboard.lockstate（libSystem 自带） */
 #include <sys/select.h>
@@ -99,7 +100,6 @@ static char     g_last_err_time[64] = "";
 typedef struct { pid_t pid; int32_t band; int seen; } applied_t;
 static applied_t g_applied[MAX_APPLIED];
 static int g_napplied = 0;
-static int g_first_round_done = 0;  /* 首轮结束后置 1，此后无记录 pid 不再认领 */
 
 static applied_t *applied_find(pid_t pid) {
     for (int i = 0; i < g_napplied; i++)
@@ -130,6 +130,81 @@ static void applied_prune(void) {
     g_napplied = j;
 }
 
+static void applied_remove(pid_t pid) {
+    for (int i = 0; i < g_napplied; i++)
+        if (g_applied[i].pid == pid) {
+            g_applied[i] = g_applied[--g_napplied];
+            return;
+        }
+}
+
+#define MAX_OLD_TARGETS 64
+typedef struct {
+    pid_t   pid;
+    int32_t target;
+} old_target_t;
+static old_target_t g_old_targets[MAX_OLD_TARGETS];
+static int g_nold_targets = 0;
+
+static int old_target_find(pid_t pid, int32_t *target_out) {
+    for (int i = 0; i < g_nold_targets; i++) {
+        if (g_old_targets[i].pid == pid) {
+            if (target_out) *target_out = g_old_targets[i].target;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 启动时导入旧 status.txt 记录供首轮认领：
+ * 只有比开机时间新的 status.txt 才导入，防止重启手机后误降档 */
+static void load_old_targets(void) {
+    struct stat st;
+    if (stat(STATUS_PATH, &st) != 0) return;  /* 没有旧文件，不导入 */
+
+    struct timeval boottime;
+    size_t len = sizeof(boottime);
+    int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+    if (sysctl(mib, 2, &boottime, &len, NULL, 0) != 0) return;  /* 取不到，不导入 */
+
+    /* 旧文件比开机还早 → 丢弃 */
+    if (st.st_mtime < boottime.tv_sec) return;
+
+    FILE *f = fopen(STATUS_PATH, "r");
+    if (!f) return;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "protected_app=", 14) != 0) continue;
+        char *p = line + 14;
+        int pid = 0, cur = 0, target = 0;
+        char *bar1 = strchr(p, '|');
+        if (bar1 && sscanf(bar1 + 1, "%d|%d|%d", &pid, &cur, &target) == 3) {
+            /* 格式: protected_app=frag|pid|cur|target */
+        } else if (sscanf(p, "%d|%d|%d", &pid, &cur, &target) == 3) {
+            /* 容错: protected_app=pid|cur|target */
+        } else {
+            continue;
+        }
+        if (pid > 0 && g_nold_targets < MAX_OLD_TARGETS) {
+            int found = 0;
+            for (int i = 0; i < g_nold_targets; i++) {
+                if (g_old_targets[i].pid == (pid_t)pid) {
+                    g_old_targets[i].target = target;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                g_old_targets[g_nold_targets].pid = (pid_t)pid;
+                g_old_targets[g_nold_targets].target = target;
+                g_nold_targets++;
+            }
+        }
+    }
+    fclose(f);
+}
+
 static int load_config(void) {
     FILE *f = fopen(CONFIG_PATH, "r");
     if (!f) return -1;
@@ -144,6 +219,7 @@ static int load_config(void) {
         if (n < 2) continue;
         if (strcmp(verb, "protect") == 0 && g_nprotect < MAX_RULES) {
             if (n < 3 || band <= 0) band = BAND_FOREGROUND - 10; /* 默认 90 */
+            if (band < BAND_BACKGROUND) band = BAND_BACKGROUND;   /* 与 App 滑杆最小值 30 一致 */
             if (band > BAND_MAX_PROTECT) band = BAND_MAX_PROTECT;
             strncpy(g_protect[g_nprotect].frag, frag, 255);
             g_protect[g_nprotect].target = band;
@@ -328,6 +404,7 @@ int main(void) {
     setsid();  /* 脱离拉起它的 App 会话 */
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     lockmon_init();  /* 锁屏监听（失败则保持常速轮询，不影响保护） */
+    load_old_targets();  /* 启动时导入旧 status.txt 记录供首轮认领 */
 
     while (!should_stop()) {
         if (load_config() != 0) { sleep(5); continue; }
@@ -364,15 +441,14 @@ int main(void) {
                             applied_set(pid, target);
                         }
                     } else if (cur > target && cur < BAND_FOREGROUND) {
-                        int is_plugin = (strstr(path, "/PlugIns/") != NULL);
-                        if (!prev && !g_first_round_done && !is_plugin) {
-                            /* 首轮认领旧档位 */
+                        int32_t old_target = 0;
+                        if (!prev && old_target_find(pid, &old_target) && cur == old_target) {
+                            /* 首轮认领旧档位：pid 在旧表里且当前档位等于旧 target */
                             applied_set(pid, cur);
                             prev = applied_find(pid);
                         }
                         if (prev && prev->band == cur) {
-                            /* 高于目标且是我们（或旧实例）设的：跟着降；
-                             * 插件类进程不认领 */
+                            /* 高于目标且是我们（或旧实例）设的：跟着降 */
                             if (set_priority(pid, target) == 0) {
                                 g_reassert_count++;
                                 applied_set(pid, target);
@@ -388,13 +464,15 @@ int main(void) {
                 } else if (prev && prev->band == cur && cur > BAND_BACKGROUND &&
                            cur < BAND_FOREGROUND) {
                     /* 规则被删：把我们抬过的档位还回普通后台 */
-                    if (set_priority(pid, BAND_BACKGROUND) == 0)
-                        prev->band = BAND_BACKGROUND;
+                    if (set_priority(pid, BAND_BACKGROUND) == 0) {
+                        applied_remove(pid);   /* 还回后不再是我们的档位 */
+                        prev = NULL;           /* 指针已失效 */
+                    }
                 }
             }
             free(list);
             applied_prune();
-            g_first_round_done = 1;  /* 首轮结束 */
+            g_nold_targets = 0;  /* 首轮结束，清空旧记录 */
         }
 
         write_status(protected_now, demoted_now, plist, nplist);

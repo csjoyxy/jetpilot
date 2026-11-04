@@ -1774,12 +1774,14 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     cell.textLabel.text = name;
 
     NSString *humanStatus;
-    if (app.currentBand == app.targetBand) {
+    if (app.currentBand >= 100) {
+        humanStatus = @"前台中";
+    } else if (app.currentBand == app.targetBand) {
         humanStatus = @"已达标";
     } else if (app.currentBand < app.targetBand) {
         humanStatus = @"等待提升";
     } else {
-        humanStatus = @"等待降级";
+        humanStatus = @"高于目标";
     }
     cell.detailTextLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
