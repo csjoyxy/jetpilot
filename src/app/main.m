@@ -1773,7 +1773,14 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     cell.textLabel.textColor = UIColor.labelColor;
     cell.textLabel.text = name;
 
-    NSString *humanStatus = (app.currentBand < app.targetBand) ? @"已抬升保护中" : @"已达标";
+    NSString *humanStatus;
+    if (app.currentBand == app.targetBand) {
+        humanStatus = @"已达标";
+    } else if (app.currentBand < app.targetBand) {
+        humanStatus = @"等待提升";
+    } else {
+        humanStatus = @"等待降级";
+    }
     cell.detailTextLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
     cell.detailTextLabel.text = [NSString stringWithFormat:@"pid %d · 当前 %ld → 目标 %ld · %@",
@@ -1940,7 +1947,13 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.addRuleCard = [self createAddRuleCard];
     [self.contentStackView addArrangedSubview:self.addRuleCard];
 
-    // 4. Footer Note
+    // 4. About Section
+    UILabel *aboutHeader = [self createSectionHeader:@"关于"];
+    [self.contentStackView addArrangedSubview:aboutHeader];
+    UIView *aboutCard = [self createAboutCard];
+    [self.contentStackView addArrangedSubview:aboutCard];
+
+    // 5. Footer Note
     UILabel *footer = [UILabel new];
     footer.translatesAutoresizingMaskIntoConstraints = NO;
     footer.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
@@ -2007,6 +2020,53 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [card addGestureRecognizer:tap];
     card.userInteractionEnabled = YES;
     return card;
+}
+
+- (UIView *)createAboutCard {
+    UIView *card = [UIView new];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    card.layer.cornerRadius = 14;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.clipsToBounds = YES;
+
+    UIStackView *stack = [UIStackView new];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 8;
+    stack.alignment = UIStackViewAlignmentLeading;
+
+    UILabel *versionLabel = [UILabel new];
+    versionLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    versionLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    versionLabel.textColor = UIColor.labelColor;
+    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
+    versionLabel.text = [NSString stringWithFormat:@"JetsamPilot v%@", version];
+
+    UIButton *repoButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    repoButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [repoButton setTitle:@"开源仓库：github.com/csjoyxy/jetsampilot" forState:UIControlStateNormal];
+    [repoButton setTitleColor:UIColor.systemBlueColor forState:UIControlStateNormal];
+    repoButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+    repoButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [repoButton addTarget:self action:@selector(openGitHubRepo) forControlEvents:UIControlEventTouchUpInside];
+
+    [stack addArrangedSubview:versionLabel];
+    [stack addArrangedSubview:repoButton];
+    [card addSubview:stack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
+        [stack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [stack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [stack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12]
+    ]];
+
+    return card;
+}
+
+- (void)openGitHubRepo {
+    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/csjoyxy/jetsampilot"] options:@{} completionHandler:nil];
 }
 
 - (void)setupSaveNoticeToast {

@@ -99,6 +99,7 @@ static char     g_last_err_time[64] = "";
 typedef struct { pid_t pid; int32_t band; int seen; } applied_t;
 static applied_t g_applied[MAX_APPLIED];
 static int g_napplied = 0;
+static int g_first_round_done = 0;  /* 首轮结束后置 1，此后无记录 pid 不再认领 */
 
 static applied_t *applied_find(pid_t pid) {
     for (int i = 0; i < g_napplied; i++)
@@ -362,12 +363,20 @@ int main(void) {
                             g_reassert_count++;
                             applied_set(pid, target);
                         }
-                    } else if (cur > target && cur < BAND_FOREGROUND &&
-                               prev && prev->band == cur) {
-                        /* 高于目标且是我们上次设的：用户把滑块调低了，跟着降 */
-                        if (set_priority(pid, target) == 0) {
-                            g_reassert_count++;
-                            applied_set(pid, target);
+                    } else if (cur > target && cur < BAND_FOREGROUND) {
+                        int is_plugin = (strstr(path, "/PlugIns/") != NULL);
+                        if (!prev && !g_first_round_done && !is_plugin) {
+                            /* 首轮认领旧档位 */
+                            applied_set(pid, cur);
+                            prev = applied_find(pid);
+                        }
+                        if (prev && prev->band == cur) {
+                            /* 高于目标且是我们（或旧实例）设的：跟着降；
+                             * 插件类进程不认领 */
+                            if (set_priority(pid, target) == 0) {
+                                g_reassert_count++;
+                                applied_set(pid, target);
+                            }
                         }
                     }
                 } else if (path_matches(path, g_demote, g_ndemote, NULL, NULL)) {
@@ -385,6 +394,7 @@ int main(void) {
             }
             free(list);
             applied_prune();
+            g_first_round_done = 1;  /* 首轮结束 */
         }
 
         write_status(protected_now, demoted_now, plist, nplist);
