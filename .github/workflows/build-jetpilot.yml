@@ -1,4 +1,4 @@
-name: build-jetsampilot
+name: build-jetpilot
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       - "v*"
     paths:
       - "src/**"
-      - ".github/workflows/build-jetsampilot.yml"
+      - ".github/workflows/build-jetpilot.yml"
 
 permissions:
   contents: write
@@ -30,8 +30,8 @@ jobs:
           xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall \
             -miphoneos-version-min=15.0 \
             -framework CoreFoundation \
-            jetsampilotd.c -o jetsampilotd
-          ldid -Sentitlements-daemon.plist jetsampilotd
+            jetpilotd.c -o jetpilotd
+          ldid -Sentitlements-daemon.plist jetpilotd
 
       - name: Build app
         working-directory: src
@@ -39,27 +39,27 @@ jobs:
           xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall -fobjc-arc \
             -miphoneos-version-min=15.0 \
             -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
-            app/main.m -o JetsamPilot
-          ldid -Sentitlements-app.plist JetsamPilot
+            app/main.m -o JetPilot
+          ldid -Sentitlements-app.plist JetPilot
 
       - name: Package tipa
         working-directory: src
         run: |
-          mkdir -p Payload/JetsamPilot.app
-          cp app/Info.plist Payload/JetsamPilot.app/
-          cp app/Icon-*.png Payload/JetsamPilot.app/
-          cp JetsamPilot jetsampilotd Payload/JetsamPilot.app/
-          chmod 755 Payload/JetsamPilot.app/JetsamPilot Payload/JetsamPilot.app/jetsampilotd
-          zip -qr JetsamPilot.tipa Payload
+          mkdir -p Payload/JetPilot.app
+          cp app/Info.plist Payload/JetPilot.app/
+          cp app/Icon-*.png Payload/JetPilot.app/
+          cp JetPilot jetpilotd Payload/JetPilot.app/
+          chmod 755 Payload/JetPilot.app/JetPilot Payload/JetPilot.app/jetpilotd
+          zip -qr JetPilot.tipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
-          name: JetsamPilot
-          path: src/JetsamPilot.tipa
+          name: JetPilot
+          path: src/JetPilot.tipa
 
       # 打 tag（如 v0.1.1）并 push 后，自动把 .tipa 挂到对应 Release 下
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: src/JetsamPilot.tipa
+          files: src/JetPilot.tipa

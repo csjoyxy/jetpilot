@@ -1,4 +1,6 @@
-# JetsamPilot
+# JetPilot
+
+原名 JetsamPilot，v0.6.0 起改名。从旧版升级请看下方《从 JetsamPilot 升级》。
 
 TrollStore 应用 + root 常驻进程：周期性把受保护 App 的 Jetsam 档位抬到目标值，让系统在内存紧张时先杀别的进程。默认规则把 Reynard 保在 90 档。
 
@@ -9,36 +11,47 @@ TrollStore 应用 + root 常驻进程：周期性把受保护 App 的 Jetsam 档
 ```
 src/
   app/main.m                # 巨魔 App 界面：编辑规则、启动/停止常驻进程、看状态
-  app/Info.plist            # App 信息（com.lili.jetsampilot）
-  jetsampilotd.c            # 常驻进程：每 5–10 秒按规则重设 jetsam 档位
+  app/Info.plist            # App 信息（com.lili.jetpilot）
+  jetpilotd.c               # 常驻进程：每 5–10 秒按规则重设 jetsam 档位
   entitlements-app.plist    # App 权限（persona-mgmt 拉起 root 子进程）
   entitlements-daemon.plist # 守护进程权限（memorystatus / jetsam.modify-priority）
 .github/workflows/
-  build-jetsampilot.yml     # Actions：macos-latest 编译 → 打包 .tipa → 上传产物
+  build-jetpilot.yml        # Actions：macos-latest 编译 → 打包 .tipa → 上传产物
 ```
 
 ## 开发者流程
 
-1. 改代码后直接 `push` 到 `main`（或在 Actions 页手动 Run workflow）。
-2. `build-jetsampilot` 自动跑：编译守护进程 → 编译 App → `ldid` 签名 → 打包 `JetsamPilot.tipa` → 上传到 Artifacts（保留 90 天）。
-3. 发版：`git tag v0.x.y && git push origin v0.x.y`（先 push 代码再打 tag）→ Actions 自动把 `JetsamPilot.tipa` 挂到对应 Release 下，仓库首页 Releases 栏直接下载，无需手动传。
-4. 手机上从 Release 下载 `.tipa`，用 TrollStore 安装，打开点「启动」。
-5. 版本历史见下方。
+1. 从 `origin/main` 开 `review/<版本>` 分支改代码，用推送脚本推到 GitHub；
+2. CI 出包，真机验证通过；
+3. 经 GitHub API 把 `main` 快进到验证过的提交（`PATCH git/refs/heads/main`，`force: false`），再经 API 在同一提交建 tag `v<版本>`（具体工具与 §五-5 一致）；
+4. Actions 自动把 JetPilot.tipa 挂到 Release。
 
 ## 规则配置
 
-App 内「保存规则」写入 `/var/mobile/Library/JetsamPilot/config.txt`，常驻进程 5–10 秒内生效：
+App 内「保存规则」写入 `/var/mobile/Library/JetPilot/config.txt`，常驻进程 5–10 秒内生效：
 
 ```
 # protect <路径片段> <档位，最高 95>
 # demote  <路径片段>   （不在前台时降到 30）
 protect Reynard.app/ 90
+protect bid:<目标 App 的 Bundle ID> 90
 ```
+
+Bundle ID 可在 Filza 里打开该 App 的 Info.plist，看 CFBundleIdentifier。
 
 守护进程只碰 `/var/containers/Bundle/Application/` 下的用户 App，绝不动系统进程；档位封顶 95，永不触及前台 100。
 
+## 从 JetsamPilot 升级
+
+1. 在 TrollStore 删除 JetsamPilot；
+2. 安装 JetPilot.tipa，打开后重新添加规则并启动。
+
+新版是新的 Bundle ID 和配置目录，不导入旧规则。
+删除旧 App 不会删掉 `/var/mobile/Library/JetsamPilot/`，留着不影响新版，想清理可用 Filza 删除。
+
 ## 版本历史
 
+- **v0.6.0**（2026-11-05）：改名 JetPilot（Bundle ID、配置目录变更，需删除旧版重装，规则需重新添加）。
 - **v0.5.6**（2026-11-05）：规则按 Bundle ID 精确匹配，避免误伤同名应用；支持规则编辑与自动迁移。
 - **v0.5.5**（2026-11-04）：状态文件按需写入，更省电；守护进程未运行时顶部红条提醒，一键启动；受保护进程标出主程序或扩展；新增调试日志。
 - **v0.5.4**（2026-11-04）：重启后不再误调系统给的档位；扩展进程的档位也会随规则下调；保护中状态显示更准确。

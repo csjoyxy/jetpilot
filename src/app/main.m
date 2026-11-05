@@ -1,12 +1,12 @@
 /*
- * JetsamPilot v0.5.0 — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetPilot v0.6.0 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
  *   xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall -fobjc-arc \
  *     -miphoneos-version-min=15.0 -framework UIKit -framework Foundation \
- *     app/main.m -o JetsamPilot
- *   ldid -Sentitlements-app.plist JetsamPilot
+ *     app/main.m -o JetPilot
+ *   ldid -Sentitlements-app.plist JetPilot
  */
 
 #import <UIKit/UIKit.h>
@@ -24,15 +24,15 @@ extern int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t *, uid_t);
 extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *, uid_t);
 extern char **environ;
 
-static NSString *const kDir        = @"/var/mobile/Library/JetsamPilot";
-static NSString *const kConfig     = @"/var/mobile/Library/JetsamPilot/config.txt";
-static NSString *const kConfigBackup = @"/var/mobile/Library/JetsamPilot/config.txt.pre-0.5.6";
-static NSString *const kMigrationDeclined = @"/var/mobile/Library/JetsamPilot/migration.declined";
-static NSString *const kFlag       = @"/var/mobile/Library/JetsamPilot/running.flag";
-static NSString *const kStatus     = @"/var/mobile/Library/JetsamPilot/status.txt";
-static NSString *const kPidFile    = @"/var/mobile/Library/JetsamPilot/daemon.pid";
-static NSString *const kLogFile    = @"/var/mobile/Library/JetsamPilot/daemon.log";
-static NSString *const kLogOldFile = @"/var/mobile/Library/JetsamPilot/daemon.log.1";
+static NSString *const kDir        = @"/var/mobile/Library/JetPilot";
+static NSString *const kConfig     = @"/var/mobile/Library/JetPilot/config.txt";
+static NSString *const kConfigBackup = @"/var/mobile/Library/JetPilot/config.txt.pre-0.5.6";
+static NSString *const kMigrationDeclined = @"/var/mobile/Library/JetPilot/migration.declined";
+static NSString *const kFlag       = @"/var/mobile/Library/JetPilot/running.flag";
+static NSString *const kStatus     = @"/var/mobile/Library/JetPilot/status.txt";
+static NSString *const kPidFile    = @"/var/mobile/Library/JetPilot/daemon.pid";
+static NSString *const kLogFile    = @"/var/mobile/Library/JetPilot/daemon.log";
+static NSString *const kLogOldFile = @"/var/mobile/Library/JetPilot/daemon.log.1";
 
 typedef NS_ENUM(NSInteger, JPDaemonState) {
     JPDaemonStateRunning,
@@ -50,7 +50,7 @@ static time_t JPBootTime(void) {
 }
 
 static NSString *DefaultConfig(void) {
-    return @"# JetsamPilot 规则（iOS 16 档位：后台 30，前台 100）\n"
+    return @"# JetPilot 规则（iOS 16 档位：后台 30，前台 100）\n"
            @"# protect <路径片段> <档位，最高 95>\n"
            @"# demote  <路径片段>   （不在前台时降到 30）\n"
            @"protect Reynard.app/ 90\n";
@@ -2454,12 +2454,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"JetsamPilot";
+    self.title = @"JetPilot";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.navigationController.navigationBar.prefersLargeTitles = YES;
 
     self.rules = [NSMutableArray array];
-    self.killStatsQueue = dispatch_queue_create("com.lili.jetsampilot.killstats", DISPATCH_QUEUE_SERIAL);
+    self.killStatsQueue = dispatch_queue_create("com.lili.jetpilot.killstats", DISPATCH_QUEUE_SERIAL);
 
     NSFileManager *fm = NSFileManager.defaultManager;
     [fm createDirectoryAtPath:kDir withIntermediateDirectories:YES
@@ -2706,11 +2706,11 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     versionLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
     versionLabel.textColor = UIColor.labelColor;
     NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
-    versionLabel.text = [NSString stringWithFormat:@"JetsamPilot v%@", version];
+    versionLabel.text = [NSString stringWithFormat:@"JetPilot v%@", version];
 
     UIButton *repoButton = [UIButton buttonWithType:UIButtonTypeSystem];
     repoButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [repoButton setTitle:@"开源仓库：github.com/csjoyxy/jetsampilot" forState:UIControlStateNormal];
+    [repoButton setTitle:@"开源仓库：github.com/csjoyxy/jetpilot" forState:UIControlStateNormal];
     [repoButton setTitleColor:UIColor.systemBlueColor forState:UIControlStateNormal];
     repoButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
     repoButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
@@ -2740,7 +2740,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)openGitHubRepo {
-    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/csjoyxy/jetsampilot"] options:@{} completionHandler:nil];
+    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/csjoyxy/jetpilot"] options:@{} completionHandler:nil];
 }
 
 - (void)openLogViewer {
@@ -2909,7 +2909,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 - (BOOL)saveConfigWithError:(NSError **)errorOut {
     NSMutableString *outStr = [NSMutableString string];
-    [outStr appendString:@"# JetsamPilot 规则（iOS 16 档位：后台 30，前台 100）\n"];
+    [outStr appendString:@"# JetPilot 规则（iOS 16 档位：后台 30，前台 100）\n"];
     [outStr appendString:@"# protect <路径片段> <档位，最高 95>\n"];
     [outStr appendString:@"# demote  <路径片段>   （不在前台时降到 30）\n"];
 
@@ -2993,7 +2993,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     NSError *backupErr = nil;
     NSString *configContent = [NSString stringWithContentsOfFile:kConfig encoding:NSUTF8StringEncoding error:&backupErr];
     if (!configContent || ![configContent writeToFile:kConfigBackup atomically:YES encoding:NSUTF8StringEncoding error:&backupErr]) {
-        NSLog(@"[JetsamPilot] 规则备份失败，取消迁移: %@", backupErr);
+        NSLog(@"[JetPilot] 规则备份失败，取消迁移: %@", backupErr);
         return;
     }
 
@@ -3192,7 +3192,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [self saveConfig];
     [@"run" writeToFile:kFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-    NSString *bin = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"jetsampilotd"];
+    NSString *bin = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"jetpilotd"];
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);

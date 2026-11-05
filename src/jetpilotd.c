@@ -1,7 +1,7 @@
 /*
- * jetsampilotd.c — JetsamPilot 常驻进程
+ * jetpilotd.c — JetPilot 常驻进程
  *
- * 作用：周期性读取全系统 jetsam 档位，把「受保护」App（按 bundle 路径片段匹配）
+ * 作用：周期性读取全系统 jetsam 档位，把「受保护」App（按 Bundle ID（`bid:`）或 bundle 路径片段匹配）
  *       的后台档位抬到目标值，让系统在内存紧张时先杀别的进程。
  *
  * 适配：iOS 16.x（档位数值自 iOS 16 起整体 ×10）。iPhone 11 / 16.4.1 主目标。
@@ -9,12 +9,12 @@
  *       与 com.apple.private.jetsam.modify-priority 权限（见 entitlements-daemon.plist）。
  *       这些权限要求按 XNU 一般规则推断，未在 16.4.1 上逐行核实。
  *
- * 编译（GitHub Actions macos-latest，见 .github/workflows/build.yml）：
+ * 编译（GitHub Actions macos-latest，见 .github/workflows/build-jetpilot.yml）：
  *   xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall \
- *     -miphoneos-version-min=15.0 jetsampilotd.c -o jetsampilotd
- *   ldid -Sentitlements-daemon.plist jetsampilotd
+ *     -miphoneos-version-min=15.0 jetpilotd.c -o jetpilotd
+ *   ldid -Sentitlements-daemon.plist jetpilotd
  *
- * 配置：/var/mobile/Library/JetsamPilot/config.txt
+ * 配置：/var/mobile/Library/JetPilot/config.txt
  *   每行一条规则，井号开头是注释。格式：
  *     protect <路径片段> <目标档位>
  *     demote  <路径片段>
@@ -71,12 +71,12 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
                                 void *buffer, size_t buffersize);
 
 /* ---- 配置 ---- */
-#define CONFIG_DIR  "/var/mobile/Library/JetsamPilot"
+#define CONFIG_DIR  "/var/mobile/Library/JetPilot"
 #define CONFIG_PATH CONFIG_DIR "/config.txt"
 #define FLAG_PATH   CONFIG_DIR "/running.flag"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define PID_PATH    CONFIG_DIR "/daemon.pid"
-#define JP_VERSION   "0.5.6"
+#define JP_VERSION   "0.6.0"
 #define LOG_PATH     CONFIG_DIR "/daemon.log"
 #define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
 #define LOG_MAX_BYTES (256 * 1024)
@@ -435,7 +435,7 @@ static int set_priority(pid_t pid, int32_t band) {
         time_t t = time(NULL);
         strftime(g_last_err_time, sizeof(g_last_err_time),
                  "%Y-%m-%d %H:%M:%S", localtime(&t));
-        fprintf(stderr, "[JetsamPilot] set pid %d -> %d 失败: %s\n",
+        fprintf(stderr, "[JetPilot] set pid %d -> %d 失败: %s\n",
                 pid, band, strerror(errno));
     }
     return rc;
@@ -612,7 +612,7 @@ static int wait_lock_change(int secs) {
 
 int main(void) {
     if (geteuid() != 0) {
-        fprintf(stderr, "[JetsamPilot] 必须以 root 运行\n");
+        fprintf(stderr, "[JetPilot] 必须以 root 运行\n");
         return 1;
     }
     /* 防止重复启动：已有实例在跑就直接退出 */
@@ -621,7 +621,7 @@ int main(void) {
         int old = 0;
         if (fscanf(pf, "%d", &old) == 1 && old > 0 && kill(old, 0) == 0) {
             fclose(pf);
-            fprintf(stderr, "[JetsamPilot] 已在运行 (pid %d)\n", old);
+            fprintf(stderr, "[JetPilot] 已在运行 (pid %d)\n", old);
             return 0;
         }
         fclose(pf);
@@ -789,6 +789,6 @@ int main(void) {
 
     jp_log("STOP");
     unlink(PID_PATH);
-    fprintf(stderr, "[JetsamPilot] 收到停止信号，退出\n");
+    fprintf(stderr, "[JetPilot] 收到停止信号，退出\n");
     return 0;
 }
