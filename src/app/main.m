@@ -2989,12 +2989,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     }
 
     // 必改 3-2: 备份失败则不迁移，直接 return（本次不再尝试）
-    if (![fm fileExistsAtPath:kConfigBackup]) {
-        NSError *backupErr = nil;
-        if (![fm copyItemAtPath:kConfig toPath:kConfigBackup error:&backupErr]) {
-            NSLog(@"[JetsamPilot] 规则备份失败，取消迁移: %@", backupErr);
-            return;
-        }
+    // 终审: 每次迁移前都覆盖备份，备份含义为"本次迁移之前"，撤销永远只撤这一次
+    NSError *backupErr = nil;
+    NSString *configContent = [NSString stringWithContentsOfFile:kConfig encoding:NSUTF8StringEncoding error:&backupErr];
+    if (!configContent || ![configContent writeToFile:kConfigBackup atomically:YES encoding:NSUTF8StringEncoding error:&backupErr]) {
+        NSLog(@"[JetsamPilot] 规则备份失败，取消迁移: %@", backupErr);
+        return;
     }
 
     // 备份成功后再修改规则对象
