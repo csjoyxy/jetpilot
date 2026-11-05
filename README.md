@@ -23,15 +23,16 @@ src/
 
 1. 从 `origin/main` 开 `review/<版本>` 分支改代码，用推送脚本推到 GitHub；
 2. CI 出包，真机验证通过；
-3. 经 GitHub API 把 `main` 快进到验证过的提交（`PATCH git/refs/heads/main`，`force: false`），再经 API 在同一提交建 tag `v<版本>`（具体工具与 §五-5 一致）；
-4. Actions 自动把 JetPilot.tipa 挂到 Release。
+3. `PATCH git/refs/heads/main`（`force: false`，只允许快进）把 main 快进到验证过的提交，再经 API 在同一提交建 tag `v<版本>`；
+4. Actions 自动把 JetPilot.tipa 挂到 Release；
+5. 手机上从 Release 下载 .tipa，用 TrollStore 安装，打开点「启动」。
 
 ## 规则配置
 
 App 内「保存规则」写入 `/var/mobile/Library/JetPilot/config.txt`，常驻进程 5–10 秒内生效：
 
 ```
-# protect <路径片段> <档位，最高 95>
+# protect <路径片段 或 bid:Bundle ID> <档位，最高 95>
 # demote  <路径片段>   （不在前台时降到 30）
 protect Reynard.app/ 90
 protect bid:<目标 App 的 Bundle ID> 90
