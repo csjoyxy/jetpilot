@@ -43,6 +43,11 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #include <sys/select.h>
 #include <sys/time.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
+
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *) -2)
+#endif
 
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
@@ -610,6 +615,198 @@ static int wait_lock_change(int secs) {
     return 0;
 }
 
+/* ---- 阶段 A 诊断：Safari 网页进程与相关宿主进程日志 ---- */
+#define PROC_PIDCOALITIONINFO 20
+struct proc_pidcoalitioninfo {
+    uint64_t coalition_id[2];
+    uint64_t reserved1, reserved2, reserved3;
+}; /* [0]=resource [1]=jetsam */
+
+#define PROC_PIDTASKINFO 4
+struct proc_taskinfo {
+    uint64_t pti_virtual_size, pti_resident_size, pti_total_user, pti_total_system,
+             pti_threads_user, pti_threads_system;
+    int32_t  pti_policy, pti_faults, pti_pageins, pti_cow_faults, pti_messages_sent,
+             pti_messages_received, pti_syscalls_mach, pti_syscalls_unix, pti_csw,
+             pti_threadnum, pti_numrunning, pti_priority;
+};
+
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+
+#define MAX_WEBDIAG 64
+typedef struct {
+    pid_t    pid;
+    int32_t  band;
+    uint64_t coal_jet;
+    int      coal_jet_err;
+    int64_t  rss_mb;
+    int      rss_err;
+    pid_t    resp;
+} webdiag_entry_t;
+
+static webdiag_entry_t g_webdiag[MAX_WEBDIAG];
+static int g_webdiag_count = 0;
+
+typedef int (*jp_resp_fn)(pid_t pid, pid_t *out);
+static jp_resp_fn g_resp_fn = NULL;
+
+static void webdiag_init(void) {
+    g_resp_fn = (jp_resp_fn)dlsym(RTLD_DEFAULT, "responsibility_get_pid_responsible_for_pid");
+    if (g_resp_fn) {
+        pid_t out = -1;
+        int r = g_resp_fn(getpid(), &out);
+        /* 解读：out 被改写（!= -1）→ 双参形式，out 为结果、r 为状态；
+                 out 仍为 -1 → 按单参形式理解，r 本身即结果 */
+        pid_t resp;
+        if (out != -1) {
+            resp = out;
+        } else {
+            resp = (r > 0) ? (pid_t)r : -1;
+        }
+        if (resp <= 0) {
+            jp_log("WEBDIAG resp_self=NA resp_r=%d", r);
+        } else {
+            jp_log("WEBDIAG resp_self=%d resp_r=%d", (int)resp, r);
+        }
+    } else {
+        jp_log("WEBDIAG resp_self=NA resp_r=NA");
+    }
+}
+
+static int is_web_proc(const char *path) {
+    if (!path) return 0;
+    size_t len = strlen(path);
+
+    /* 1. 路径以 /com.apple.WebKit.WebContent 结尾 */
+    const char s1[] = "/com.apple.WebKit.WebContent";
+    size_t s1_len = sizeof(s1) - 1;
+    if (len >= s1_len && strcmp(path + len - s1_len, s1) == 0) return 1;
+
+    /* 2. 路径以 /MobileSafari 结尾 */
+    const char s2[] = "/MobileSafari";
+    size_t s2_len = sizeof(s2) - 1;
+    if (len >= s2_len && strcmp(path + len - s2_len, s2) == 0) return 1;
+
+    /* 3. 路径以 /SafariViewService 结尾 */
+    const char s3[] = "/SafariViewService";
+    size_t s3_len = sizeof(s3) - 1;
+    if (len >= s3_len && strcmp(path + len - s3_len, s3) == 0) return 1;
+
+    return 0;
+}
+
+static void webdiag_prune(void) {
+    for (int i = 0; i < g_webdiag_count; ) {
+        if (kill(g_webdiag[i].pid, 0) != 0 && errno == ESRCH) {
+            g_webdiag[i] = g_webdiag[--g_webdiag_count];
+        } else {
+            i++;
+        }
+    }
+}
+
+static void webdiag(pid_t pid, const char *path, int32_t cur) {
+    if (!is_web_proc(path)) return;
+
+    webdiag_prune();
+
+    struct proc_pidcoalitioninfo coal;
+    memset(&coal, 0, sizeof(coal));
+    int coal_ret = proc_pidinfo(pid, PROC_PIDCOALITIONINFO, 0, &coal, sizeof(coal));
+    int coal_errno = errno;
+    int coal_err = (coal_ret != (int)sizeof(coal));
+
+    char coal_res_str[64];
+    char coal_jet_str[64];
+    if (coal_err) {
+        int err = (coal_ret < 0) ? coal_errno : 0;
+        snprintf(coal_res_str, sizeof(coal_res_str), "coal_res=ERR errno=%d", err);
+        snprintf(coal_jet_str, sizeof(coal_jet_str), "coal_jet=ERR errno=%d", err);
+    } else {
+        snprintf(coal_res_str, sizeof(coal_res_str), "coal_res=%llu", (unsigned long long)coal.coalition_id[0]);
+        snprintf(coal_jet_str, sizeof(coal_jet_str), "coal_jet=%llu", (unsigned long long)coal.coalition_id[1]);
+    }
+
+    struct proc_taskinfo taskinfo;
+    memset(&taskinfo, 0, sizeof(taskinfo));
+    int task_ret = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &taskinfo, sizeof(taskinfo));
+    int rss_err = (task_ret != (int)sizeof(taskinfo));
+    int64_t rss_mb = 0;
+    char rss_str[32];
+    if (rss_err) {
+        snprintf(rss_str, sizeof(rss_str), "ERR");
+    } else {
+        rss_mb = (int64_t)(taskinfo.pti_resident_size / 1048576);
+        snprintf(rss_str, sizeof(rss_str), "%lld", (long long)rss_mb);
+    }
+
+    char resp_str[32];
+    char resp_r_str[32];
+    pid_t resp_val = -1;   /* 上次写出的 resp 数值，-1 = NA（去重键，v6 §三） */
+    if (!g_resp_fn) {
+        snprintf(resp_str, sizeof(resp_str), "NA");
+        snprintf(resp_r_str, sizeof(resp_r_str), "NA");
+    } else {
+        pid_t out = -1;
+        int r = g_resp_fn(pid, &out);
+        /* 解读：out 被改写（!= -1）→ 双参形式，out 为结果、r 为状态；
+                 out 仍为 -1 → 按单参形式理解，r 本身即结果 */
+        pid_t resp;
+        if (out != -1) {
+            resp = out;
+        } else {
+            resp = (r > 0) ? (pid_t)r : -1;
+        }
+        resp_val = (resp > 0) ? resp : -1;
+        if (resp <= 0) {
+            snprintf(resp_str, sizeof(resp_str), "NA");
+        } else {
+            snprintf(resp_str, sizeof(resp_str), "%d", (int)resp);
+        }
+        snprintf(resp_r_str, sizeof(resp_r_str), "%d", r);
+    }
+
+    webdiag_entry_t *entry = NULL;
+    for (int i = 0; i < g_webdiag_count; i++) {
+        if (g_webdiag[i].pid == pid) {
+            entry = &g_webdiag[i];
+            break;
+        }
+    }
+
+    if (!entry) {
+        if (g_webdiag_count >= MAX_WEBDIAG) return;
+        entry = &g_webdiag[g_webdiag_count++];
+        entry->pid = pid;
+    } else {
+        int band_changed = (cur != entry->band);
+        int coal_jet_changed = (coal_err != entry->coal_jet_err) ||
+                               (!coal_err && coal.coalition_id[1] != entry->coal_jet);
+        int resp_changed = (resp_val != entry->resp);
+        int rss_changed = 0;
+        if (rss_err != entry->rss_err) {
+            rss_changed = 1;
+        } else if (!rss_err) {
+            int64_t diff = rss_mb - entry->rss_mb;
+            if (diff < 0) diff = -diff;
+            if (diff >= 10) rss_changed = 1;
+        }
+        if (!band_changed && !coal_jet_changed && !resp_changed && !rss_changed) {
+            return;
+        }
+    }
+
+    entry->band = cur;
+    entry->coal_jet = coal_err ? 0 : coal.coalition_id[1];
+    entry->coal_jet_err = coal_err;
+    entry->rss_mb = rss_mb;
+    entry->rss_err = rss_err;
+    entry->resp = resp_val;
+
+    jp_log("WEBDIAG pid=%d band=%d %s %s resp=%s resp_r=%s rss_mb=%s path=%s",
+           (int)pid, (int)cur, coal_res_str, coal_jet_str, resp_str, resp_r_str, rss_str, path);
+}
+
 int main(void) {
     if (geteuid() != 0) {
         fprintf(stderr, "[JetPilot] 必须以 root 运行\n");
@@ -635,6 +832,7 @@ int main(void) {
     load_old_targets();  /* 启动时导入旧 status.txt 记录供首轮认领 */
     jp_log("%-6s v%s pid=%d old_records=%d locked=%d",
            "START", JP_VERSION, (int)getpid(), g_nold_targets, g_locked);
+    webdiag_init();
 
     while (!should_stop()) {
         if (load_config() != 0) { sleep(5); continue; }
@@ -653,6 +851,9 @@ int main(void) {
 
                 char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
                 if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
+
+                webdiag(pid, path, cur);
+
                 /* 只碰用户 App，绝不动系统进程 */
                 if (!strstr(path, "/var/containers/Bundle/Application/")) continue;
 
