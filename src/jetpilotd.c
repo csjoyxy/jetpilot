@@ -633,9 +633,37 @@ struct proc_taskinfo {
 
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 
-#define MAX_WEBDIAG 64
+#define PROC_PIDTBSDINFO 3
+#define PROC_PIDTBSDINFO_MAXCOMLEN 16
+struct proc_bsdinfo {
+    uint32_t pbi_flags;
+    uint32_t pbi_status;
+    uint32_t pbi_xstatus;
+    uint32_t pbi_pid;
+    uint32_t pbi_ppid;
+    uid_t    pbi_uid;
+    gid_t    pbi_gid;
+    uid_t    pbi_ruid;
+    gid_t    pbi_rgid;
+    uid_t    pbi_svuid;
+    gid_t    pbi_svgid;
+    uint32_t rfu_1;
+    char     pbi_comm[PROC_PIDTBSDINFO_MAXCOMLEN];
+    char     pbi_name[2 * PROC_PIDTBSDINFO_MAXCOMLEN];
+    uint32_t pbi_nfiles;
+    uint32_t pbi_pgid;
+    uint32_t pbi_pjobc;
+    uint32_t e_tdev;
+    uint32_t e_tpgid;
+    int32_t  pbi_nice;
+    uint64_t pbi_start_tvsec;
+    uint64_t pbi_start_tvusec;
+};
+
+#define MAX_WEBDIAG 256
 typedef struct {
     pid_t    pid;
+    char     kind[16];
     int32_t  band;
     uint64_t coal_jet;
     int      coal_jet_err;
@@ -646,6 +674,7 @@ typedef struct {
 
 static webdiag_entry_t g_webdiag[MAX_WEBDIAG];
 static int g_webdiag_count = 0;
+static unsigned long long g_webdiag_dropped_total = 0;
 
 typedef int (*jp_resp_fn)(pid_t pid, pid_t *out);
 static jp_resp_fn g_resp_fn = NULL;
@@ -673,42 +702,34 @@ static void webdiag_init(void) {
     }
 }
 
-static int is_web_proc(const char *path) {
-    if (!path) return 0;
+static const char *get_web_proc_kind(const char *path) {
+    if (!path) return NULL;
     size_t len = strlen(path);
 
     /* 1. 路径以 /com.apple.WebKit.WebContent 结尾 */
     const char s1[] = "/com.apple.WebKit.WebContent";
     size_t s1_len = sizeof(s1) - 1;
-    if (len >= s1_len && strcmp(path + len - s1_len, s1) == 0) return 1;
+    if (len >= s1_len && strcmp(path + len - s1_len, s1) == 0) return "web";
 
     /* 2. 路径以 /MobileSafari 结尾 */
     const char s2[] = "/MobileSafari";
     size_t s2_len = sizeof(s2) - 1;
-    if (len >= s2_len && strcmp(path + len - s2_len, s2) == 0) return 1;
+    if (len >= s2_len && strcmp(path + len - s2_len, s2) == 0) return "safari";
 
     /* 3. 路径以 /SafariViewService 结尾 */
     const char s3[] = "/SafariViewService";
     size_t s3_len = sizeof(s3) - 1;
-    if (len >= s3_len && strcmp(path + len - s3_len, s3) == 0) return 1;
+    if (len >= s3_len && strcmp(path + len - s3_len, s3) == 0) return "svs";
 
-    return 0;
+    return NULL;
 }
 
-static void webdiag_prune(void) {
-    for (int i = 0; i < g_webdiag_count; ) {
-        if (kill(g_webdiag[i].pid, 0) != 0 && errno == ESRCH) {
-            g_webdiag[i] = g_webdiag[--g_webdiag_count];
-        } else {
-            i++;
-        }
-    }
+static int is_web_proc(const char *path) {
+    return get_web_proc_kind(path) != NULL;
 }
 
 static void webdiag(pid_t pid, const char *path, int32_t cur) {
     if (!is_web_proc(path)) return;
-
-    webdiag_prune();
 
     struct proc_pidcoalitioninfo coal;
     memset(&coal, 0, sizeof(coal));
@@ -775,10 +796,24 @@ static void webdiag(pid_t pid, const char *path, int32_t cur) {
     }
 
     if (!entry) {
-        if (g_webdiag_count >= MAX_WEBDIAG) return;
+        if (g_webdiag_count >= MAX_WEBDIAG) {
+            g_webdiag_dropped_total++;
+            return;
+        }
         entry = &g_webdiag[g_webdiag_count++];
+        memset(entry, 0, sizeof(*entry));
         entry->pid = pid;
+        const char *k = get_web_proc_kind(path);
+        if (k) {
+            strncpy(entry->kind, k, sizeof(entry->kind) - 1);
+            entry->kind[sizeof(entry->kind) - 1] = '\0';
+        }
     } else {
+        const char *k = get_web_proc_kind(path);
+        if (k && entry->kind[0] == '\0') {
+            strncpy(entry->kind, k, sizeof(entry->kind) - 1);
+            entry->kind[sizeof(entry->kind) - 1] = '\0';
+        }
         int band_changed = (cur != entry->band);
         int coal_jet_changed = (coal_err != entry->coal_jet_err) ||
                                (!coal_err && coal.coalition_id[1] != entry->coal_jet);
@@ -807,6 +842,510 @@ static void webdiag(pid_t pid, const char *path, int32_t cur) {
            (int)pid, (int)cur, coal_res_str, coal_jet_str, resp_str, resp_r_str, rss_str, path);
 }
 
+static void webdiag_gone_scan(void) {
+    for (int i = 0; i < g_webdiag_count; ) {
+        if (kill(g_webdiag[i].pid, 0) == -1 && errno == ESRCH) {
+            jp_log("WEBDIAG gone pid=%d kind=%s coal_jet=%llu last_band=%d last_rss_mb=%lld",
+                   (int)g_webdiag[i].pid,
+                   g_webdiag[i].kind[0] ? g_webdiag[i].kind : "unknown",
+                   (unsigned long long)g_webdiag[i].coal_jet,
+                   (int)g_webdiag[i].band,
+                   (long long)g_webdiag[i].rss_mb);
+            g_webdiag[i] = g_webdiag[--g_webdiag_count];
+        } else {
+            i++;
+        }
+    }
+}
+
+#define XRAISED_PATH     CONFIG_DIR "/webdiag_raised.txt"
+#define XRAISED_TMP_PATH CONFIG_DIR "/webdiag_raised.txt.tmp"
+#define XPROT_FLAG_PATH  CONFIG_DIR "/webdiag_protect"
+
+#define MAX_XRAISED 64
+typedef struct {
+    pid_t    pid;
+    char     kind[16];
+    uint64_t start_tvsec;
+    uint64_t start_tvusec;
+    int32_t  orig;
+} xraised_entry_t;
+
+static xraised_entry_t g_xraised[MAX_XRAISED];
+static int g_xraised_count = 0;
+static int g_xfull = 0;
+
+static int xraised_save(void) {
+    FILE *f = fopen(XRAISED_TMP_PATH, "w");
+    if (!f) return -1;
+    for (int i = 0; i < g_xraised_count; i++) {
+        fprintf(f, "%d %s %llu.%llu %d\n",
+                (int)g_xraised[i].pid,
+                g_xraised[i].kind,
+                (unsigned long long)g_xraised[i].start_tvsec,
+                (unsigned long long)g_xraised[i].start_tvusec,
+                (int)g_xraised[i].orig);
+    }
+    if (fflush(f) != 0) {
+        fclose(f);
+        unlink(XRAISED_TMP_PATH);
+        return -1;
+    }
+    int fd = fileno(f);
+    if (fd < 0 || fsync(fd) != 0) {
+        fclose(f);
+        unlink(XRAISED_TMP_PATH);
+        return -1;
+    }
+    if (fclose(f) != 0) {
+        unlink(XRAISED_TMP_PATH);
+        return -1;
+    }
+    if (rename(XRAISED_TMP_PATH, XRAISED_PATH) != 0) {
+        unlink(XRAISED_TMP_PATH);
+        return -1;
+    }
+    return 0;
+}
+
+static void xraised_restore(void) {
+    int n = 0;
+    int drop = 0;
+    g_xraised_count = 0;
+
+    FILE *f = fopen(XRAISED_PATH, "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            pid_t pid = 0;
+            char kind[16] = {0};
+            uint64_t sec = 0, usec = 0;
+            int32_t orig = 0;
+
+            int matched = sscanf(line, "%d %15s %llu.%llu %d",
+                                 &pid, kind, (unsigned long long *)&sec,
+                                 (unsigned long long *)&usec, &orig);
+            if (matched != 5) {
+                matched = sscanf(line, "%d %15s %llu:%llu %d",
+                                 &pid, kind, (unsigned long long *)&sec,
+                                 (unsigned long long *)&usec, &orig);
+            }
+            if (matched != 5 || pid <= 0) {
+                drop++;
+                continue;
+            }
+
+            int exists = 0;
+            for (int i = 0; i < g_xraised_count; i++) {
+                if (g_xraised[i].pid == pid) { exists = 1; break; }
+            }
+            if (exists) {
+                drop++;
+                continue;
+            }
+
+            // 1. pid 存活
+            if (kill(pid, 0) != 0 && errno == ESRCH) {
+                drop++;
+                continue;
+            }
+
+            // 2. 路径结尾与 kind 一致
+            char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+            if (proc_pidpath(pid, path, sizeof(path)) <= 0) {
+                drop++;
+                continue;
+            }
+            const char *k = get_web_proc_kind(path);
+            if (!k || strcmp(k, kind) != 0) {
+                drop++;
+                continue;
+            }
+
+            // 3. 启动时间与 start 一致
+            struct proc_bsdinfo bsd;
+            memset(&bsd, 0, sizeof(bsd));
+            if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, sizeof(bsd)) != (int)sizeof(bsd)) {
+                drop++;
+                continue;
+            }
+            if (bsd.pbi_start_tvsec != sec || bsd.pbi_start_tvusec != usec) {
+                drop++;
+                continue;
+            }
+
+            if (g_xraised_count < MAX_XRAISED) {
+                g_xraised[g_xraised_count].pid = pid;
+                strncpy(g_xraised[g_xraised_count].kind, kind, sizeof(g_xraised[g_xraised_count].kind) - 1);
+                g_xraised[g_xraised_count].kind[sizeof(g_xraised[g_xraised_count].kind) - 1] = '\0';
+                g_xraised[g_xraised_count].start_tvsec = sec;
+                g_xraised[g_xraised_count].start_tvusec = usec;
+                g_xraised[g_xraised_count].orig = orig;
+                g_xraised_count++;
+                n++;
+            } else {
+                drop++;
+            }
+        }
+        fclose(f);
+    }
+
+    jp_log("WEBDIAG xrestore_load n=%d drop=%d", n, drop);
+    xraised_save();
+}
+
+typedef struct {
+    pid_t pid;
+    int32_t cur;
+    const char *kind;
+    uint64_t coal_jet;
+    int coal_err;
+} diag_proc_t;
+
+static void diag_round(void) {
+    struct timespec diag_start;
+    clock_gettime(CLOCK_MONOTONIC, &diag_start);
+
+    static time_t s_last_diag_sec = 0;
+    long dt = 0;
+    if (s_last_diag_sec > 0) {
+        dt = (long)(diag_start.tv_sec - s_last_diag_sec);
+        if (dt < 0) dt = 0;
+    }
+    s_last_diag_sec = diag_start.tv_sec;
+
+    // 1. gone 扫描
+    webdiag_gone_scan();
+
+    // 2. 读开关：access("/var/mobile/Library/JetPilot/webdiag_protect", F_OK) == 0 为打开
+    int mode_on = (access(XPROT_FLAG_PATH, F_OK) == 0);
+
+    // 3. get_list
+    int count = 0;
+    memorystatus_priority_entry_t *list = get_list(&count);
+    if (!list) {
+        struct timespec diag_end;
+        clock_gettime(CLOCK_MONOTONIC, &diag_end);
+        long proc_ms = (long)((diag_end.tv_sec - diag_start.tv_sec) * 1000 +
+                              (diag_end.tv_nsec - diag_start.tv_nsec) / 1000000);
+        char locked_str[8];
+        if (g_lock_fd < 0) snprintf(locked_str, sizeof(locked_str), "NA");
+        else snprintf(locked_str, sizeof(locked_str), "%d", g_locked ? 1 : 0);
+
+        jp_log("WEBDIAG xsum mode=%s locked=%s list=fail S=NA set=- at90=- below90=- coal_err=- raised_left=%d xfull=%d dt=%ld proc_ms=%ld tracked=%d dropped_total=%llu",
+               mode_on ? "on" : "off",
+               locked_str,
+               g_xraised_count,
+               g_xfull,
+               dt,
+               proc_ms,
+               g_webdiag_count,
+               (unsigned long long)g_webdiag_dropped_total);
+        return;
+    }
+
+    int alloc_count = (count > 0) ? count : 1;
+    diag_proc_t *procs = calloc(alloc_count, sizeof(diag_proc_t));
+    if (!procs) {
+        free(list);
+        return;
+    }
+
+    int safari_idx = -1;
+    for (int i = 0; i < count; i++) {
+        procs[i].pid = list[i].pid;
+        procs[i].cur = list[i].priority;
+        if (procs[i].pid <= 0) continue;
+
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(procs[i].pid, path, sizeof(path)) <= 0) continue;
+
+        procs[i].kind = get_web_proc_kind(path);
+        if (procs[i].kind && strcmp(procs[i].kind, "safari") == 0) {
+            if (safari_idx < 0) {
+                safari_idx = i;
+            }
+        }
+    }
+
+    if (safari_idx >= 0) {
+        struct proc_pidcoalitioninfo coal;
+        memset(&coal, 0, sizeof(coal));
+        int ret = proc_pidinfo(procs[safari_idx].pid, PROC_PIDCOALITIONINFO, 0, &coal, sizeof(coal));
+        if (ret == (int)sizeof(coal)) {
+            procs[safari_idx].coal_jet = coal.coalition_id[1];
+            procs[safari_idx].coal_err = 0;
+        } else {
+            procs[safari_idx].coal_jet = 0;
+            procs[safari_idx].coal_err = 1;
+        }
+    }
+
+    static uint64_t s_last_S = 0;
+    static int s_S_fail_count = 0;
+
+    uint64_t S = 0;
+    int S_valid = 0;
+    int S_is_stale = 0;
+
+    if (safari_idx >= 0) {
+        if (!procs[safari_idx].coal_err) {
+            S = procs[safari_idx].coal_jet;
+            S_valid = 1;
+            S_is_stale = 0;
+            s_last_S = S;
+            s_S_fail_count = 0;
+        } else {
+            s_S_fail_count++;
+            if (s_S_fail_count == 1 && s_last_S != 0) {
+                S = s_last_S;
+                S_valid = 1;
+                S_is_stale = 1;
+            } else {
+                S = 0;
+                S_valid = 0;
+                s_last_S = 0;
+            }
+        }
+    } else {
+        S = 0;
+        S_valid = 0;
+        s_last_S = 0;
+        s_S_fail_count = 0;
+    }
+
+    char coal_err_str[256] = "";
+    int n_coal_err = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (procs[i].kind && strcmp(procs[i].kind, "web") == 0) {
+            struct proc_pidcoalitioninfo coal;
+            memset(&coal, 0, sizeof(coal));
+            int ret = proc_pidinfo(procs[i].pid, PROC_PIDCOALITIONINFO, 0, &coal, sizeof(coal));
+            if (ret == (int)sizeof(coal)) {
+                procs[i].coal_jet = coal.coalition_id[1];
+                procs[i].coal_err = 0;
+            } else {
+                procs[i].coal_jet = 0;
+                procs[i].coal_err = 1;
+                if (n_coal_err > 0) {
+                    strncat(coal_err_str, ",", sizeof(coal_err_str) - strlen(coal_err_str) - 1);
+                }
+                char pbuf[16];
+                snprintf(pbuf, sizeof(pbuf), "%d", (int)procs[i].pid);
+                strncat(coal_err_str, pbuf, sizeof(coal_err_str) - strlen(coal_err_str) - 1);
+                n_coal_err++;
+            }
+        }
+    }
+    if (n_coal_err == 0) {
+        snprintf(coal_err_str, sizeof(coal_err_str), "-");
+    }
+
+    char set_str[16] = "-";
+    char at90_str[16] = "-";
+    char below90_str[256] = "-";
+
+    if (mode_on) {
+        int set_count = 0;
+        for (int i = 0; i < count; i++) {
+            int in_set = 0;
+            if (procs[i].kind && strcmp(procs[i].kind, "safari") == 0) {
+                in_set = 1;
+            } else if (procs[i].kind && strcmp(procs[i].kind, "web") == 0 &&
+                       S_valid && !procs[i].coal_err && procs[i].coal_jet == S) {
+                in_set = 1;
+            }
+            if (!in_set) continue;
+
+            set_count++;
+
+            if (procs[i].cur < 90) {
+                int idx = -1;
+                for (int r = 0; r < g_xraised_count; r++) {
+                    if (g_xraised[r].pid == procs[i].pid) {
+                        idx = r;
+                        break;
+                    }
+                }
+
+                if (idx >= 0) {
+                    int rc = set_priority(procs[i].pid, 90);
+                    if (rc == 0) {
+                        jp_log("WEBDIAG xprot pid=%d kind=%s %d->90 ok",
+                               (int)procs[i].pid, procs[i].kind, (int)procs[i].cur);
+                        procs[i].cur = 90;
+                    } else {
+                        int alive = (kill(procs[i].pid, 0) == 0 || errno != ESRCH) ? 1 : 0;
+                        jp_log("WEBDIAG xprot pid=%d kind=%s %d->90 fail alive=%d",
+                               (int)procs[i].pid, procs[i].kind, (int)procs[i].cur, alive);
+                    }
+                } else {
+                    if (g_xraised_count >= MAX_XRAISED) {
+                        g_xfull++;
+                    } else {
+                        struct proc_bsdinfo bsd;
+                        memset(&bsd, 0, sizeof(bsd));
+                        if (proc_pidinfo(procs[i].pid, PROC_PIDTBSDINFO, 0, &bsd, sizeof(bsd)) != (int)sizeof(bsd)) {
+                            // proc_pidinfo 失败不抬
+                        } else {
+                            g_xraised[g_xraised_count].pid = procs[i].pid;
+                            strncpy(g_xraised[g_xraised_count].kind, procs[i].kind, sizeof(g_xraised[g_xraised_count].kind) - 1);
+                            g_xraised[g_xraised_count].kind[sizeof(g_xraised[g_xraised_count].kind) - 1] = '\0';
+                            g_xraised[g_xraised_count].start_tvsec = bsd.pbi_start_tvsec;
+                            g_xraised[g_xraised_count].start_tvusec = bsd.pbi_start_tvusec;
+                            g_xraised[g_xraised_count].orig = procs[i].cur;
+                            g_xraised_count++;
+
+                            if (xraised_save() != 0) {
+                                g_xraised_count--;
+                                jp_log("WEBDIAG xpersist fail pid=%d", (int)procs[i].pid);
+                            } else {
+                                int rc = set_priority(procs[i].pid, 90);
+                                if (rc == 0) {
+                                    jp_log("WEBDIAG xprot pid=%d kind=%s %d->90 ok",
+                                           (int)procs[i].pid, procs[i].kind, (int)procs[i].cur);
+                                    procs[i].cur = 90;
+                                } else {
+                                    int alive = (kill(procs[i].pid, 0) == 0 || errno != ESRCH) ? 1 : 0;
+                                    jp_log("WEBDIAG xprot pid=%d kind=%s %d->90 fail alive=%d",
+                                           (int)procs[i].pid, procs[i].kind, (int)procs[i].cur, alive);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        int at90_count = 0;
+        int n_below90 = 0;
+        below90_str[0] = '\0';
+
+        for (int i = 0; i < count; i++) {
+            int in_set = 0;
+            if (procs[i].kind && strcmp(procs[i].kind, "safari") == 0) {
+                in_set = 1;
+            } else if (procs[i].kind && strcmp(procs[i].kind, "web") == 0 &&
+                       S_valid && !procs[i].coal_err && procs[i].coal_jet == S) {
+                in_set = 1;
+            }
+            if (!in_set) continue;
+
+            if (procs[i].cur >= 90) {
+                at90_count++;
+            } else {
+                int alive = (kill(procs[i].pid, 0) == 0 || errno != ESRCH);
+                if (alive) {
+                    if (n_below90 > 0) {
+                        strncat(below90_str, ",", sizeof(below90_str) - strlen(below90_str) - 1);
+                    }
+                    char pbuf[16];
+                    snprintf(pbuf, sizeof(pbuf), "%d", (int)procs[i].pid);
+                    strncat(below90_str, pbuf, sizeof(below90_str) - strlen(below90_str) - 1);
+                    n_below90++;
+                }
+            }
+        }
+        if (n_below90 == 0) {
+            snprintf(below90_str, sizeof(below90_str), "-");
+        }
+        snprintf(set_str, sizeof(set_str), "%d", set_count);
+        snprintf(at90_str, sizeof(at90_str), "%d", at90_count);
+
+    } else {
+        int modified = 0;
+        for (int r = 0; r < g_xraised_count; ) {
+            pid_t rpid = g_xraised[r].pid;
+            if (kill(rpid, 0) == -1 && errno == ESRCH) {
+                g_xraised[r] = g_xraised[--g_xraised_count];
+                modified = 1;
+                continue;
+            }
+
+            int found = 0;
+            int32_t rcur = 0;
+            for (int i = 0; i < count; i++) {
+                if (procs[i].pid == rpid) {
+                    rcur = procs[i].cur;
+                    found = 1;
+                    break;
+                }
+            }
+
+            if (!found) {
+                if (kill(rpid, 0) == -1 && errno == ESRCH) {
+                    g_xraised[r] = g_xraised[--g_xraised_count];
+                    modified = 1;
+                    continue;
+                }
+                r++;
+                continue;
+            }
+
+            if (rcur != 90) {
+                g_xraised[r] = g_xraised[--g_xraised_count];
+                modified = 1;
+                continue;
+            }
+
+            int rc = set_priority(rpid, g_xraised[r].orig);
+            if (rc == 0) {
+                jp_log("WEBDIAG xprot_off pid=%d kind=%s 90->%d ok",
+                       (int)rpid, g_xraised[r].kind, (int)g_xraised[r].orig);
+                g_xraised[r] = g_xraised[--g_xraised_count];
+                modified = 1;
+            } else {
+                int alive = (kill(rpid, 0) == 0 || errno != ESRCH) ? 1 : 0;
+                jp_log("WEBDIAG xprot_off pid=%d kind=%s 90->%d fail alive=%d",
+                       (int)rpid, g_xraised[r].kind, (int)g_xraised[r].orig, alive);
+                r++;
+            }
+        }
+        if (modified) {
+            xraised_save();
+        }
+    }
+
+    struct timespec diag_end;
+    clock_gettime(CLOCK_MONOTONIC, &diag_end);
+    long proc_ms = (long)((diag_end.tv_sec - diag_start.tv_sec) * 1000 +
+                          (diag_end.tv_nsec - diag_start.tv_nsec) / 1000000);
+
+    char locked_str[8];
+    if (g_lock_fd < 0) snprintf(locked_str, sizeof(locked_str), "NA");
+    else snprintf(locked_str, sizeof(locked_str), "%d", g_locked ? 1 : 0);
+
+    char S_str[32];
+    if (S_valid) {
+        if (S_is_stale) {
+            snprintf(S_str, sizeof(S_str), "%llu(stale)", (unsigned long long)S);
+        } else {
+            snprintf(S_str, sizeof(S_str), "%llu", (unsigned long long)S);
+        }
+    } else {
+        snprintf(S_str, sizeof(S_str), "NA");
+    }
+
+    jp_log("WEBDIAG xsum mode=%s locked=%s list=ok S=%s set=%s at90=%s below90=%s coal_err=%s raised_left=%d xfull=%d dt=%ld proc_ms=%ld tracked=%d dropped_total=%llu",
+           mode_on ? "on" : "off",
+           locked_str,
+           S_str,
+           set_str,
+           at90_str,
+           below90_str,
+           coal_err_str,
+           g_xraised_count,
+           g_xfull,
+           dt,
+           proc_ms,
+           g_webdiag_count,
+           (unsigned long long)g_webdiag_dropped_total);
+
+    free(procs);
+    free(list);
+}
+
 int main(void) {
     if (geteuid() != 0) {
         fprintf(stderr, "[JetPilot] 必须以 root 运行\n");
@@ -833,8 +1372,12 @@ int main(void) {
     jp_log("%-6s v%s pid=%d old_records=%d locked=%d",
            "START", JP_VERSION, (int)getpid(), g_nold_targets, g_locked);
     webdiag_init();
+    jp_log("WEBDIAG xstart");
+    xraised_restore();
 
     while (!should_stop()) {
+        diag_round();
+
         if (load_config() != 0) { sleep(5); continue; }
 
         int count = 0;
