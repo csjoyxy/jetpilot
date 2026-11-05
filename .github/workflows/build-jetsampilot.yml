@@ -29,6 +29,7 @@ jobs:
         run: |
           xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall \
             -miphoneos-version-min=15.0 \
+            -framework CoreFoundation \
             jetsampilotd.c -o jetsampilotd
           ldid -Sentitlements-daemon.plist jetsampilotd
 

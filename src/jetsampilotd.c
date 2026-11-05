@@ -42,6 +42,7 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #include <notify.h>   /* 锁屏状态：com.apple.springboard.lockstate（libSystem 自带） */
 #include <sys/select.h>
 #include <sys/time.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
@@ -75,7 +76,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define FLAG_PATH   CONFIG_DIR "/running.flag"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define PID_PATH    CONFIG_DIR "/daemon.pid"
-#define JP_VERSION   "0.5.5"
+#define JP_VERSION   "0.5.6"
 #define LOG_PATH     CONFIG_DIR "/daemon.log"
 #define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
 #define LOG_MAX_BYTES (256 * 1024)
@@ -145,10 +146,94 @@ static void skip_dedup_clear(pid_t pid) {
 typedef struct {
     char    frag[256];
     int32_t target;   /* protect 用；demote 规则 target = -1 */
+    int     is_bid;   /* 1 = 按 Bundle ID 匹配；0 = 按路径片段匹配 */
 } rule_t;
 
 static rule_t g_protect[MAX_RULES];  static int g_nprotect = 0;
 static rule_t g_demote[MAX_RULES];   static int g_ndemote  = 0;
+static int g_has_bid_rules = 0;      /* 是否存在 bid: 规则 */
+
+#define MAX_BID_CACHE 64
+typedef struct {
+    char   app_dir[512];
+    char   bid[128];
+    time_t fail_time; /* CLOCK_MONOTONIC 读失败时间；成功为 0 */
+    int    valid;
+} bid_cache_entry_t;
+
+static bid_cache_entry_t g_bid_cache[MAX_BID_CACHE];
+static int g_bid_cache_head = 0;
+
+/* 从进程路径获取主 App Bundle ID：
+ * 截取第一个 .app/ 之前（含 .app）为主 App 目录，扩展归主 App。
+ * 成功永久缓存；失败缓存 60 秒（CLOCK_MONOTONIC 过期重试）。无 .app/ 返回 NULL。 */
+static const char *app_bid_for_path(const char *path) {
+    if (!path) return NULL;
+    const char *dot_app = strstr(path, ".app/");
+    if (!dot_app) return NULL;
+
+    size_t dirlen = (size_t)(dot_app + 4 - path); /* 包含 .app */
+    if (dirlen >= 512) return NULL;
+    char app_dir[512];
+    memcpy(app_dir, path, dirlen);
+    app_dir[dirlen] = '\0';
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    /* 1. 查找缓存 */
+    int slot = -1;
+    for (int i = 0; i < MAX_BID_CACHE; i++) {
+        if (g_bid_cache[i].valid && strcmp(g_bid_cache[i].app_dir, app_dir) == 0) {
+            if (g_bid_cache[i].bid[0] != '\0') {
+                return g_bid_cache[i].bid; /* 成功永久有效 */
+            }
+            if (now.tv_sec - g_bid_cache[i].fail_time < 60) {
+                return NULL; /* 失败在 60 秒内，直接返回 NULL */
+            }
+            /* 超过 60 秒过期，重新读取 */
+            slot = i;
+            break;
+        }
+    }
+
+    /* 2. 读取 CFBundle */
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault,
+                                                          (const UInt8 *)app_dir,
+                                                          dirlen,
+                                                          true);
+    CFBundleRef bundle = url ? CFBundleCreate(kCFAllocatorDefault, url) : NULL;
+    CFStringRef bidRef = bundle ? CFBundleGetIdentifier(bundle) : NULL;
+    char read_bid[128] = {0};
+    int success = 0;
+    if (bidRef) {
+        if (CFStringGetCString(bidRef, read_bid, sizeof(read_bid), kCFStringEncodingUTF8) && read_bid[0] != '\0') {
+            success = 1;
+        }
+    }
+    if (bundle) CFRelease(bundle);
+    if (url) CFRelease(url);
+
+    /* 3. 写入/更新缓存 */
+    if (slot < 0) {
+        slot = g_bid_cache_head;
+        g_bid_cache_head = (g_bid_cache_head + 1) % MAX_BID_CACHE;
+    }
+    strncpy(g_bid_cache[slot].app_dir, app_dir, sizeof(g_bid_cache[slot].app_dir) - 1);
+    g_bid_cache[slot].app_dir[sizeof(g_bid_cache[slot].app_dir) - 1] = '\0';
+    g_bid_cache[slot].valid = 1;
+
+    if (success) {
+        strncpy(g_bid_cache[slot].bid, read_bid, sizeof(g_bid_cache[slot].bid) - 1);
+        g_bid_cache[slot].bid[sizeof(g_bid_cache[slot].bid) - 1] = '\0';
+        g_bid_cache[slot].fail_time = 0;
+        return g_bid_cache[slot].bid;
+    } else {
+        g_bid_cache[slot].bid[0] = '\0';
+        g_bid_cache[slot].fail_time = now.tv_sec;
+        return NULL;
+    }
+}
 static unsigned long g_reassert_count = 0;
 static int g_locked_passes = 0;
 /* set_priority 失败记录：供 App 在状态页红字展示（不用 stderr，常驻进程 setsid 后没人读） */
@@ -282,6 +367,7 @@ static int load_config(void) {
     FILE *f = fopen(CONFIG_PATH, "r");
     if (!f) return -1;
     g_nprotect = g_ndemote = 0;
+    g_has_bid_rules = 0;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
@@ -290,16 +376,21 @@ static int load_config(void) {
         char verb[32], frag[256]; int band = 0;
         int n = sscanf(p, "%31s %255s %d", verb, frag, &band);
         if (n < 2) continue;
+        int is_bid = (strncmp(frag, "bid:", 4) == 0);
         if (strcmp(verb, "protect") == 0 && g_nprotect < MAX_RULES) {
             if (n < 3 || band <= 0) band = BAND_FOREGROUND - 10; /* 默认 90 */
             if (band < BAND_BACKGROUND) band = BAND_BACKGROUND;   /* 与 App 滑杆最小值 30 一致 */
             if (band > BAND_MAX_PROTECT) band = BAND_MAX_PROTECT;
             strncpy(g_protect[g_nprotect].frag, frag, 255);
             g_protect[g_nprotect].target = band;
+            g_protect[g_nprotect].is_bid = is_bid;
+            if (is_bid) g_has_bid_rules = 1;
             g_nprotect++;
         } else if (strcmp(verb, "demote") == 0 && g_ndemote < MAX_RULES) {
             strncpy(g_demote[g_ndemote].frag, frag, 255);
             g_demote[g_ndemote].target = -1;
+            g_demote[g_ndemote].is_bid = is_bid;
+            if (is_bid) g_has_bid_rules = 1;
             g_ndemote++;
         }
     }
@@ -364,13 +455,22 @@ static memorystatus_priority_entry_t *get_list(int *count_out) {
     return buf;
 }
 
-static int path_matches(const char *path, rule_t *rules, int n,
+static int path_matches(const char *path, const char *app_bid,
+                        rule_t *rules, int n,
                         int32_t *target_out, const char **frag_out) {
     for (int i = 0; i < n; i++) {
-        if (strstr(path, rules[i].frag)) {
-            if (target_out) *target_out = rules[i].target;
-            if (frag_out) *frag_out = rules[i].frag;
-            return 1;
+        if (rules[i].is_bid) {
+            if (app_bid && strcmp(app_bid, rules[i].frag + 4) == 0) {
+                if (target_out) *target_out = rules[i].target;
+                if (frag_out) *frag_out = rules[i].frag;
+                return 1;
+            }
+        } else {
+            if (strstr(path, rules[i].frag)) {
+                if (target_out) *target_out = rules[i].target;
+                if (frag_out) *frag_out = rules[i].frag;
+                return 1;
+            }
         }
     }
     return 0;
@@ -378,8 +478,9 @@ static int path_matches(const char *path, rule_t *rules, int n,
 
 /* status.txt 格式（App 端解析）：
  *   原有 key=value 行保持不变；新增 protected_app 行（可多行）：
+ *     bid_support=1
  *     protected_app=<路径片段>|<pid>|<当前档位>|<目标档位>
- *     protected_proc=<pid>|<标签>
+ *     protected_proc=<pid>|<标签>|<bid>
  *   旧版 App 忽略不认识的行；新版 App 读不到这些行时显示"暂无数据"。 */
 #define MAX_PROTECTED_LIST 64
 typedef struct {
@@ -388,6 +489,7 @@ typedef struct {
     int32_t     cur;
     int32_t     target;
     char        label[64];  /* "main" 或扩展名（不带 .appex） */
+    char        bid[128];   /* 主 App Bundle ID，读不到为空串 */
 } protected_entry_t;
 
 /* 从可执行路径得出进程标签：主程序 "main"，扩展取 xxx.appex 的 xxx */
@@ -423,7 +525,8 @@ static void write_status(int protected_now, int demoted_now,
     char *body = NULL; size_t blen = 0;
     FILE *m = open_memstream(&body, &blen);
     if (!m) return;
-    fprintf(m, "protect_rules=%d\ndemote_rules=%d\n"
+    fprintf(m, "bid_support=1\n"
+               "protect_rules=%d\ndemote_rules=%d\n"
                "protected_pids=%d\ndemoted_pids=%d\nreasserts_total=%lu\n",
             g_nprotect, g_ndemote, protected_now, demoted_now, g_reassert_count);
     /* 失败记录：无失败时只写总数 0，App 端隐藏红色区域 */
@@ -436,7 +539,8 @@ static void write_status(int protected_now, int demoted_now,
         fprintf(m, "protected_app=%s|%d|%d|%d\n",
                 plist[i].frag, (int)plist[i].pid, plist[i].cur, plist[i].target);
     for (int i = 0; i < nplist; i++)
-        fprintf(m, "protected_proc=%d|%s\n", (int)plist[i].pid, plist[i].label);
+        fprintf(m, "protected_proc=%d|%s|%s\n",
+                (int)plist[i].pid, plist[i].label, plist[i].bid);
     int merr = ferror(m);
     fclose(m);                         /* fclose 后 body/blen 才有效 */
     if (merr || !body) { free(body); return; }
@@ -567,12 +671,25 @@ int main(void) {
                         jp_log("%-6s pid=%d band=%d", "CLAIM", (int)pid, (int)cur);
                     }
                 }
-                if (path_matches(path, g_protect, g_nprotect, &target, &frag)) {
+                const char *app_bid = NULL;
+                if (g_has_bid_rules) {
+                    app_bid = app_bid_for_path(path);
+                }
+                if (path_matches(path, app_bid, g_protect, g_nprotect, &target, &frag)) {
                     protected_now++;
+                    if (!app_bid) {
+                        app_bid = app_bid_for_path(path);
+                    }
                     if (nplist < MAX_PROTECTED_LIST) {
                         protected_entry_t *e = &plist[nplist++];
                         e->frag = frag; e->pid = pid; e->cur = cur; e->target = target;
                         proc_label(path, e->label, sizeof(e->label));
+                        if (app_bid) {
+                            strncpy(e->bid, app_bid, sizeof(e->bid) - 1);
+                            e->bid[sizeof(e->bid) - 1] = '\0';
+                        } else {
+                            e->bid[0] = '\0';
+                        }
                     }
                     if (cur < target) {
                         /* 低于目标：抬高 */
@@ -615,7 +732,7 @@ int main(void) {
                             }
                         }
                     }
-                } else if (path_matches(path, g_demote, g_ndemote, NULL, &demote_frag)) {
+                } else if (path_matches(path, app_bid, g_demote, g_ndemote, NULL, &demote_frag)) {
                     /* 只在非前台时降，且只降到 BACKGROUND，避免误杀正在用的 App */
                     if (cur < BAND_FOREGROUND && cur > BAND_BACKGROUND) {
                         demoted_now++;

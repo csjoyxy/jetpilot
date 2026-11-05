@@ -26,6 +26,8 @@ extern char **environ;
 
 static NSString *const kDir        = @"/var/mobile/Library/JetsamPilot";
 static NSString *const kConfig     = @"/var/mobile/Library/JetsamPilot/config.txt";
+static NSString *const kConfigBackup = @"/var/mobile/Library/JetsamPilot/config.txt.pre-0.5.6";
+static NSString *const kMigrationDeclined = @"/var/mobile/Library/JetsamPilot/migration.declined";
 static NSString *const kFlag       = @"/var/mobile/Library/JetsamPilot/running.flag";
 static NSString *const kStatus     = @"/var/mobile/Library/JetsamPilot/status.txt";
 static NSString *const kPidFile    = @"/var/mobile/Library/JetsamPilot/daemon.pid";
@@ -96,6 +98,8 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, copy) NSString *pathFragment;
 @property (nonatomic, assign) NSInteger targetBand;
 @property (nonatomic, copy) NSString *displayName;
+@property (nonatomic, assign) BOOL isConflict;
+@property (nonatomic, copy) NSArray<NSString *> *conflictAppNames;
 @end
 
 @implementation JPRule
@@ -107,6 +111,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) NSInteger currentBand;
 @property (nonatomic, assign) NSInteger targetBand;
 @property (nonatomic, copy) NSString *procLabel;   /* nil = 旧守护进程未提供 */
+@property (nonatomic, copy) NSString *bundleId;    /* 主 App Bundle ID，nil = 读失败或旧 daemon */
 @end
 
 @implementation JPProtectedApp
@@ -121,6 +126,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) unsigned long reassertsTotal;
 @property (nonatomic, copy) NSArray<JPProtectedApp *> *protectedApps;
 @property (nonatomic, assign) BOOL hasProtectedAppLines;
+@property (nonatomic, assign) BOOL bidSupport;      /* 守护进程是否支持 bid: 规则 */
 @property (nonatomic, assign) unsigned long setFailTotal;
 @property (nonatomic, assign) BOOL hasSetFailTotal;
 @property (nonatomic, assign) int lastErrorErrno;
@@ -181,6 +187,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     st.updated = @"";
     st.protectedApps = @[];
     st.hasProtectedAppLines = NO;
+    st.bidSupport = NO;
     st.setFailTotal = 0;
     st.hasSetFailTotal = NO;
     st.lastErrorErrno = 0;
@@ -194,10 +201,13 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 
     NSMutableArray<JPProtectedApp *> *apps = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, NSString *> *labels = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSNumber *, NSString *> *bids = [NSMutableDictionary dictionary];
     NSArray<NSString *> *lines = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
     for (NSString *line in lines) {
         if ([line hasPrefix:@"updated="]) {
             st.updated = [line substringFromIndex:8];
+        } else if ([line hasPrefix:@"bid_support="]) {
+            st.bidSupport = ([[line substringFromIndex:12] intValue] == 1);
         } else if ([line hasPrefix:@"protect_rules="]) {
             st.protectRules = [[line substringFromIndex:14] integerValue];
         } else if ([line hasPrefix:@"demote_rules="]) {
@@ -216,11 +226,15 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             }
         } else if ([line hasPrefix:@"protected_proc="]) {
             NSString *rest = [line substringFromIndex:15];
-            NSRange bar = [rest rangeOfString:@"|"];
-            if (bar.location != NSNotFound) {
-                int pidVal = [[rest substringToIndex:bar.location] intValue];
-                NSString *lab = [rest substringFromIndex:bar.location + 1];
+            NSArray<NSString *> *parts = [rest componentsSeparatedByString:@"|"];
+            if (parts.count >= 2) {
+                int pidVal = [parts[0] intValue];
+                NSString *lab = parts[1];
                 if (pidVal > 0 && lab.length > 0) labels[@(pidVal)] = lab;
+                if (parts.count >= 3) {
+                    NSString *bidVal = [parts[2] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                    if (pidVal > 0 && bidVal.length > 0) bids[@(pidVal)] = bidVal;
+                }
             }
         } else if ([line hasPrefix:@"set_fail_total="]) {
             @try {
@@ -277,7 +291,10 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             }
         }
     }
-    for (JPProtectedApp *a in apps) a.procLabel = labels[@(a.pid)];
+    for (JPProtectedApp *a in apps) {
+        a.procLabel = labels[@(a.pid)];
+        a.bundleId = bids[@(a.pid)];
+    }
     st.protectedApps = [apps copy];
     return st;
 }
@@ -361,6 +378,15 @@ static BOOL FragmentMatchesProcessName(NSString *frag, NSString *procName) {
 
 static NSString *ResolveDisplayNameHelper(NSString *frag, NSArray<JPInstalledApp *> *apps) {
     if (!frag || frag.length == 0) return @"";
+    if ([frag hasPrefix:@"bid:"]) {
+        NSString *targetBid = [frag substringFromIndex:4];
+        for (JPInstalledApp *app in apps) {
+            if (app.bundleId.length > 0 && [app.bundleId isEqualToString:targetBid]) {
+                return app.displayName;
+            }
+        }
+        return frag;
+    }
     for (JPInstalledApp *app in apps) {
         if ([frag containsString:app.bundleName] || [app.bundleName containsString:frag]) {
             return app.displayName;
@@ -371,6 +397,20 @@ static NSString *ResolveDisplayNameHelper(NSString *frag, NSArray<JPInstalledApp
 
 static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInstalledApp *> *apps) {
     if (!rule || !procName || procName.length == 0) return NO;
+    if ([rule.pathFragment hasPrefix:@"bid:"]) {
+        NSString *targetBid = [rule.pathFragment substringFromIndex:4];
+        if (apps) {
+            for (JPInstalledApp *app in apps) {
+                if (app.bundleId.length > 0 && [app.bundleId isEqualToString:targetBid]) {
+                    if ([procName localizedCaseInsensitiveCompare:app.bundleId] == NSOrderedSame) return YES;
+                    if (app.displayName.length > 0 && [procName localizedCaseInsensitiveCompare:app.displayName] == NSOrderedSame) return YES;
+                    if (FragmentMatchesProcessName(app.bundleName, procName)) return YES;
+                    break;
+                }
+            }
+        }
+        return NO;
+    }
     if (FragmentMatchesProcessName(rule.pathFragment, procName)) return YES;
     if (apps) {
         for (JPInstalledApp *app in apps) {
@@ -1202,9 +1242,11 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @class JPRuleCardView;
 
 @protocol JPRuleCardViewDelegate <NSObject>
+@optional
 - (void)ruleCardViewDidRequestDelete:(JPRuleCardView *)card;
 - (void)ruleCardView:(JPRuleCardView *)card didChangeBand:(NSInteger)band;
 - (void)ruleCardViewDidFinishBandChange:(JPRuleCardView *)card;
+- (void)ruleCardViewDidTap:(JPRuleCardView *)card;
 @end
 
 @interface JPRuleCardView : UIView
@@ -1212,11 +1254,13 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, weak) id<JPRuleCardViewDelegate> delegate;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *pathLabel;
+@property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *bandLabel;
 @property (nonatomic, strong) UISlider *slider;
 @property (nonatomic, strong) UIButton *deleteButton;
 
 - (instancetype)initWithRule:(JPRule *)rule delegate:(id<JPRuleCardViewDelegate>)delegate;
+- (void)updateStatusWithInfo:(JPStatusInfo *)status daemonRunning:(BOOL)daemonRunning;
 @end
 
 @implementation JPRuleCardView
@@ -1251,21 +1295,39 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.pathLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
     self.pathLabel.text = self.rule.pathFragment;
 
+    self.statusLabel = [UILabel new];
+    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.statusLabel.textColor = UIColor.secondaryLabelColor;
+    self.statusLabel.numberOfLines = 0;
+
     self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.deleteButton setImage:[UIImage systemImageNamed:@"trash"] forState:UIControlStateNormal];
     self.deleteButton.tintColor = UIColor.systemRedColor;
     [self.deleteButton addTarget:self action:@selector(deleteTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    chevron.translatesAutoresizingMaskIntoConstraints = NO;
+    chevron.tintColor = UIColor.tertiaryLabelColor;
+    chevron.contentMode = UIViewContentModeScaleAspectFit;
+
     [self addSubview:self.titleLabel];
     [self addSubview:self.pathLabel];
+    [self addSubview:self.statusLabel];
     [self addSubview:self.deleteButton];
+    [self addSubview:chevron];
 
     [NSLayoutConstraint activateConstraints:@[
-        [self.deleteButton.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
-        [self.deleteButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-12],
-        [self.deleteButton.widthAnchor constraintEqualToConstant:36],
-        [self.deleteButton.heightAnchor constraintEqualToConstant:36],
+        [chevron.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
+        [chevron.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
+        [chevron.widthAnchor constraintEqualToConstant:10],
+        [chevron.heightAnchor constraintEqualToConstant:14],
+
+        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
+        [self.deleteButton.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-6],
+        [self.deleteButton.widthAnchor constraintEqualToConstant:32],
+        [self.deleteButton.heightAnchor constraintEqualToConstant:32],
 
         [self.titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:14],
         [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
@@ -1273,7 +1335,11 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
         [self.pathLabel.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:3],
         [self.pathLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.pathLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8]
+        [self.pathLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+
+        [self.statusLabel.topAnchor constraintEqualToAnchor:self.pathLabel.bottomAnchor constant:5],
+        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.statusLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16]
     ]];
 
     if (self.rule.type == JPRuleTypeProtect) {
@@ -1311,7 +1377,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         [self addSubview:maxHint];
 
         [NSLayoutConstraint activateConstraints:@[
-            [self.bandLabel.topAnchor constraintEqualToAnchor:self.pathLabel.bottomAnchor constant:12],
+            [self.bandLabel.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:10],
             [self.bandLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
             [self.bandLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
 
@@ -1360,10 +1426,75 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
         [self addSubview:badge];
         [NSLayoutConstraint activateConstraints:@[
-            [badge.topAnchor constraintEqualToAnchor:self.pathLabel.bottomAnchor constant:12],
+            [badge.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:10],
             [badge.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
             [badge.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14]
         ]];
+    }
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(cardTapped:)];
+    [self addGestureRecognizer:tap];
+}
+
+- (void)cardTapped:(UITapGestureRecognizer *)gesture {
+    CGPoint pt = [gesture locationInView:self];
+    if (CGRectContainsPoint(self.deleteButton.frame, pt)) return;
+    if (self.slider && CGRectContainsPoint(self.slider.frame, pt)) return;
+    if ([self.delegate respondsToSelector:@selector(ruleCardViewDidTap:)]) {
+        [self.delegate ruleCardViewDidTap:self];
+    }
+}
+
+- (void)updateStatusWithInfo:(JPStatusInfo *)status daemonRunning:(BOOL)daemonRunning {
+    if (!daemonRunning) {
+        self.statusLabel.text = @"守护进程未运行";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        return;
+    }
+    if ([self.rule.pathFragment hasPrefix:@"bid:"] && (!status || !status.bidSupport)) {
+        self.statusLabel.text = @"守护进程版本过低，此规则不生效";
+        self.statusLabel.textColor = UIColor.systemRedColor;
+        return;
+    }
+    // 必改 4-3: 降级规则卡片状态只走前两级（未运行/版本低），否则固定显示说明（status.txt 仅记录保护规则）
+    if (self.rule.type == JPRuleTypeDemote) {
+        self.statusLabel.text = @"不在前台时降到 30";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        return;
+    }
+    if (self.rule.isConflict) {
+        NSString *names = [self.rule.conflictAppNames componentsJoinedByString:@"、"] ?: @"";
+        self.statusLabel.text = [NSString stringWithFormat:@"会命中多个 App：%@，点此重选", names];
+        self.statusLabel.textColor = UIColor.systemOrangeColor;
+        return;
+    }
+
+    NSMutableArray<NSNumber *> *matchedPids = [NSMutableArray array];
+    if (status) {
+        for (JPProtectedApp *pApp in status.protectedApps) {
+            if ([self.rule.pathFragment hasPrefix:@"bid:"]) {
+                NSString *bid = [self.rule.pathFragment substringFromIndex:4];
+                if ([pApp.bundleId isEqualToString:bid] || [pApp.pathFragment isEqualToString:self.rule.pathFragment]) {
+                    [matchedPids addObject:@(pApp.pid)];
+                }
+            } else {
+                // 小问题: 路径匹配使用 isEqualToString，避免 Runner.app/ 把 xRunner.app/ 算成自己的
+                if ([pApp.pathFragment isEqualToString:self.rule.pathFragment]) {
+                    [matchedPids addObject:@(pApp.pid)];
+                }
+            }
+        }
+    }
+
+    if (matchedPids.count == 1) {
+        self.statusLabel.text = [NSString stringWithFormat:@"保护中 · pid %d", [matchedPids.firstObject intValue]];
+        self.statusLabel.textColor = UIColor.systemGreenColor;
+    } else if (matchedPids.count > 1) {
+        self.statusLabel.text = [NSString stringWithFormat:@"保护中 · %lu 个进程", (unsigned long)matchedPids.count];
+        self.statusLabel.textColor = UIColor.systemGreenColor;
+    } else {
+        self.statusLabel.text = @"没在运行 · 打开后自动保护";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
     }
 }
 
@@ -1527,10 +1658,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 - (BOOL)isAppAlreadyAdded:(JPInstalledApp *)app {
     for (JPRule *r in self.existingRules) {
-        if ([r.pathFragment isEqualToString:app.pathFragment] ||
-            [r.pathFragment containsString:app.bundleName] ||
-            [app.bundleName containsString:r.pathFragment]) {
-            return YES;
+        if ([r.pathFragment hasPrefix:@"bid:"]) {
+            NSString *ruleBid = [r.pathFragment substringFromIndex:4];
+            if (app.bundleId.length > 0 && [app.bundleId isEqualToString:ruleBid]) {
+                return YES;
+            }
+        } else {
+            if ([r.pathFragment isEqualToString:app.pathFragment] ||
+                [r.pathFragment containsString:app.bundleName] ||
+                [app.bundleName containsString:r.pathFragment]) {
+                return YES;
+            }
         }
     }
     return NO;
@@ -1580,10 +1718,56 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         return;
     }
 
-    if (self.onSelectApp) {
-        self.onSelectApp(app.pathFragment, app.displayName);
+    NSString *bid = app.bundleId;
+    if (bid && bid.length > 0) {
+        if (self.onSelectApp) {
+            self.onSelectApp([NSString stringWithFormat:@"bid:%@", bid], app.displayName);
+        }
+        [self dismissViewControllerAnimated:YES completion:nil];
+    } else {
+        __weak typeof(self) weakSelf = self;
+        UIAlertController *warn = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                      message:@"这个 App 读不到标识，按目录名匹配，可能会误伤同名 App"
+                                                               preferredStyle:UIAlertControllerStyleAlert];
+        [warn addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            if (weakSelf.onSelectApp) {
+                weakSelf.onSelectApp(app.pathFragment, app.displayName);
+            }
+            [weakSelf dismissViewControllerAnimated:YES completion:nil];
+        }]];
+        // 提交 2 小 1: 选 App 读不到 bundleId 时的提示框加「取消」选项
+        [warn addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:warn animated:YES completion:nil];
     }
-    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)promptManualAddWithText:(NSString *)text type:(JPRuleType)type band:(NSInteger)band {
+    NSMutableArray<NSString *> *matchedNames = [NSMutableArray array];
+    for (JPInstalledApp *app in self.allApps) {
+        if ([app.pathFragment containsString:text] || [text containsString:app.pathFragment] ||
+            [app.bundleName containsString:text] || [text containsString:app.bundleName]) {
+            [matchedNames addObject:app.displayName];
+        }
+    }
+    __weak typeof(self) weakSelf = self;
+    if (matchedNames.count >= 2) {
+        UIAlertController *warn = [UIAlertController alertControllerWithTitle:@"警告"
+                                                                      message:[NSString stringWithFormat:@"该路径片段会同时命中多个 App：%@。确定要继续添加吗？", [matchedNames componentsJoinedByString:@"、"]]
+                                                               preferredStyle:UIAlertControllerStyleAlert];
+        [warn addAction:[UIAlertAction actionWithTitle:@"继续添加" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            if (weakSelf.onManualAdd) {
+                weakSelf.onManualAdd(text, type, band);
+            }
+            [weakSelf dismissViewControllerAnimated:YES completion:nil];
+        }]];
+        [warn addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:warn animated:YES completion:nil];
+    } else {
+        if (weakSelf.onManualAdd) {
+            weakSelf.onManualAdd(text, type, band);
+        }
+        [weakSelf dismissViewControllerAnimated:YES completion:nil];
+    }
 }
 
 - (void)showManualInputDialog {
@@ -1604,10 +1788,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         if (![text containsString:@"/"] && ![text hasSuffix:@".app"]) {
             text = [text stringByAppendingString:@".app/"];
         }
-        if (weakSelf.onManualAdd) {
-            weakSelf.onManualAdd(text, JPRuleTypeProtect, 90);
-        }
-        [weakSelf dismissViewControllerAnimated:YES completion:nil];
+        [weakSelf promptManualAddWithText:text type:JPRuleTypeProtect band:90];
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"添加为降级 (30 档)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
@@ -1616,10 +1797,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         if (![text containsString:@"/"] && ![text hasSuffix:@".app"]) {
             text = [text stringByAppendingString:@".app/"];
         }
-        if (weakSelf.onManualAdd) {
-            weakSelf.onManualAdd(text, JPRuleTypeDemote, 30);
-        }
-        [weakSelf dismissViewControllerAnimated:YES completion:nil];
+        [weakSelf promptManualAddWithText:text type:JPRuleTypeDemote band:30];
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -1637,6 +1815,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, strong) UILabel *emptyLabel;
 @property (nonatomic, strong) NSTimer *pollingTimer;
 @property (nonatomic, strong) JPStatusInfo *status;
+@property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
 @property (nonatomic, copy) NSString * (^nameResolver)(NSString *frag);
 @end
 
@@ -1794,14 +1973,48 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     }
 
     JPProtectedApp *app = self.status.protectedApps[indexPath.row];
-    NSString *name = self.nameResolver ? self.nameResolver(app.pathFragment) : app.pathFragment;
-    if (!name || name.length == 0) {
-        name = app.pathFragment ?: @"";
+    NSString *ruleName = self.nameResolver ? self.nameResolver(app.pathFragment) : app.pathFragment;
+    if (!ruleName || ruleName.length == 0) {
+        ruleName = app.pathFragment ?: @"";
+    }
+
+    JPInstalledApp *realApp = nil;
+    if (app.bundleId.length > 0 && self.installedApps) {
+        for (JPInstalledApp *inst in self.installedApps) {
+            if ([inst.bundleId isEqualToString:app.bundleId]) {
+                realApp = inst;
+                break;
+            }
+        }
     }
 
     cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    cell.textLabel.textColor = UIColor.labelColor;
-    cell.textLabel.text = name;
+
+    BOOL isBidRule = [app.pathFragment hasPrefix:@"bid:"];
+    if (isBidRule) {
+        NSString *displayName = realApp.displayName ?: ruleName;
+        cell.textLabel.attributedText = nil;
+        cell.textLabel.text = displayName;
+        cell.textLabel.textColor = UIColor.labelColor;
+    } else {
+        if (realApp && realApp.displayName.length > 0 && ![realApp.displayName isEqualToString:ruleName]) {
+            NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:ruleName attributes:@{
+                NSForegroundColorAttributeName: UIColor.labelColor,
+                NSFontAttributeName: [UIFont systemFontOfSize:16 weight:UIFontWeightMedium]
+            }];
+            NSString *extra = [NSString stringWithFormat:@" 实际是 %@", realApp.displayName];
+            NSAttributedString *orangePart = [[NSAttributedString alloc] initWithString:extra attributes:@{
+                NSForegroundColorAttributeName: UIColor.systemOrangeColor,
+                NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightRegular]
+            }];
+            [attr appendAttributedString:orangePart];
+            cell.textLabel.attributedText = attr;
+        } else {
+            cell.textLabel.attributedText = nil;
+            cell.textLabel.text = ruleName;
+            cell.textLabel.textColor = UIColor.labelColor;
+        }
+    }
 
     NSString *humanStatus;
     if (app.currentBand >= 100) {
@@ -2002,9 +2215,215 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 @end
 
+#pragma mark - Controllers: Rule Edit
+
+@protocol JPRuleEditViewControllerDelegate <NSObject>
+- (void)ruleEditViewControllerDidSave:(JPRule *)rule;
+- (void)ruleEditViewControllerDidDelete:(JPRule *)rule;
+@end
+
+@interface JPRuleEditViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) JPRule *rule;
+@property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
+@property (nonatomic, copy) NSArray<JPRule *> *existingRules;
+@property (nonatomic, weak) id<JPRuleEditViewControllerDelegate> delegate;
+
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, assign) NSInteger currentBand;
+@property (nonatomic, copy) NSString *currentFrag;
+@property (nonatomic, copy) NSString *currentDisplayName;
+@property (nonatomic, strong) UILabel *sliderValLabel;
+@end
+
+@implementation JPRuleEditViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"编辑规则";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+
+    self.currentBand = self.rule.targetBand;
+    if (self.currentBand < 30) self.currentBand = 30;
+    if (self.currentBand > 95) self.currentBand = 95;
+    self.currentFrag = self.rule.pathFragment ?: @"";
+    self.currentDisplayName = self.rule.displayName ?: @"";
+
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"取消"
+                                                                             style:UIBarButtonItemStylePlain
+                                                                            target:self
+                                                                            action:@selector(cancelTapped)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"保存"
+                                                                              style:UIBarButtonItemStyleDone
+                                                                             target:self
+                                                                             action:@selector(saveTapped)];
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    [self.view addSubview:self.tableView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.tableView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
+}
+
+- (void)cancelTapped {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)saveTapped {
+    self.rule.pathFragment = self.currentFrag;
+    self.rule.displayName = self.currentDisplayName;
+    self.rule.targetBand = self.currentBand;
+    self.rule.isConflict = NO;
+    self.rule.conflictAppNames = nil;
+    if ([self.delegate respondsToSelector:@selector(ruleEditViewControllerDidSave:)]) {
+        [self.delegate ruleEditViewControllerDidSave:self.rule];
+    }
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)reselectApp {
+    JPAppPickerViewController *picker = [JPAppPickerViewController new];
+    picker.allApps = self.installedApps;
+    picker.existingRules = self.existingRules;
+    __weak typeof(self) weakSelf = self;
+    picker.onSelectApp = ^(NSString *pathFragment, NSString *displayName) {
+        weakSelf.currentFrag = pathFragment;
+        weakSelf.currentDisplayName = displayName;
+        [weakSelf.tableView reloadData];
+    };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
+    if (@available(iOS 15.0, *)) {
+        UISheetPresentationController *sheet = nav.sheetPresentationController;
+        sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+        sheet.prefersGrabberVisible = YES;
+    }
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)confirmDelete {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除规则"
+                                                                   message:[NSString stringWithFormat:@"确定要移除对「%@」的规则吗？", self.currentDisplayName]
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        if ([weakSelf.delegate respondsToSelector:@selector(ruleEditViewControllerDidDelete:)]) {
+            [weakSelf.delegate ruleEditViewControllerDidDelete:weakSelf.rule];
+        }
+        [weakSelf dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - Table View
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return (self.rule.type == JPRuleTypeProtect) ? 3 : 2;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (section == 0) return 3;
+    if (self.rule.type == JPRuleTypeProtect && section == 1) return 1;
+    return 1;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (section == 0) return @"应用信息";
+    if (self.rule.type == JPRuleTypeProtect && section == 1) return @"目标保护档位（步进 5）";
+    return nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section == 0) {
+        if (indexPath.row == 0) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+            cell.textLabel.text = @"应用名称";
+            cell.detailTextLabel.text = self.currentDisplayName.length > 0 ? self.currentDisplayName : @"未命名";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        } else if (indexPath.row == 1) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+            cell.textLabel.text = @"规则标识";
+            cell.detailTextLabel.text = self.currentFrag;
+            cell.detailTextLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        } else {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            cell.textLabel.text = @"重新选择 App";
+            cell.textLabel.textColor = UIColor.systemBlueColor;
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            return cell;
+        }
+    } else if (self.rule.type == JPRuleTypeProtect && indexPath.section == 1) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        self.sliderValLabel = [UILabel new];
+        self.sliderValLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        self.sliderValLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        self.sliderValLabel.textColor = UIColor.systemBlueColor;
+        self.sliderValLabel.text = BandDescription(self.currentBand);
+
+        UISlider *slider = [UISlider new];
+        slider.translatesAutoresizingMaskIntoConstraints = NO;
+        slider.minimumValue = 30.0f;
+        slider.maximumValue = 95.0f;
+        slider.value = (float)self.currentBand;
+        [slider addTarget:self action:@selector(sliderMoved:) forControlEvents:UIControlEventValueChanged];
+
+        [cell.contentView addSubview:self.sliderValLabel];
+        [cell.contentView addSubview:slider];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [self.sliderValLabel.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:12],
+            [self.sliderValLabel.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+            [self.sliderValLabel.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+
+            [slider.topAnchor constraintEqualToAnchor:self.sliderValLabel.bottomAnchor constant:10],
+            [slider.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+            [slider.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+            [slider.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-14]
+        ]];
+        return cell;
+    } else {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.textLabel.text = @"删除规则";
+        cell.textLabel.textColor = UIColor.systemRedColor;
+        cell.textLabel.textAlignment = NSTextAlignmentCenter;
+        return cell;
+    }
+}
+
+- (void)sliderMoved:(UISlider *)slider {
+    NSInteger stepped = (NSInteger)lroundf(slider.value / 5.0f) * 5;
+    if (stepped < 30) stepped = 30;
+    if (stepped > 95) stepped = 95;
+    self.currentBand = stepped;
+    self.sliderValLabel.text = BandDescription(stepped);
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section == 0 && indexPath.row == 2) {
+        [self reselectApp];
+    } else if ((self.rule.type == JPRuleTypeProtect && indexPath.section == 2) ||
+               (self.rule.type != JPRuleTypeProtect && indexPath.section == 1)) {
+        [self confirmDelete];
+    }
+}
+
+@end
+
 #pragma mark - Controllers: Main ViewController
 
-@interface MainViewController : UIViewController <JPRuleCardViewDelegate>
+@interface MainViewController : UIViewController <JPRuleCardViewDelegate, JPRuleEditViewControllerDelegate>
 @property (nonatomic, strong) NSMutableArray<JPRule *> *rules;
 @property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
 
@@ -2025,7 +2444,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, strong) NSTimer *saveNoticeTimer;
 @property (nonatomic, strong) NSTimer *pollingTimer;
 @property (nonatomic, strong) UIButton *deadBanner;
+@property (nonatomic, strong) UIButton *versionWarningBanner;
 @property (nonatomic, assign) CFAbsoluteTime lastSpawnTime;
+@property (nonatomic, assign) BOOL migrationAttemptedThisSession;
+@property (nonatomic, strong) JPStatusInfo *lastLoadedStatus;
 @end
 
 @implementation MainViewController
@@ -2142,6 +2564,22 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [self.deadBanner addTarget:self action:@selector(startDaemon) forControlEvents:UIControlEventTouchUpInside];
     self.deadBanner.hidden = YES;
     [self.contentStackView addArrangedSubview:self.deadBanner];
+
+    self.versionWarningBanner = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.versionWarningBanner.translatesAutoresizingMaskIntoConstraints = NO;
+    self.versionWarningBanner.backgroundColor = UIColor.systemRedColor;
+    self.versionWarningBanner.layer.cornerRadius = 12;
+    self.versionWarningBanner.layer.cornerCurve = kCACornerCurveContinuous;
+    // 提交 2 小 2: 文案和点击逻辑改为停止后自动重启守护进程
+    [self.versionWarningBanner setTitle:@"守护进程是旧版本，按 App 添加的规则不会生效。点击重启守护进程。" forState:UIControlStateNormal];
+    [self.versionWarningBanner setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.versionWarningBanner.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.versionWarningBanner.titleLabel.numberOfLines = 0;
+    self.versionWarningBanner.titleLabel.textAlignment = NSTextAlignmentCenter;
+    self.versionWarningBanner.contentEdgeInsets = UIEdgeInsetsMake(10, 14, 10, 14);
+    [self.versionWarningBanner addTarget:self action:@selector(restartDaemon) forControlEvents:UIControlEventTouchUpInside];
+    self.versionWarningBanner.hidden = YES;
+    [self.contentStackView addArrangedSubview:self.versionWarningBanner];
 
     UILabel *statusHeader = [self createSectionHeader:@"运行状态"];
     self.statusCard = [JPStatusCardView new];
@@ -2393,13 +2831,28 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 #pragma mark - Config Management
 
 - (NSString *)resolveDisplayNameForFragment:(NSString *)frag {
-    if (!frag || frag.length == 0) return @"";
-    for (JPInstalledApp *app in self.installedApps) {
-        if ([frag containsString:app.bundleName] || [app.bundleName containsString:frag]) {
-            return app.displayName;
+    return ResolveDisplayNameHelper(frag, self.installedApps);
+}
+
+- (void)evaluateRuleConflict:(JPRule *)r {
+    if (![r.pathFragment hasPrefix:@"bid:"]) {
+        NSMutableArray<NSString *> *matching = [NSMutableArray array];
+        for (JPInstalledApp *app in self.installedApps) {
+            if ([app.pathFragment isEqualToString:r.pathFragment]) {
+                [matching addObject:app.displayName];
+            }
         }
+        if (matching.count >= 2) {
+            r.isConflict = YES;
+            r.conflictAppNames = [matching copy];
+        } else {
+            r.isConflict = NO;
+            r.conflictAppNames = nil;
+        }
+    } else {
+        r.isConflict = NO;
+        r.conflictAppNames = nil;
     }
-    return frag;
 }
 
 - (void)loadConfig {
@@ -2440,6 +2893,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
             r.pathFragment = frag;
             r.targetBand = band;
             r.displayName = [self resolveDisplayNameForFragment:frag];
+            [self evaluateRuleConflict:r];
             [self.rules addObject:r];
         } else if ([verb isEqualToString:@"demote"]) {
             JPRule *r = [JPRule new];
@@ -2447,12 +2901,13 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
             r.pathFragment = frag;
             r.targetBand = 30;
             r.displayName = [self resolveDisplayNameForFragment:frag];
+            [self evaluateRuleConflict:r];
             [self.rules addObject:r];
         }
     }
 }
 
-- (void)saveConfig {
+- (BOOL)saveConfigWithError:(NSError **)errorOut {
     NSMutableString *outStr = [NSMutableString string];
     [outStr appendString:@"# JetsamPilot 规则（iOS 16 档位：后台 30，前台 100）\n"];
     [outStr appendString:@"# protect <路径片段> <档位，最高 95>\n"];
@@ -2471,9 +2926,169 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     NSError *err = nil;
     BOOL ok = [outStr writeToFile:kConfig atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (errorOut) *errorOut = err;
     if (ok) {
         [self showSaveNotice];
     }
+    return ok;
+}
+
+- (void)saveConfig {
+    [self saveConfigWithError:nil];
+}
+
+- (void)checkAndMigrateLegacyRulesIfNeeded:(JPStatusInfo *)status {
+    // 必改 3-1: installedApps 没加载完时先尝试补扫；若仍为空则直接返回，且不置位本次尝试
+    if (self.installedApps.count == 0) {
+        self.installedApps = [JPInstalledApp scanInstalledApps];
+        if (self.installedApps.count > 0) {
+            for (JPRule *r in self.rules) {
+                [self evaluateRuleConflict:r];
+            }
+            [self rebuildRulesCards];
+        }
+    }
+    if (self.installedApps.count == 0) return;
+
+    // 必改 3-4: 撤销持久化标记检查，若用户此前撤销过则不再自动迁移
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if ([fm fileExistsAtPath:kMigrationDeclined]) return;
+
+    if (!status.bidSupport || [self daemonState] != JPDaemonStateRunning) return;
+    if (self.migrationAttemptedThisSession) return;
+    self.migrationAttemptedThisSession = YES;
+
+    // 先检查是否有可迁移规则，不提前污染 self.rules 内存
+    NSMutableArray<NSString *> *migratedNames = [NSMutableArray array];
+    NSInteger conflictCount = 0;
+    BOOL hasChanges = NO;
+
+    for (JPRule *r in self.rules) {
+        if ([r.pathFragment hasPrefix:@"bid:"]) {
+            continue; // 已是 bid 的跳过
+        }
+        NSMutableArray<JPInstalledApp *> *matches = [NSMutableArray array];
+        for (JPInstalledApp *app in self.installedApps) {
+            if ([app.pathFragment isEqualToString:r.pathFragment]) {
+                [matches addObject:app];
+            }
+        }
+        if (matches.count == 1) {
+            JPInstalledApp *app = matches.firstObject;
+            if (app.bundleId.length > 0) {
+                [migratedNames addObject:app.displayName];
+                hasChanges = YES;
+            }
+        } else if (matches.count >= 2) {
+            conflictCount++;
+        }
+    }
+
+    if (!hasChanges) {
+        return;
+    }
+
+    // 必改 3-2: 备份失败则不迁移，直接 return（本次不再尝试）
+    if (![fm fileExistsAtPath:kConfigBackup]) {
+        NSError *backupErr = nil;
+        if (![fm copyItemAtPath:kConfig toPath:kConfigBackup error:&backupErr]) {
+            NSLog(@"[JetsamPilot] 规则备份失败，取消迁移: %@", backupErr);
+            return;
+        }
+    }
+
+    // 备份成功后再修改规则对象
+    for (JPRule *r in self.rules) {
+        if ([r.pathFragment hasPrefix:@"bid:"]) continue;
+
+        NSMutableArray<JPInstalledApp *> *matches = [NSMutableArray array];
+        for (JPInstalledApp *app in self.installedApps) {
+            if ([app.pathFragment isEqualToString:r.pathFragment]) {
+                [matches addObject:app];
+            }
+        }
+        if (matches.count == 1) {
+            JPInstalledApp *app = matches.firstObject;
+            if (app.bundleId.length > 0) {
+                r.pathFragment = [NSString stringWithFormat:@"bid:%@", app.bundleId];
+                r.displayName = app.displayName;
+                r.isConflict = NO;
+                r.conflictAppNames = nil;
+            }
+        } else if (matches.count >= 2) {
+            r.isConflict = YES;
+            r.conflictAppNames = [matches valueForKey:@"displayName"];
+        }
+    }
+
+    NSError *saveErr = nil;
+    if (![self saveConfigWithError:&saveErr]) {
+        [self loadConfig];
+        [self rebuildRulesCards];
+        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"规则升级失败"
+                                                                          message:[NSString stringWithFormat:@"规则升级失败，已保持原样：%@", saveErr ? saveErr.localizedDescription : @"写入错误"]
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+        [errAlert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:errAlert animated:YES completion:nil];
+        return;
+    }
+
+    [self rebuildRulesCards];
+
+    NSString *msg;
+    NSString *namesStr = [migratedNames componentsJoinedByString:@"、"];
+    if (conflictCount > 0) {
+        msg = [NSString stringWithFormat:@"已把 %lu 条规则升级为按 App 识别，更准确：%@。另有 %ld 条会同时命中多个 App，需要你重新选择。",
+               (unsigned long)migratedNames.count, namesStr, (long)conflictCount];
+    } else {
+        msg = [NSString stringWithFormat:@"已把 %lu 条规则升级为按 App 识别，更准确：%@。",
+               (unsigned long)migratedNames.count, namesStr];
+    }
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"规则升级提示"
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"撤销" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSFileManager *fileMgr = NSFileManager.defaultManager;
+        if (![fileMgr fileExistsAtPath:kConfigBackup]) {
+            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"撤销失败"
+                                                                              message:@"未找到备份文件，无法撤销。"
+                                                                       preferredStyle:UIAlertControllerStyleAlert];
+            [errAlert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [strongSelf presentViewController:errAlert animated:YES completion:nil];
+            return;
+        }
+
+        // 必改 3-3: 撤销原子化，读取备份写回，失败弹窗且保持现状
+        NSError *readErr = nil;
+        NSString *backupContent = [NSString stringWithContentsOfFile:kConfigBackup encoding:NSUTF8StringEncoding error:&readErr];
+        NSError *writeErr = nil;
+        BOOL ok = NO;
+        if (backupContent) {
+            ok = [backupContent writeToFile:kConfig atomically:YES encoding:NSUTF8StringEncoding error:&writeErr];
+        }
+        if (!ok) {
+            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"撤销失败"
+                                                                              message:[NSString stringWithFormat:@"恢复规则备份失败，规则文件保持不变：%@", writeErr ? writeErr.localizedDescription : (readErr ? readErr.localizedDescription : @"未知错误")]
+                                                                       preferredStyle:UIAlertControllerStyleAlert];
+            [errAlert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [strongSelf presentViewController:errAlert animated:YES completion:nil];
+            return;
+        }
+
+        // 必改 3-4: 撤销成功后写入持久标记，下次打开不再自动迁移
+        [@"declined" writeToFile:kMigrationDeclined atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        [strongSelf loadConfig];
+        [strongSelf rebuildRulesCards];
+        [strongSelf showSaveNotice];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)rebuildRulesCards {
@@ -2504,8 +3119,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         ]];
         [self.rulesStackView addArrangedSubview:emptyCard];
     } else {
+        JPStatusInfo *st = self.lastLoadedStatus ?: [JPStatusInfo loadCurrentStatus];
+        // 小问题: 与 refreshStatus 统一使用 [self daemonState] == JPDaemonStateRunning
+        BOOL isRunning = ([self daemonState] == JPDaemonStateRunning);
         for (JPRule *rule in self.rules) {
             JPRuleCardView *card = [[JPRuleCardView alloc] initWithRule:rule delegate:self];
+            [card updateStatusWithInfo:st daemonRunning:isRunning];
             [self.rulesStackView addArrangedSubview:card];
         }
     }
@@ -2543,11 +3162,26 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)toggleDaemon {
-    if ([self isDaemonRunning]) {
+    if ([self daemonState] == JPDaemonStateRunning) {
         [self stopDaemon];
     } else {
         [self startDaemon];
     }
+}
+
+// 提交 2 小 2: 停止后自动启动守护进程（复用现有启动流程）
+- (void)restartDaemon {
+    [self stopDaemon];
+    NSString *pidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
+    pid_t pid = (pid_t)[pidStr intValue];
+    if (pid > 0) {
+        kill(pid, SIGTERM);
+    }
+    [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [weakSelf startDaemon];
+    });
 }
 
 - (void)startDaemon {
@@ -2622,13 +3256,30 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     });
 }
 
+- (BOOL)hasBidRules {
+    for (JPRule *r in self.rules) {
+        if ([r.pathFragment hasPrefix:@"bid:"]) return YES;
+    }
+    return NO;
+}
+
 - (void)refreshStatus {
     JPDaemonState state = [self daemonState];
     BOOL running = (state == JPDaemonStateRunning);
     self.deadBanner.hidden = (state != JPDaemonStateDead);
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
+    self.lastLoadedStatus = st;
+    self.versionWarningBanner.hidden = !(running && [self hasBidRules] && !st.bidSupport);
     [self.statusCard updateWithStatus:st isRunning:running];
     [self refreshKilledStatsIfNeeded:NO];
+    for (UIView *v in self.rulesStackView.arrangedSubviews) {
+        if ([v isKindOfClass:[JPRuleCardView class]]) {
+            [(JPRuleCardView *)v updateStatusWithInfo:st daemonRunning:running];
+        }
+    }
+    if (running && st.bidSupport) {
+        [self checkAndMigrateLegacyRulesIfNeeded:st];
+    }
 }
 
 #pragma mark - JPRuleCardViewDelegate
@@ -2665,7 +3316,152 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [self saveConfig];
 }
 
+- (void)ruleCardViewDidTap:(JPRuleCardView *)card {
+    if (card.rule.isConflict) {
+        [self reselectAppForRule:card.rule];
+    } else {
+        [self openEditRuleController:card.rule];
+    }
+}
+
+- (void)reselectAppForRule:(JPRule *)rule {
+    JPAppPickerViewController *picker = [JPAppPickerViewController new];
+    picker.allApps = self.installedApps;
+    picker.existingRules = self.rules;
+    __weak typeof(self) weakSelf = self;
+    picker.onSelectApp = ^(NSString *pathFragment, NSString *displayName) {
+        rule.pathFragment = pathFragment;
+        rule.displayName = displayName;
+        rule.isConflict = NO;
+        rule.conflictAppNames = nil;
+        [weakSelf rebuildRulesCards];
+        [weakSelf saveConfig];
+    };
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
+    if (@available(iOS 15.0, *)) {
+        UISheetPresentationController *sheet = nav.sheetPresentationController;
+        sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+        sheet.prefersGrabberVisible = YES;
+    }
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)openEditRuleController:(JPRule *)rule {
+    JPRuleEditViewController *vc = [JPRuleEditViewController new];
+    vc.rule = rule;
+    vc.installedApps = self.installedApps;
+    vc.existingRules = self.rules;
+    vc.delegate = self;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+#pragma mark - JPRuleEditViewControllerDelegate
+
+- (void)ruleEditViewControllerDidSave:(JPRule *)rule {
+    [self rebuildRulesCards];
+    [self saveConfig];
+}
+
+- (void)ruleEditViewControllerDidDelete:(JPRule *)rule {
+    [self.rules removeObject:rule];
+    [self rebuildRulesCards];
+    [self saveConfig];
+}
+
 #pragma mark - Add Rule Action
+
+- (BOOL)status:(JPStatusInfo *)status hasMatchingAppForRule:(JPRule *)rule {
+    if (!status || status.protectedApps.count == 0) return NO;
+    for (JPProtectedApp *pApp in status.protectedApps) {
+        if ([rule.pathFragment hasPrefix:@"bid:"]) {
+            NSString *bid = [rule.pathFragment substringFromIndex:4];
+            if ([pApp.bundleId isEqualToString:bid] || [pApp.pathFragment isEqualToString:rule.pathFragment]) {
+                return YES;
+            }
+        } else {
+            // 小问题: 路径匹配仅使用 isEqualToString
+            if ([pApp.pathFragment isEqualToString:rule.pathFragment]) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+- (void)checkRuleRunStateAfterAdd:(JPRule *)rule
+                          appName:(NSString *)appName
+                       targetBand:(NSInteger)band
+                             type:(JPRuleType)type
+                         saveTime:(NSDate *)saveTime {
+    NSString *name = appName.length > 0 ? appName : rule.displayName;
+    if (name.length == 0) name = rule.pathFragment;
+
+    // 必改 4-2: 守护进程未运行 / 版本过低时按规则卡片同等优先级直接提示，不轮询
+    BOOL running = ([self daemonState] == JPDaemonStateRunning);
+    if (!running) {
+        [self showAddResultAlert:@"已添加。守护进程没在运行，启动守护进程后才会保护。"];
+        return;
+    }
+
+    JPStatusInfo *initSt = self.lastLoadedStatus ?: [JPStatusInfo loadCurrentStatus];
+    if ([rule.pathFragment hasPrefix:@"bid:"] && (!initSt || !initSt.bidSupport)) {
+        [self showAddResultAlert:@"已添加，但守护进程是旧版本，这条规则不会生效。请停止守护进程再启动。"];
+        return;
+    }
+
+    // 必改 4-3: 降级规则固定提示，不轮询（status.txt 仅记录保护规则）
+    if (type == JPRuleTypeDemote) {
+        NSString *msg = [NSString stringWithFormat:@"已添加。%@ 不在前台时会降到 30。", name];
+        [self showAddResultAlert:msg];
+        return;
+    }
+
+    // 必改 4-1: 保护规则按 status.txt 的 mtime 是否已反映新规则轮询判定，最长等 15 秒
+    NSDate *t0 = saveTime ?: [NSDate date];
+    __block NSInteger checksRemaining = 30; // 30 * 0.5s = 15.0s
+    __weak typeof(self) weakSelf = self;
+    NSTimer *timer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer * _Nonnull t) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) { [t invalidate]; return; }
+
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSDictionary *attrs = [fm attributesOfItemAtPath:kStatus error:nil];
+        NSDate *mtime = attrs.fileModificationDate;
+
+        if (mtime && [mtime compare:t0] == NSOrderedDescending) {
+            // mtime > t0，说明守护进程已在规则保存后写出新的 status.txt
+            [t invalidate];
+            [strongSelf refreshStatus];
+            JPStatusInfo *currentSt = strongSelf.lastLoadedStatus ?: [JPStatusInfo loadCurrentStatus];
+            if ([strongSelf status:currentSt hasMatchingAppForRule:rule]) {
+                NSString *msg = [NSString stringWithFormat:@"已添加，%@ 正在运行，已立即保护到 %ld。", name, (long)band];
+                [strongSelf showAddResultAlert:msg];
+            } else {
+                NSString *msg = [NSString stringWithFormat:@"已添加。%@ 现在没运行，你打开它时会自动保护（不会替你打开）。", name];
+                [strongSelf showAddResultAlert:msg];
+            }
+            return;
+        }
+
+        checksRemaining--;
+        if (checksRemaining <= 0) {
+            [t invalidate];
+            [strongSelf refreshStatus];
+            NSString *msg = @"已添加，守护进程还没处理到这条规则，稍后在规则卡片上看状态";
+            [strongSelf showAddResultAlert:msg];
+        }
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+}
+
+- (void)showAddResultAlert:(NSString *)msg {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
 
 - (void)showAddRuleSheet {
     JPAppPickerViewController *picker = [JPAppPickerViewController new];
@@ -2679,9 +3475,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         r.pathFragment = pathFragment;
         r.targetBand = 90;
         r.displayName = displayName;
+        [weakSelf evaluateRuleConflict:r];
         [weakSelf.rules addObject:r];
         [weakSelf rebuildRulesCards];
+        NSDate *t0 = [NSDate date];
         [weakSelf saveConfig];
+        [weakSelf checkRuleRunStateAfterAdd:r appName:displayName targetBand:90 type:JPRuleTypeProtect saveTime:t0];
     };
 
     picker.onManualAdd = ^(NSString *pathFragment, JPRuleType type, NSInteger band) {
@@ -2690,9 +3489,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         r.pathFragment = pathFragment;
         r.targetBand = band;
         r.displayName = [weakSelf resolveDisplayNameForFragment:pathFragment];
+        [weakSelf evaluateRuleConflict:r];
         [weakSelf.rules addObject:r];
         [weakSelf rebuildRulesCards];
+        NSDate *t0 = [NSDate date];
         [weakSelf saveConfig];
+        [weakSelf checkRuleRunStateAfterAdd:r appName:r.displayName targetBand:band type:type saveTime:t0];
     };
 
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
@@ -2706,6 +3508,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 - (void)showProtectedList {
     JPProtectedListViewController *vc = [JPProtectedListViewController new];
+    vc.installedApps = self.installedApps;
     __weak typeof(self) weakSelf = self;
     vc.nameResolver = ^NSString *(NSString *frag) {
         return [weakSelf resolveDisplayNameForFragment:frag];
