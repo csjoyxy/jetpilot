@@ -1,5 +1,5 @@
 /*
- * JetPilot v0.7.1 — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetPilot v0.7.2 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
@@ -33,6 +33,11 @@ static NSString *const kStatus     = @"/var/mobile/Library/JetPilot/status.txt";
 static NSString *const kPidFile    = @"/var/mobile/Library/JetPilot/daemon.pid";
 static NSString *const kLogFile    = @"/var/mobile/Library/JetPilot/daemon.log";
 static NSString *const kLogOldFile = @"/var/mobile/Library/JetPilot/daemon.log.1";
+
+static NSString *const kMemPressureConfig    = @"/var/mobile/Library/JetPilot/mempressure.txt";
+static NSString *const kMemPressureConfigOff = @"/var/mobile/Library/JetPilot/mempressure.txt.off";
+static NSString *const kMemPressureState     = @"/var/mobile/Library/JetPilot/mempressure_state.txt";
+static NSString *const kMemPressureFloor     = @"/var/mobile/Library/JetPilot/mempressure_floor.txt";
 
 typedef NS_ENUM(NSInteger, JPDaemonState) {
     JPDaemonStateRunning,
@@ -100,6 +105,9 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, copy) NSString *displayName;
 @property (nonatomic, assign) BOOL isConflict;
 @property (nonatomic, copy) NSArray<NSString *> *conflictAppNames;
+@property (nonatomic, assign) BOOL isDuplicate;
+@property (nonatomic, assign) BOOL isConflictWithDemote;
+@property (nonatomic, assign) BOOL hasSameBand;
 @end
 
 @implementation JPRule
@@ -298,6 +306,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     st.protectedApps = [apps copy];
     return st;
 }
+
 @end
 
 @interface JPInstalledApp : NSObject
@@ -305,10 +314,57 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, copy) NSString *bundleName;
 @property (nonatomic, copy) NSString *bundleId;
 @property (nonatomic, copy) NSString *pathFragment;
+@property (nonatomic, copy) NSString *appDirPath;
+- (UIImage *)icon;
 + (NSArray<JPInstalledApp *> *)scanInstalledApps;
 @end
 
 @implementation JPInstalledApp
+
+- (UIImage *)icon {
+    SEL sel = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:scale:");
+    if ([UIImage respondsToSelector:sel]) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        NSMethodSignature *sig = [UIImage methodSignatureForSelector:sel];
+        if (sig) {
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            [inv setSelector:sel];
+            [inv setTarget:[UIImage class]];
+            NSString *bid = self.bundleId;
+            int format = 0;
+            double scale = [UIScreen mainScreen].scale;
+            [inv setArgument:&bid atIndex:2];
+            [inv setArgument:&format atIndex:3];
+            [inv setArgument:&scale atIndex:4];
+            [inv invoke];
+            CFTypeRef result;
+            [inv getReturnValue:&result];
+            if (result) {
+                UIImage *img = (__bridge UIImage *)result;
+                if (img && img.size.width > 0) return img;
+            }
+        }
+        #pragma clang diagnostic pop
+    }
+    if (self.appDirPath.length > 0) {
+        NSString *plistPath = [self.appDirPath stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        NSArray *iconFiles = plist[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"];
+        if (iconFiles.count > 0) {
+            for (NSString *fn in iconFiles.reverseObjectEnumerator) {
+                NSString *imgPath = [self.appDirPath stringByAppendingPathComponent:fn];
+                UIImage *img = [UIImage imageWithContentsOfFile:imgPath];
+                if (!img) img = [UIImage imageWithContentsOfFile:[imgPath stringByAppendingString:@"@2x.png"]];
+                if (!img) img = [UIImage imageWithContentsOfFile:[imgPath stringByAppendingString:@"@3x.png"]];
+                if (!img) img = [UIImage imageWithContentsOfFile:[imgPath stringByAppendingPathExtension:@"png"]];
+                if (img) return img;
+            }
+        }
+    }
+    return [UIImage systemImageNamed:@"app.fill"];
+}
+
 + (NSArray<JPInstalledApp *> *)scanInstalledApps {
     NSMutableArray<JPInstalledApp *> *list = [NSMutableArray array];
     NSString *base = @"/var/containers/Bundle/Application";
@@ -349,6 +405,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
                 item.bundleName = sub;
                 item.bundleId = bid;
                 item.pathFragment = [sub stringByAppendingString:@"/"];
+                item.appDirPath = appDir;
                 [list addObject:item];
             }
         }
@@ -360,6 +417,496 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     return list;
 }
 @end
+
+static UIImage *JPIconForFragment(NSString *frag, NSArray<JPInstalledApp *> *installedApps) {
+    if (!frag || frag.length == 0) return [UIImage systemImageNamed:@"app.fill"];
+    if (installedApps) {
+        for (JPInstalledApp *app in installedApps) {
+            if ([frag hasPrefix:@"bid:"]) {
+                NSString *bid = [frag substringFromIndex:4];
+                if ([app.bundleId isEqualToString:bid]) return [app icon];
+            } else {
+                if ([app.pathFragment isEqualToString:frag]) return [app icon];
+            }
+        }
+    }
+    return [UIImage systemImageNamed:@"app.fill"];
+}
+
+static BOOL JPIsAppInstalled(NSString *frag, NSArray<JPInstalledApp *> *installedApps) {
+    if (!frag || frag.length == 0 || !installedApps) return NO;
+    for (JPInstalledApp *app in installedApps) {
+        if ([frag hasPrefix:@"bid:"]) {
+            NSString *bid = [frag substringFromIndex:4];
+            if ([app.bundleId isEqualToString:bid]) return YES;
+        } else {
+            if ([app.pathFragment isEqualToString:frag]) return YES;
+        }
+    }
+    return NO;
+}
+
+static uint64_t JPGetDeviceMemcapMB(void) {
+    uint64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0 && memsize > 0) {
+        uint64_t cap = (memsize / 2ULL) / (1024ULL * 1024ULL);
+        if (cap > 0) return cap;
+    }
+    return 2048;
+}
+
+#pragma mark - MemPressure Models
+
+@interface JPMemPressureFloorEntry : NSObject
+@property (nonatomic, copy) NSString *frag;
+@property (nonatomic, assign) time_t lastTime;
+@property (nonatomic, assign) NSInteger sampleCount;
+@property (nonatomic, copy) NSString *medianStr;
+@property (nonatomic, assign) double median;
+@property (nonatomic, copy) NSString *samplesStr;
++ (NSDictionary<NSString *, JPMemPressureFloorEntry *> *)loadFloorFile;
+@end
+
+@implementation JPMemPressureFloorEntry
+
++ (NSDictionary<NSString *, JPMemPressureFloorEntry *> *)loadFloorFile {
+    NSMutableDictionary<NSString *, JPMemPressureFloorEntry *> *dict = [NSMutableDictionary dictionary];
+    NSString *content = [NSString stringWithContentsOfFile:kMemPressureFloor encoding:NSUTF8StringEncoding error:nil];
+    if (!content || content.length == 0) return dict;
+
+    BOOL hasTrailing = [content hasSuffix:@"\n"];
+    NSString *toSplit = hasTrailing ? [content substringToIndex:content.length - 1] : content;
+    NSArray<NSString *> *lines = [toSplit componentsSeparatedByString:@"\n"];
+    if (lines.count == 0) return dict;
+
+    NSString *firstLine = [lines[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (![firstLine isEqualToString:@"# jetpilot floor v1"]) {
+        return dict;
+    }
+
+    for (NSUInteger lidx = 1; lidx < lines.count; lidx++) {
+        NSString *line = lines[lidx];
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (trimmed.length == 0 || [trimmed hasPrefix:@"#"]) continue;
+
+        NSArray<NSString *> *tokens = [trimmed componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (tokens.count == 0) continue;
+
+        JPMemPressureFloorEntry *entry = [JPMemPressureFloorEntry new];
+        entry.frag = tokens[0];
+        entry.medianStr = @"NA";
+        entry.median = 0.0;
+
+        for (NSUInteger i = 1; i < tokens.count; i++) {
+            NSString *tok = tokens[i];
+            if ([tok hasPrefix:@"t="]) {
+                entry.lastTime = (time_t)[[tok substringFromIndex:2] longLongValue];
+            } else if ([tok hasPrefix:@"n="]) {
+                entry.sampleCount = [[tok substringFromIndex:2] integerValue];
+            } else if ([tok hasPrefix:@"med="]) {
+                entry.medianStr = [tok substringFromIndex:4];
+                if (![entry.medianStr isEqualToString:@"NA"]) {
+                    entry.median = [entry.medianStr doubleValue];
+                }
+            } else if ([tok hasPrefix:@"s="]) {
+                entry.samplesStr = [tok substringFromIndex:2];
+            }
+        }
+
+        dict[entry.frag] = entry;
+        if ([entry.frag hasPrefix:@"bid:"]) {
+            dict[[entry.frag substringFromIndex:4]] = entry;
+        }
+    }
+    return dict;
+}
+
+@end
+
+@interface JPMemPressureRule : NSObject
+@property (nonatomic, copy) NSString *frag;
+@property (nonatomic, copy) NSString *displayName;
+@property (nonatomic, assign) NSInteger thresholdMB;
+@property (nonatomic, assign) NSInteger cooldown;
+@property (nonatomic, assign) BOOL hasExplicitThreshold;
+@property (nonatomic, assign) BOOL isEnabled;
+@property (nonatomic, assign) BOOL isDuplicate;
+@property (nonatomic, assign) BOOL isDirty;
+@property (nonatomic, copy) NSString *extraTokensStr;
+@end
+
+@implementation JPMemPressureRule
+@end
+
+typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
+    JPMemPressureLineTypeComment = 0,
+    JPMemPressureLineTypeGlobalCooldown,
+    JPMemPressureLineTypeRule,
+    JPMemPressureLineTypeDisabledRule,
+    JPMemPressureLineTypeUnknown
+};
+
+@interface JPMemPressureLine : NSObject
+@property (nonatomic, assign) JPMemPressureLineType type;
+@property (nonatomic, copy) NSString *rawText;
+@property (nonatomic, strong) JPMemPressureRule *rule;
+@property (nonatomic, assign) BOOL isDirty;
+@end
+
+@implementation JPMemPressureLine
+@end
+
+@interface JPMemPressureConfig : NSObject
+@property (nonatomic, assign) NSInteger globalCooldown;
+@property (nonatomic, assign) NSInteger originalGlobalCooldown;
+@property (nonatomic, assign) BOOL hasExplicitGlobalCooldown;
+@property (nonatomic, assign) BOOL hasTrailingNewline;
+@property (nonatomic, strong) NSMutableArray<JPMemPressureLine *> *lines;
+@property (nonatomic, strong) NSMutableArray<JPMemPressureRule *> *rules;
++ (instancetype)loadFromPath:(NSString *)path;
+- (BOOL)saveToPath:(NSString *)path error:(NSError **)error;
+- (void)updateDuplicateRules;
+@end
+
+@implementation JPMemPressureConfig
+
++ (instancetype)loadFromPath:(NSString *)path {
+    JPMemPressureConfig *cfg = [JPMemPressureConfig new];
+    cfg.lines = [NSMutableArray array];
+    cfg.rules = [NSMutableArray array];
+    cfg.globalCooldown = 600;
+    cfg.originalGlobalCooldown = 600;
+    cfg.hasExplicitGlobalCooldown = NO;
+    cfg.hasTrailingNewline = YES;
+
+    NSString *content = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (!content || content.length == 0) return cfg;
+
+    cfg.hasTrailingNewline = [content hasSuffix:@"\n"];
+    NSString *toSplit = cfg.hasTrailingNewline ? [content substringToIndex:content.length - 1] : content;
+    NSArray<NSString *> *rawLines = [toSplit componentsSeparatedByString:@"\n"];
+
+    uint64_t memcap = JPGetDeviceMemcapMB();
+    JPMemPressureLine *lastCooldownLine = nil;
+
+    for (NSString *rawLine in rawLines) {
+        if ([rawLine lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 510) {
+            JPMemPressureLine *l = [JPMemPressureLine new];
+            l.type = JPMemPressureLineTypeUnknown;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        NSString *trimmed = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if ([trimmed hasSuffix:@"\r"]) {
+            trimmed = [trimmed substringToIndex:trimmed.length - 1];
+            trimmed = [trimmed stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        }
+
+        if (trimmed.length == 0 || ([trimmed hasPrefix:@"#"] && ![trimmed hasPrefix:@"#off "])) {
+            JPMemPressureLine *l = [JPMemPressureLine new];
+            l.type = JPMemPressureLineTypeComment;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        BOOL isOff = [trimmed hasPrefix:@"#off "];
+        NSString *ruleStr = isOff ? [trimmed substringFromIndex:5] : trimmed;
+        ruleStr = [ruleStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+
+        NSArray<NSString *> *rawTokens = [ruleStr componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@" \t\r"]];
+        NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+        for (NSString *t in rawTokens) {
+            if (t.length > 0) [tokens addObject:t];
+        }
+
+        if (tokens.count == 0) {
+            JPMemPressureLine *l = [JPMemPressureLine new];
+            l.type = JPMemPressureLineTypeComment;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        if (tokens.count > 8) {
+            JPMemPressureLine *l = [JPMemPressureLine new];
+            l.type = JPMemPressureLineTypeUnknown;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        if ([tokens[0] isEqualToString:@"cooldown"]) {
+            if (isOff || tokens.count != 2) {
+                JPMemPressureLine *l = [JPMemPressureLine new];
+                l.type = JPMemPressureLineTypeUnknown;
+                l.rawText = rawLine;
+                [cfg.lines addObject:l];
+                continue;
+            }
+            NSScanner *scanner = [NSScanner scannerWithString:tokens[1]];
+            int cdVal = 0;
+            if (![scanner scanInt:&cdVal] || ![scanner isAtEnd] || cdVal < 60 || cdVal > 86400) {
+                JPMemPressureLine *l = [JPMemPressureLine new];
+                l.type = JPMemPressureLineTypeUnknown;
+                l.rawText = rawLine;
+                [cfg.lines addObject:l];
+                continue;
+            }
+
+            cfg.globalCooldown = cdVal;
+            cfg.hasExplicitGlobalCooldown = YES;
+
+            if (lastCooldownLine) {
+                [cfg.lines removeObject:lastCooldownLine];
+            }
+
+            JPMemPressureLine *l = [JPMemPressureLine new];
+            l.type = JPMemPressureLineTypeGlobalCooldown;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            lastCooldownLine = l;
+            continue;
+        }
+
+        NSString *frag = tokens[0];
+        if (frag.length == 0 || [frag containsString:@"="]) {
+            JPMemPressureLine *l = [JPMemPressureLine new];
+            l.type = JPMemPressureLineTypeUnknown;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        NSInteger thr = 600;
+        BOOL hasExplicitThr = NO;
+        NSUInteger idx = 1;
+        BOOL isBad = NO;
+
+        if (idx < tokens.count && ![tokens[idx] containsString:@"="]) {
+            NSScanner *scanner = [NSScanner scannerWithString:tokens[idx]];
+            int thrVal = 0;
+            if (![scanner scanInt:&thrVal] || ![scanner isAtEnd] || thrVal < 100 || (uint64_t)thrVal > memcap) {
+                isBad = YES;
+            } else {
+                thr = thrVal;
+                hasExplicitThr = YES;
+            }
+            idx++;
+        }
+
+        if (isBad) {
+            JPMemPressureLine *l = [JPMemPressureLine new];
+            l.type = JPMemPressureLineTypeUnknown;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        NSInteger ruleCd = 0;
+        BOOL hasRuleCd = NO;
+
+        for (; idx < tokens.count; idx++) {
+            NSString *tok = tokens[idx];
+            NSRange eqRange = [tok rangeOfString:@"="];
+            if (eqRange.location == NSNotFound || eqRange.location == 0) {
+                isBad = YES;
+                break;
+            }
+            NSString *key = [tok substringToIndex:eqRange.location];
+            NSString *valStr = [tok substringFromIndex:eqRange.location + 1];
+            if (![key isEqualToString:@"cooldown"]) {
+                isBad = YES;
+                break;
+            }
+            if (hasRuleCd) {
+                isBad = YES;
+                break;
+            }
+            NSScanner *scanner = [NSScanner scannerWithString:valStr];
+            int cdVal = 0;
+            if (![scanner scanInt:&cdVal] || ![scanner isAtEnd] || cdVal < 60 || cdVal > 86400) {
+                isBad = YES;
+                break;
+            }
+            ruleCd = cdVal;
+            hasRuleCd = YES;
+        }
+
+        if (isBad) {
+            JPMemPressureLine *l = [JPMemPressureLine new];
+            l.type = JPMemPressureLineTypeUnknown;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        JPMemPressureRule *r = [JPMemPressureRule new];
+        r.frag = frag;
+        r.thresholdMB = thr;
+        r.hasExplicitThreshold = hasExplicitThr;
+        r.cooldown = ruleCd;
+        r.isEnabled = !isOff;
+        r.isDirty = NO;
+
+        JPMemPressureLine *l = [JPMemPressureLine new];
+        l.type = isOff ? JPMemPressureLineTypeDisabledRule : JPMemPressureLineTypeRule;
+        l.rawText = rawLine;
+        l.rule = r;
+        l.isDirty = NO;
+
+        [cfg.lines addObject:l];
+        [cfg.rules addObject:r];
+    }
+
+    cfg.originalGlobalCooldown = cfg.globalCooldown;
+
+    [cfg updateDuplicateRules];
+
+    return cfg;
+}
+
+- (void)updateDuplicateRules {
+    NSMutableSet<NSString *> *seenFrags = [NSMutableSet set];
+    for (JPMemPressureRule *r in self.rules) {
+        if (!r.isEnabled) {
+            r.isDuplicate = NO;
+            continue;
+        }
+        if ([seenFrags containsObject:r.frag]) {
+            r.isDuplicate = YES;
+        } else {
+            r.isDuplicate = NO;
+            [seenFrags addObject:r.frag];
+        }
+    }
+}
+
+- (BOOL)saveToPath:(NSString *)path error:(NSError **)error {
+    if (!self.hasExplicitGlobalCooldown) {
+        JPMemPressureLine *cdLine = [JPMemPressureLine new];
+        cdLine.type = JPMemPressureLineTypeGlobalCooldown;
+        cdLine.rawText = [NSString stringWithFormat:@"cooldown %ld", (long)self.globalCooldown];
+        cdLine.isDirty = YES;
+
+        NSUInteger insertIdx = 0;
+        for (NSUInteger i = 0; i < self.lines.count; i++) {
+            if (self.lines[i].type == JPMemPressureLineTypeRule || self.lines[i].type == JPMemPressureLineTypeDisabledRule) {
+                insertIdx = i;
+                break;
+            }
+        }
+        [self.lines insertObject:cdLine atIndex:insertIdx];
+        self.hasExplicitGlobalCooldown = YES;
+        self.originalGlobalCooldown = self.globalCooldown;
+    }
+
+    NSMutableArray<NSString *> *outputLines = [NSMutableArray array];
+    for (JPMemPressureLine *l in self.lines) {
+        if (l.type == JPMemPressureLineTypeGlobalCooldown) {
+            if (self.globalCooldown != self.originalGlobalCooldown || l.isDirty || l.rawText == nil) {
+                [outputLines addObject:[NSString stringWithFormat:@"cooldown %ld", (long)self.globalCooldown]];
+            } else {
+                [outputLines addObject:l.rawText];
+            }
+        } else if (l.type == JPMemPressureLineTypeComment || l.type == JPMemPressureLineTypeUnknown) {
+            [outputLines addObject:l.rawText ?: @""];
+        } else if (l.rule) {
+            JPMemPressureRule *r = l.rule;
+            if (!r.isDirty && !l.isDirty && l.rawText != nil) {
+                [outputLines addObject:l.rawText];
+            } else {
+                NSMutableString *rLine = [NSMutableString string];
+                if (!r.isEnabled) [rLine appendString:@"#off "];
+                [rLine appendString:r.frag];
+                [rLine appendFormat:@" %ld", (long)r.thresholdMB];
+                if (r.cooldown > 0) {
+                    [rLine appendFormat:@" cooldown=%ld", (long)r.cooldown];
+                }
+                if (r.extraTokensStr.length > 0) {
+                    [rLine appendFormat:@" %@", r.extraTokensStr];
+                }
+                [outputLines addObject:rLine];
+            }
+        }
+    }
+
+    NSMutableString *outStr = [NSMutableString string];
+    [outStr appendString:[outputLines componentsJoinedByString:@"\n"]];
+    if (self.hasTrailingNewline) {
+        [outStr appendString:@"\n"];
+    }
+
+    BOOL ok = [outStr writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
+    if (ok) {
+        self.originalGlobalCooldown = self.globalCooldown;
+        for (JPMemPressureLine *l in self.lines) {
+            l.isDirty = NO;
+            if (l.rule) l.rule.isDirty = NO;
+        }
+    }
+    return ok;
+}
+
+@end
+
+@interface JPDaemonManager : NSObject
++ (JPDaemonState)daemonStateWithLastSpawnTime:(CFAbsoluteTime)lastSpawnTime;
++ (int)startDaemonWithLastSpawnTime:(CFAbsoluteTime *)lastSpawnTimeOut;
++ (void)stopDaemon;
+@end
+
+@implementation JPDaemonManager
+
++ (JPDaemonState)daemonStateWithLastSpawnTime:(CFAbsoluteTime)lastSpawnTime {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (![fm fileExistsAtPath:kFlag]) return JPDaemonStateStopped;
+
+    if (lastSpawnTime > 0 && CFAbsoluteTimeGetCurrent() - lastSpawnTime < 10.0)
+        return JPDaemonStateRunning;
+
+    NSDate *mtime = [[fm attributesOfItemAtPath:kStatus error:nil] fileModificationDate];
+    time_t boot = JPBootTime();
+    if (!mtime) return JPDaemonStateDead;
+    if (boot > 0 && (time_t)mtime.timeIntervalSince1970 < boot) return JPDaemonStateDead;
+
+    NSString *pidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
+    pid_t pid = (pid_t)[pidStr intValue];
+    if (pid <= 0) return JPDaemonStateDead;
+    if (kill(pid, 0) != 0 && errno == ESRCH) return JPDaemonStateDead;
+    return JPDaemonStateRunning;
+}
+
++ (int)startDaemonWithLastSpawnTime:(CFAbsoluteTime *)lastSpawnTimeOut {
+    [@"run" writeToFile:kFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    NSString *bin = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"jetpilotd"];
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+    posix_spawnattr_set_persona_uid_np(&attr, 0);
+    posix_spawnattr_set_persona_gid_np(&attr, 0);
+
+    pid_t pid = 0;
+    const char *argv[] = { bin.fileSystemRepresentation, NULL };
+    int rc = posix_spawn(&pid, bin.fileSystemRepresentation, NULL, &attr, (char **)argv, environ);
+    posix_spawnattr_destroy(&attr);
+    if (rc == 0 && lastSpawnTimeOut) {
+        *lastSpawnTimeOut = CFAbsoluteTimeGetCurrent();
+    }
+    return rc;
+}
+
++ (void)stopDaemon {
+    [NSFileManager.defaultManager removeItemAtPath:kFlag error:nil];
+}
+
+@end
+
 
 #pragma mark - Matching Helpers & Jetsam Models
 
@@ -1244,32 +1791,37 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @protocol JPRuleCardViewDelegate <NSObject>
 @optional
 - (void)ruleCardViewDidRequestDelete:(JPRuleCardView *)card;
-- (void)ruleCardView:(JPRuleCardView *)card didChangeBand:(NSInteger)band;
-- (void)ruleCardViewDidFinishBandChange:(JPRuleCardView *)card;
 - (void)ruleCardViewDidTap:(JPRuleCardView *)card;
 @end
 
 @interface JPRuleCardView : UIView
 @property (nonatomic, strong) JPRule *rule;
 @property (nonatomic, weak) id<JPRuleCardViewDelegate> delegate;
+@property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
+@property (nonatomic, strong) UIImageView *iconImageView;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UILabel *pathLabel;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *bandLabel;
-@property (nonatomic, strong) UISlider *slider;
 @property (nonatomic, strong) UIButton *deleteButton;
 
 - (instancetype)initWithRule:(JPRule *)rule delegate:(id<JPRuleCardViewDelegate>)delegate;
+- (instancetype)initWithRule:(JPRule *)rule delegate:(id<JPRuleCardViewDelegate>)delegate installedApps:(NSArray<JPInstalledApp *> *)installedApps;
 - (void)updateStatusWithInfo:(JPStatusInfo *)status daemonRunning:(BOOL)daemonRunning;
 @end
 
 @implementation JPRuleCardView
 
 - (instancetype)initWithRule:(JPRule *)rule delegate:(id<JPRuleCardViewDelegate>)delegate {
+    return [self initWithRule:rule delegate:delegate installedApps:nil];
+}
+
+- (instancetype)initWithRule:(JPRule *)rule delegate:(id<JPRuleCardViewDelegate>)delegate installedApps:(NSArray<JPInstalledApp *> *)installedApps {
     self = [super initWithFrame:CGRectZero];
     if (self) {
         _rule = rule;
         _delegate = delegate;
+        _installedApps = [installedApps copy];
         [self setupUI];
     }
     return self;
@@ -1282,11 +1834,21 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.clipsToBounds = YES;
     self.translatesAutoresizingMaskIntoConstraints = NO;
 
+    self.iconImageView = [UIImageView new];
+    self.iconImageView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.iconImageView.layer.cornerRadius = 8;
+    self.iconImageView.layer.cornerCurve = kCACornerCurveContinuous;
+    self.iconImageView.clipsToBounds = YES;
+    self.iconImageView.contentMode = UIViewContentModeScaleAspectFit;
+    self.iconImageView.tintColor = UIColor.systemBlueColor;
+    [self addSubview:self.iconImageView];
+
     self.titleLabel = [UILabel new];
     self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+    self.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     self.titleLabel.textColor = UIColor.labelColor;
     self.titleLabel.text = self.rule.displayName.length > 0 ? self.rule.displayName : self.rule.pathFragment;
+    [self addSubview:self.titleLabel];
 
     self.pathLabel = [UILabel new];
     self.pathLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1294,143 +1856,67 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.pathLabel.textColor = UIColor.secondaryLabelColor;
     self.pathLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
     self.pathLabel.text = self.rule.pathFragment;
+    [self addSubview:self.pathLabel];
 
     self.statusLabel = [UILabel new];
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.statusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     self.statusLabel.textColor = UIColor.secondaryLabelColor;
-    self.statusLabel.numberOfLines = 0;
+    self.statusLabel.numberOfLines = 1;
+    [self addSubview:self.statusLabel];
+
+    self.bandLabel = [UILabel new];
+    self.bandLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.bandLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
+    self.bandLabel.textAlignment = NSTextAlignmentRight;
+    [self addSubview:self.bandLabel];
 
     self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.deleteButton setImage:[UIImage systemImageNamed:@"trash"] forState:UIControlStateNormal];
     self.deleteButton.tintColor = UIColor.systemRedColor;
     [self.deleteButton addTarget:self action:@selector(deleteTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.deleteButton];
 
     UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
     chevron.translatesAutoresizingMaskIntoConstraints = NO;
     chevron.tintColor = UIColor.tertiaryLabelColor;
     chevron.contentMode = UIViewContentModeScaleAspectFit;
-
-    [self addSubview:self.titleLabel];
-    [self addSubview:self.pathLabel];
-    [self addSubview:self.statusLabel];
-    [self addSubview:self.deleteButton];
     [self addSubview:chevron];
 
     [NSLayoutConstraint activateConstraints:@[
-        [chevron.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
-        [chevron.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
-        [chevron.widthAnchor constraintEqualToConstant:10],
-        [chevron.heightAnchor constraintEqualToConstant:14],
+        [self.iconImageView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+        [self.iconImageView.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.iconImageView.widthAnchor constraintEqualToConstant:40],
+        [self.iconImageView.heightAnchor constraintEqualToConstant:40],
 
-        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
-        [self.deleteButton.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-6],
+        [chevron.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
+        [chevron.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [chevron.widthAnchor constraintEqualToConstant:8],
+        [chevron.heightAnchor constraintEqualToConstant:13],
+
+        [self.deleteButton.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-4],
+        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
         [self.deleteButton.widthAnchor constraintEqualToConstant:32],
         [self.deleteButton.heightAnchor constraintEqualToConstant:32],
 
-        [self.titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:14],
-        [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.bandLabel.trailingAnchor constraintEqualToAnchor:self.deleteButton.leadingAnchor constant:-6],
+        [self.bandLabel.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.bandLabel.widthAnchor constraintGreaterThanOrEqualToConstant:36],
 
-        [self.pathLabel.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:3],
-        [self.pathLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.pathLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+        [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.bandLabel.leadingAnchor constant:-8],
 
-        [self.statusLabel.topAnchor constraintEqualToAnchor:self.pathLabel.bottomAnchor constant:5],
-        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-        [self.statusLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16]
+        [self.pathLabel.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:2],
+        [self.pathLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.pathLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.bandLabel.leadingAnchor constant:-8],
+
+        [self.statusLabel.topAnchor constraintEqualToAnchor:self.pathLabel.bottomAnchor constant:3],
+        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.bandLabel.leadingAnchor constant:-8],
+        [self.statusLabel.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12]
     ]];
-
-    if (self.rule.type == JPRuleTypeProtect) {
-        self.bandLabel = [UILabel new];
-        self.bandLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        self.bandLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        self.bandLabel.textColor = UIColor.systemBlueColor;
-        self.bandLabel.text = BandDescription(self.rule.targetBand);
-
-        self.slider = [UISlider new];
-        self.slider.translatesAutoresizingMaskIntoConstraints = NO;
-        self.slider.minimumValue = 30.0f;
-        self.slider.maximumValue = 95.0f;
-        self.slider.value = (float)self.rule.targetBand;
-        self.slider.tintColor = UIColor.systemBlueColor;
-        [self.slider addTarget:self action:@selector(sliderValueChanged:) forControlEvents:UIControlEventValueChanged];
-        [self.slider addTarget:self action:@selector(sliderTouchEnded:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
-
-        UILabel *minHint = [UILabel new];
-        minHint.translatesAutoresizingMaskIntoConstraints = NO;
-        minHint.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
-        minHint.textColor = UIColor.tertiaryLabelColor;
-        minHint.text = @"30 后台";
-
-        UILabel *maxHint = [UILabel new];
-        maxHint.translatesAutoresizingMaskIntoConstraints = NO;
-        maxHint.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
-        maxHint.textColor = UIColor.tertiaryLabelColor;
-        maxHint.text = @"95 顶配";
-        maxHint.textAlignment = NSTextAlignmentRight;
-
-        [self addSubview:self.bandLabel];
-        [self addSubview:self.slider];
-        [self addSubview:minHint];
-        [self addSubview:maxHint];
-
-        [NSLayoutConstraint activateConstraints:@[
-            [self.bandLabel.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:10],
-            [self.bandLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-            [self.bandLabel.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-
-            [self.slider.topAnchor constraintEqualToAnchor:self.bandLabel.bottomAnchor constant:6],
-            [self.slider.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-            [self.slider.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-
-            [minHint.topAnchor constraintEqualToAnchor:self.slider.bottomAnchor constant:2],
-            [minHint.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-            [minHint.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14],
-
-            [maxHint.topAnchor constraintEqualToAnchor:self.slider.bottomAnchor constant:2],
-            [maxHint.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
-            [maxHint.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14]
-        ]];
-    } else {
-        UIView *badge = [UIView new];
-        badge.translatesAutoresizingMaskIntoConstraints = NO;
-        badge.backgroundColor = [UIColor.systemOrangeColor colorWithAlphaComponent:0.12];
-        badge.layer.cornerRadius = 6;
-
-        UIImageView *badgeIcon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"arrow.down.circle.fill"]];
-        badgeIcon.translatesAutoresizingMaskIntoConstraints = NO;
-        badgeIcon.tintColor = UIColor.systemOrangeColor;
-
-        UILabel *badgeText = [UILabel new];
-        badgeText.translatesAutoresizingMaskIntoConstraints = NO;
-        badgeText.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-        badgeText.textColor = UIColor.systemOrangeColor;
-        badgeText.text = @"降级到后台 30";
-
-        [badge addSubview:badgeIcon];
-        [badge addSubview:badgeText];
-
-        [NSLayoutConstraint activateConstraints:@[
-            [badgeIcon.leadingAnchor constraintEqualToAnchor:badge.leadingAnchor constant:8],
-            [badgeIcon.centerYAnchor constraintEqualToAnchor:badge.centerYAnchor],
-            [badgeIcon.widthAnchor constraintEqualToConstant:16],
-            [badgeIcon.heightAnchor constraintEqualToConstant:16],
-
-            [badgeText.leadingAnchor constraintEqualToAnchor:badgeIcon.trailingAnchor constant:6],
-            [badgeText.trailingAnchor constraintEqualToAnchor:badge.trailingAnchor constant:-8],
-            [badgeText.centerYAnchor constraintEqualToAnchor:badge.centerYAnchor],
-            [badge.heightAnchor constraintEqualToConstant:28]
-        ]];
-
-        [self addSubview:badge];
-        [NSLayoutConstraint activateConstraints:@[
-            [badge.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:10],
-            [badge.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
-            [badge.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-14]
-        ]];
-    }
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(cardTapped:)];
     [self addGestureRecognizer:tap];
@@ -1439,33 +1925,57 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 - (void)cardTapped:(UITapGestureRecognizer *)gesture {
     CGPoint pt = [gesture locationInView:self];
     if (CGRectContainsPoint(self.deleteButton.frame, pt)) return;
-    if (self.slider && CGRectContainsPoint(self.slider.frame, pt)) return;
     if ([self.delegate respondsToSelector:@selector(ruleCardViewDidTap:)]) {
         [self.delegate ruleCardViewDidTap:self];
     }
 }
 
 - (void)updateStatusWithInfo:(JPStatusInfo *)status daemonRunning:(BOOL)daemonRunning {
-    if (!daemonRunning) {
-        self.statusLabel.text = @"守护进程未运行";
+    self.iconImageView.image = JPIconForFragment(self.rule.pathFragment, self.installedApps);
+    BOOL installed = JPIsAppInstalled(self.rule.pathFragment, self.installedApps);
+
+    if (self.rule.type == JPRuleTypeProtect) {
+        self.bandLabel.text = [NSString stringWithFormat:@"%ld", (long)self.rule.targetBand];
+        self.bandLabel.textColor = UIColor.systemBlueColor;
+    } else {
+        self.bandLabel.text = @"30";
+        self.bandLabel.textColor = UIColor.systemOrangeColor;
+    }
+
+    if (!installed) {
+        self.statusLabel.text = @"未安装";
         self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        self.alpha = 0.65;
         return;
     }
-    if ([self.rule.pathFragment hasPrefix:@"bid:"] && (!status || !status.bidSupport)) {
-        self.statusLabel.text = @"守护进程版本过低，此规则不生效";
+    self.alpha = 1.0;
+
+    if (self.rule.isDuplicate) {
+        self.statusLabel.text = @"重复，只有第一条生效";
         self.statusLabel.textColor = UIColor.systemRedColor;
         return;
     }
-    // 必改 4-3: 降级规则卡片状态只走前两级（未运行/版本低），否则固定显示说明（status.txt 仅记录保护规则）
-    if (self.rule.type == JPRuleTypeDemote) {
-        self.statusLabel.text = @"不在前台时降到 30";
-        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+    if (self.rule.isConflictWithDemote) {
+        self.statusLabel.text = @"与降级规则冲突";
+        self.statusLabel.textColor = UIColor.systemRedColor;
         return;
     }
     if (self.rule.isConflict) {
         NSString *names = [self.rule.conflictAppNames componentsJoinedByString:@"、"] ?: @"";
-        self.statusLabel.text = [NSString stringWithFormat:@"会命中多个 App：%@，点此重选", names];
+        self.statusLabel.text = [NSString stringWithFormat:@"命中多个 App：%@，点此重选", names];
         self.statusLabel.textColor = UIColor.systemOrangeColor;
+        return;
+    }
+
+    if (!daemonRunning) {
+        self.statusLabel.text = @"未运行（守护进程未运行）";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        return;
+    }
+
+    if (self.rule.type == JPRuleTypeDemote) {
+        self.statusLabel.text = @"不在前台时降到 30";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
         return;
     }
 
@@ -1478,7 +1988,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
                     [matchedPids addObject:@(pApp.pid)];
                 }
             } else {
-                // 小问题: 路径匹配使用 isEqualToString，避免 Runner.app/ 把 xRunner.app/ 算成自己的
                 if ([pApp.pathFragment isEqualToString:self.rule.pathFragment]) {
                     [matchedPids addObject:@(pApp.pid)];
                 }
@@ -1486,32 +1995,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         }
     }
 
+    NSString *sameBandHint = (self.rule.hasSameBand && self.rule.type == JPRuleTypeProtect) ? @" · 同档：内存大的先被杀" : @"";
+
     if (matchedPids.count == 1) {
-        self.statusLabel.text = [NSString stringWithFormat:@"保护中 · pid %d", [matchedPids.firstObject intValue]];
+        self.statusLabel.text = [NSString stringWithFormat:@"运行中 · pid %d%@", [matchedPids.firstObject intValue], sameBandHint];
         self.statusLabel.textColor = UIColor.systemGreenColor;
     } else if (matchedPids.count > 1) {
-        self.statusLabel.text = [NSString stringWithFormat:@"保护中 · %lu 个进程", (unsigned long)matchedPids.count];
+        self.statusLabel.text = [NSString stringWithFormat:@"运行中 · %lu 个进程%@", (unsigned long)matchedPids.count, sameBandHint];
         self.statusLabel.textColor = UIColor.systemGreenColor;
     } else {
-        self.statusLabel.text = @"没在运行 · 打开后自动保护";
+        self.statusLabel.text = [NSString stringWithFormat:@"App 没在运行%@", sameBandHint];
         self.statusLabel.textColor = UIColor.secondaryLabelColor;
-    }
-}
-
-- (void)sliderValueChanged:(UISlider *)slider {
-    NSInteger band = (NSInteger)lroundf(slider.value);
-    self.rule.targetBand = band;
-    self.bandLabel.text = BandDescription(band);
-    if ([self.delegate respondsToSelector:@selector(ruleCardView:didChangeBand:)]) {
-        [self.delegate ruleCardView:self didChangeBand:band];
-    }
-}
-
-- (void)sliderTouchEnded:(UISlider *)slider {
-    NSInteger band = (NSInteger)lroundf(slider.value);
-    self.rule.targetBand = band;
-    if ([self.delegate respondsToSelector:@selector(ruleCardViewDidFinishBandChange:)]) {
-        [self.delegate ruleCardViewDidFinishBandChange:self];
     }
 }
 
@@ -1523,12 +2017,15 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 @end
 
+
 #pragma mark - Controllers: App Picker Sheet
 
 @interface JPAppPickerViewController : UIViewController <UITableViewDataSource, UITableViewDelegate, UISearchResultsUpdating>
 @property (nonatomic, copy) NSArray<JPInstalledApp *> *allApps;
 @property (nonatomic, strong) NSMutableArray<JPInstalledApp *> *filteredApps;
 @property (nonatomic, copy) NSArray<JPRule *> *existingRules;
+@property (nonatomic, assign) BOOL userAppsOnly;
+@property (nonatomic, copy) BOOL (^isAppExistingBlock)(JPInstalledApp *app);
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UISearchController *searchController;
 @property (nonatomic, strong) UIView *emptyView;
@@ -1545,10 +2042,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     self.filteredApps = [NSMutableArray arrayWithArray:self.allApps];
 
-    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"手动输入"
-                                                                             style:UIBarButtonItemStylePlain
-                                                                            target:self
-                                                                            action:@selector(showManualInputDialog)];
+    if (!self.userAppsOnly) {
+        self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"手动输入"
+                                                                                 style:UIBarButtonItemStylePlain
+                                                                                target:self
+                                                                                action:@selector(showManualInputDialog)];
+    }
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"取消"
                                                                               style:UIBarButtonItemStylePlain
                                                                              target:self
@@ -1604,7 +2103,9 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     [self.emptyView addSubview:icon];
     [self.emptyView addSubview:tip];
-    [self.emptyView addSubview:manualBtn];
+    if (!self.userAppsOnly) {
+        [self.emptyView addSubview:manualBtn];
+    }
 
     [NSLayoutConstraint activateConstraints:@[
         [icon.centerXAnchor constraintEqualToAnchor:self.emptyView.centerXAnchor],
@@ -1615,11 +2116,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         [tip.topAnchor constraintEqualToAnchor:icon.bottomAnchor constant:12],
         [tip.leadingAnchor constraintEqualToAnchor:self.emptyView.leadingAnchor constant:24],
         [tip.trailingAnchor constraintEqualToAnchor:self.emptyView.trailingAnchor constant:-24],
-
-        [manualBtn.topAnchor constraintEqualToAnchor:tip.bottomAnchor constant:16],
-        [manualBtn.centerXAnchor constraintEqualToAnchor:self.emptyView.centerXAnchor],
-        [manualBtn.bottomAnchor constraintEqualToAnchor:self.emptyView.bottomAnchor]
     ]];
+
+    if (!self.userAppsOnly) {
+        [NSLayoutConstraint activateConstraints:@[
+            [manualBtn.topAnchor constraintEqualToAnchor:tip.bottomAnchor constant:16],
+            [manualBtn.centerXAnchor constraintEqualToAnchor:self.emptyView.centerXAnchor],
+            [manualBtn.bottomAnchor constraintEqualToAnchor:self.emptyView.bottomAnchor]
+        ]];
+    } else {
+        [tip.bottomAnchor constraintEqualToAnchor:self.emptyView.bottomAnchor].active = YES;
+    }
 
     [self.view addSubview:self.emptyView];
     [NSLayoutConstraint activateConstraints:@[
@@ -1657,6 +2164,9 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (BOOL)isAppAlreadyAdded:(JPInstalledApp *)app {
+    if (self.isAppExistingBlock) {
+        return self.isAppExistingBlock(app);
+    }
     for (JPRule *r in self.existingRules) {
         if ([r.pathFragment hasPrefix:@"bid:"]) {
             NSString *ruleBid = [r.pathFragment substringFromIndex:4];
@@ -1693,10 +2203,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     BOOL added = [self isAppAlreadyAdded:app];
     if (added) {
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 已在规则中", app.pathFragment];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 已在规则中（点此编辑）", app.pathFragment];
         cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-        cell.accessoryType = UITableViewCellAccessoryCheckmark;
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     } else {
         cell.detailTextLabel.text = app.pathFragment;
         cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
@@ -1709,16 +2219,24 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     JPInstalledApp *app = self.filteredApps[indexPath.row];
-    if ([self isAppAlreadyAdded:app]) {
-        UIAlertController *notice = [UIAlertController alertControllerWithTitle:@"规则已存在"
-                                                                        message:[NSString stringWithFormat:@"「%@」已在规则列表中", app.displayName]
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-        [notice addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:notice animated:YES completion:nil];
+    NSString *bid = app.bundleId;
+
+    if (self.userAppsOnly) {
+        if (!bid || bid.length == 0) {
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"无法添加"
+                                                                           message:@"该 App 未获取到 Bundle ID，无法配置内存释放规则"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+            return;
+        }
+        if (self.onSelectApp) {
+            self.onSelectApp([NSString stringWithFormat:@"bid:%@", bid], app.displayName);
+        }
+        [self dismissViewControllerAnimated:YES completion:nil];
         return;
     }
 
-    NSString *bid = app.bundleId;
     if (bid && bid.length > 0) {
         if (self.onSelectApp) {
             self.onSelectApp([NSString stringWithFormat:@"bid:%@", bid], app.displayName);
@@ -1735,7 +2253,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
             }
             [weakSelf dismissViewControllerAnimated:YES completion:nil];
         }]];
-        // 提交 2 小 1: 选 App 读不到 bundleId 时的提示框加「取消」选项
         [warn addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:warn animated:YES completion:nil];
     }
@@ -1782,13 +2299,13 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     __weak typeof(alert) weakAlert = alert;
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"添加为保护 (90 档)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+    [alert addAction:[UIAlertAction actionWithTitle:@"添加为保护 (50 档)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *text = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (text.length == 0) return;
         if (![text containsString:@"/"] && ![text hasSuffix:@".app"]) {
             text = [text stringByAppendingString:@".app/"];
         }
-        [weakSelf promptManualAddWithText:text type:JPRuleTypeProtect band:90];
+        [weakSelf promptManualAddWithText:text type:JPRuleTypeProtect band:50];
     }]];
 
     [alert addAction:[UIAlertAction actionWithTitle:@"添加为降级 (30 档)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
@@ -1805,6 +2322,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 @end
+
 
 #pragma mark - Controllers: Protected List
 
@@ -2233,6 +2751,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, copy) NSString *currentFrag;
 @property (nonatomic, copy) NSString *currentDisplayName;
 @property (nonatomic, strong) UILabel *sliderValLabel;
+@property (nonatomic, strong) UILabel *auxTipLabel;
 @end
 
 @implementation JPRuleEditViewController
@@ -2378,8 +2897,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         slider.value = (float)self.currentBand;
         [slider addTarget:self action:@selector(sliderMoved:) forControlEvents:UIControlEventValueChanged];
 
+        self.auxTipLabel = [UILabel new];
+        self.auxTipLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        self.auxTipLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        self.auxTipLabel.textColor = UIColor.systemOrangeColor;
+        self.auxTipLabel.numberOfLines = 0;
+        self.auxTipLabel.text = @"90 是系统前台辅助档。内存释放触发时，这些 App 会被临时让到 80 约 5 秒。";
+        self.auxTipLabel.hidden = (self.currentBand < 90);
+
         [cell.contentView addSubview:self.sliderValLabel];
         [cell.contentView addSubview:slider];
+        [cell.contentView addSubview:self.auxTipLabel];
 
         [NSLayoutConstraint activateConstraints:@[
             [self.sliderValLabel.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:12],
@@ -2389,7 +2917,11 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
             [slider.topAnchor constraintEqualToAnchor:self.sliderValLabel.bottomAnchor constant:10],
             [slider.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
             [slider.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
-            [slider.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-14]
+
+            [self.auxTipLabel.topAnchor constraintEqualToAnchor:slider.bottomAnchor constant:8],
+            [self.auxTipLabel.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+            [self.auxTipLabel.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+            [self.auxTipLabel.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-12]
         ]];
         return cell;
     } else {
@@ -2407,6 +2939,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     if (stepped > 95) stepped = 95;
     self.currentBand = stepped;
     self.sliderValLabel.text = BandDescription(stepped);
+    self.auxTipLabel.hidden = (stepped < 90);
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -2421,6 +2954,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 @end
 
+
 #pragma mark - Controllers: Main ViewController
 
 @interface MainViewController : UIViewController <JPRuleCardViewDelegate, JPRuleEditViewControllerDelegate>
@@ -2432,7 +2966,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 @property (nonatomic, strong) JPStatusCardView *statusCard;
 @property (nonatomic, strong) JPKilledStatsCardView *killedStatsCard;
-// 被杀统计的后台串行队列 + 世代计数：解析放后台，过期结果丢弃
 @property (nonatomic, strong) dispatch_queue_t killStatsQueue;
 @property (nonatomic, assign) NSInteger killStatsGeneration;
 @property (nonatomic, copy) NSString *killStatsLastSig;
@@ -2454,7 +2987,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"JetPilot";
+    self.title = @"进程优先级";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.navigationController.navigationBar.prefersLargeTitles = YES;
 
@@ -2493,6 +3026,8 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    [self loadConfig];
+    [self rebuildRulesCards];
     [self refreshStatus];
     [self startPollingTimer];
 }
@@ -2551,7 +3086,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     ]];
 
     // 0. 守护进程异常未运行时的红条（默认隐藏，UIStackView 自动收起）
-    // 1. Status Section
     self.deadBanner = [UIButton buttonWithType:UIButtonTypeSystem];
     self.deadBanner.translatesAutoresizingMaskIntoConstraints = NO;
     self.deadBanner.backgroundColor = UIColor.systemRedColor;
@@ -2570,7 +3104,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.versionWarningBanner.backgroundColor = UIColor.systemRedColor;
     self.versionWarningBanner.layer.cornerRadius = 12;
     self.versionWarningBanner.layer.cornerCurve = kCACornerCurveContinuous;
-    // 提交 2 小 2: 文案和点击逻辑改为停止后自动重启守护进程
     [self.versionWarningBanner setTitle:@"守护进程是旧版本，按 App 添加的规则不会生效。点击重启守护进程。" forState:UIControlStateNormal];
     [self.versionWarningBanner setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     self.versionWarningBanner.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
@@ -2581,6 +3114,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.versionWarningBanner.hidden = YES;
     [self.contentStackView addArrangedSubview:self.versionWarningBanner];
 
+    // 1. Status Section
     UILabel *statusHeader = [self createSectionHeader:@"运行状态"];
     self.statusCard = [JPStatusCardView new];
     __weak typeof(self) weakSelf = self;
@@ -2600,32 +3134,38 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     // 3. Rules Section
     self.rulesSectionHeaderLabel = [self createSectionHeader:@"保护规则"];
+    UILabel *rulesNote = [UILabel new];
+    rulesNote.translatesAutoresizingMaskIntoConstraints = NO;
+    rulesNote.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    rulesNote.textColor = UIColor.secondaryLabelColor;
+    rulesNote.numberOfLines = 0;
+    rulesNote.text = @"数值越大越晚被杀。内存真不够时，所有 App 都可能被杀，包括排第一的。";
+
     self.rulesStackView = [UIStackView new];
     self.rulesStackView.translatesAutoresizingMaskIntoConstraints = NO;
     self.rulesStackView.axis = UILayoutConstraintAxisVertical;
     self.rulesStackView.spacing = 12;
 
     [self.contentStackView addArrangedSubview:self.rulesSectionHeaderLabel];
+    [self.contentStackView addArrangedSubview:rulesNote];
     [self.contentStackView addArrangedSubview:self.rulesStackView];
 
     // 3. Add Rule Card
     self.addRuleCard = [self createAddRuleCard];
     [self.contentStackView addArrangedSubview:self.addRuleCard];
 
-    // 4. About Section
     UILabel *aboutHeader = [self createSectionHeader:@"关于"];
     [self.contentStackView addArrangedSubview:aboutHeader];
     UIView *aboutCard = [self createAboutCard];
     [self.contentStackView addArrangedSubview:aboutCard];
 
-    // 5. Footer Note
     UILabel *footer = [UILabel new];
     footer.translatesAutoresizingMaskIntoConstraints = NO;
     footer.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
     footer.textColor = UIColor.tertiaryLabelColor;
     footer.textAlignment = NSTextAlignmentCenter;
     footer.numberOfLines = 0;
-    footer.text = @"改动实时自动保存 · 守护进程每 5–10 秒轮询生效";
+    footer.text = @"改动实时自动保存 · 亮屏约 10 秒内，锁屏最长约 60 秒生效";
     [self.contentStackView addArrangedSubview:footer];
 }
 
@@ -2719,7 +3259,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     UIButton *logButton = [UIButton buttonWithType:UIButtonTypeSystem];
     logButton.translatesAutoresizingMaskIntoConstraints = NO;
     [logButton setTitle:@"调试日志 ›" forState:UIControlStateNormal];
-    [logButton setTitleColor:UIColor.systemBlueColor forState:UIControlStateNormal];
     logButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
     logButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
     [logButton addTarget:self action:@selector(openLogViewer) forControlEvents:UIControlEventTouchUpInside];
@@ -2784,7 +3323,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     lbl.translatesAutoresizingMaskIntoConstraints = NO;
     lbl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     lbl.textColor = UIColor.labelColor;
-    lbl.text = @"已保存，守护进程 5–10 秒内生效";
+    lbl.text = @"改动已保存 · 亮屏约 10 秒内，锁屏最长约 60 秒生效";
 
     [self.saveNoticeToast addSubview:icon];
     [self.saveNoticeToast addSubview:lbl];
@@ -2880,11 +3419,11 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         NSString *frag = cleanTokens[1];
 
         if ([verb isEqualToString:@"protect"]) {
-            NSInteger band = 90;
+            NSInteger band = 50;
             if (cleanTokens.count >= 3) {
                 band = [cleanTokens[2] integerValue];
             }
-            if (band <= 0) band = 90;
+            if (band <= 0) band = 50;
             if (band < 30) band = 30;
             if (band > 95) band = 95;
 
@@ -2950,8 +3489,8 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     }
     if (self.installedApps.count == 0) return;
 
-    // 必改 3-4: 撤销持久化标记检查，若用户此前撤销过则不再自动迁移
     NSFileManager *fm = NSFileManager.defaultManager;
+    // 必改 3-4: 撤销持久化标记检查，若用户此前撤销过则不再自动迁移
     if ([fm fileExistsAtPath:kMigrationDeclined]) return;
 
     if (!status.bidSupport || [self daemonState] != JPDaemonStateRunning) return;
@@ -2988,7 +3527,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         return;
     }
 
-    // 必改 3-2: 备份失败则不迁移，直接 return（本次不再尝试）
     // 终审: 每次迁移前都覆盖备份，备份含义为"本次迁移之前"，撤销永远只撤这一次
     NSError *backupErr = nil;
     NSString *configContent = [NSString stringWithContentsOfFile:kConfig encoding:NSUTF8StringEncoding error:&backupErr];
@@ -3083,7 +3621,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
         // 必改 3-4: 撤销成功后写入持久标记，下次打开不再自动迁移
         [@"declined" writeToFile:kMigrationDeclined atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
         [strongSelf loadConfig];
         [strongSelf rebuildRulesCards];
         [strongSelf showSaveNotice];
@@ -3095,6 +3632,55 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     for (UIView *v in self.rulesStackView.arrangedSubviews) {
         [self.rulesStackView removeArrangedSubview:v];
         [v removeFromSuperview];
+    }
+
+    // Mark duplicates and conflictWithDemote
+    NSMutableSet<NSString *> *seenProtect = [NSMutableSet set];
+    NSMutableSet<NSString *> *seenDemote = [NSMutableSet set];
+    for (JPRule *r in self.rules) {
+        r.isDuplicate = NO;
+        r.isConflictWithDemote = NO;
+        NSString *key = r.pathFragment ?: @"";
+        if (r.type == JPRuleTypeProtect) {
+            if ([seenProtect containsObject:key]) {
+                r.isDuplicate = YES;
+            } else {
+                [seenProtect addObject:key];
+            }
+            if ([seenDemote containsObject:key]) {
+                r.isConflictWithDemote = YES;
+            }
+        } else {
+            if ([seenDemote containsObject:key]) {
+                r.isDuplicate = YES;
+            } else {
+                [seenDemote addObject:key];
+            }
+            if ([seenProtect containsObject:key]) {
+                r.isConflictWithDemote = YES;
+            }
+        }
+    }
+
+    NSMutableArray<JPRule *> *protectRules = [NSMutableArray array];
+    NSMutableArray<JPRule *> *demoteRules = [NSMutableArray array];
+    for (JPRule *r in self.rules) {
+        if (r.type == JPRuleTypeProtect) [protectRules addObject:r];
+        else [demoteRules addObject:r];
+    }
+
+    [protectRules sortUsingComparator:^NSComparisonResult(JPRule *a, JPRule *b) {
+        if (a.targetBand > b.targetBand) return NSOrderedAscending;
+        if (a.targetBand < b.targetBand) return NSOrderedDescending;
+        return [a.displayName localizedStandardCompare:b.displayName];
+    }];
+
+    NSCountedSet *bandCounts = [NSCountedSet new];
+    for (JPRule *r in protectRules) {
+        [bandCounts addObject:@(r.targetBand)];
+    }
+    for (JPRule *r in protectRules) {
+        r.hasSameBand = ([bandCounts countForObject:@(r.targetBand)] > 1);
     }
 
     if (self.rules.count == 0) {
@@ -3120,14 +3706,25 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         [self.rulesStackView addArrangedSubview:emptyCard];
     } else {
         JPStatusInfo *st = self.lastLoadedStatus ?: [JPStatusInfo loadCurrentStatus];
-        // 小问题: 与 refreshStatus 统一使用 [self daemonState] == JPDaemonStateRunning
         BOOL isRunning = ([self daemonState] == JPDaemonStateRunning);
-        for (JPRule *rule in self.rules) {
-            JPRuleCardView *card = [[JPRuleCardView alloc] initWithRule:rule delegate:self];
+
+        for (JPRule *rule in protectRules) {
+            JPRuleCardView *card = [[JPRuleCardView alloc] initWithRule:rule delegate:self installedApps:self.installedApps];
             [card updateStatusWithInfo:st daemonRunning:isRunning];
             [self.rulesStackView addArrangedSubview:card];
         }
+
+        if (demoteRules.count > 0) {
+            UILabel *demoteHeader = [self createSectionHeader:@"降级规则（不在前台时降到 30）"];
+            [self.rulesStackView addArrangedSubview:demoteHeader];
+            for (JPRule *rule in demoteRules) {
+                JPRuleCardView *card = [[JPRuleCardView alloc] initWithRule:rule delegate:self installedApps:self.installedApps];
+                [card updateStatusWithInfo:st daemonRunning:isRunning];
+                [self.rulesStackView addArrangedSubview:card];
+            }
+        }
     }
+
     self.rulesSectionHeaderLabel.text = [NSString stringWithFormat:@"保护规则 (%lu)", (unsigned long)self.rules.count];
     if (self.killedStatsCard) {
         [self refreshKilledStatsIfNeeded:YES];
@@ -3137,24 +3734,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 #pragma mark - Daemon Control
 
 - (JPDaemonState)daemonState {
-    NSFileManager *fm = NSFileManager.defaultManager;
-    if (![fm fileExistsAtPath:kFlag]) return JPDaemonStateStopped;
-
-    /* 刚启动的 10 秒宽限：守护进程可能还没写出第一份 status.txt */
-    if (self.lastSpawnTime > 0 && CFAbsoluteTimeGetCurrent() - self.lastSpawnTime < 10.0)
-        return JPDaemonStateRunning;
-
-    /* status.txt 早于本次开机 = 开机后没跑过（不受 pid 复用影响） */
-    NSDate *mtime = [[fm attributesOfItemAtPath:kStatus error:nil] fileModificationDate];
-    time_t boot = JPBootTime();
-    if (!mtime) return JPDaemonStateDead;
-    if (boot > 0 && (time_t)mtime.timeIntervalSince1970 < boot) return JPDaemonStateDead;
-
-    NSString *pidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
-    pid_t pid = (pid_t)[pidStr intValue];
-    if (pid <= 0) return JPDaemonStateDead;
-    if (kill(pid, 0) != 0 && errno == ESRCH) return JPDaemonStateDead;
-    return JPDaemonStateRunning;   /* 0 或 EPERM（root 进程）都算活着 */
+    return [JPDaemonManager daemonStateWithLastSpawnTime:self.lastSpawnTime];
 }
 
 - (BOOL)isDaemonRunning {
@@ -3169,7 +3749,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     }
 }
 
-// 提交 2 小 2: 停止后自动启动守护进程（复用现有启动流程）
 - (void)restartDaemon {
     [self stopDaemon];
     NSString *pidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
@@ -3185,26 +3764,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)startDaemon {
-    /* 异常未运行时，daemon.pid 里的旧 pid 可能已被别的进程复用，
-     * 会骗过守护进程自己的防重复检查，先删掉 */
     if ([self daemonState] == JPDaemonStateDead)
         [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
     [self saveConfig];
-    [@"run" writeToFile:kFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
-
-    NSString *bin = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"jetpilotd"];
-    posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
-    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
-    posix_spawnattr_set_persona_uid_np(&attr, 0);
-    posix_spawnattr_set_persona_gid_np(&attr, 0);
-
-    pid_t pid = 0;
-    const char *argv[] = { bin.fileSystemRepresentation, NULL };
-    int rc = posix_spawn(&pid, bin.fileSystemRepresentation, NULL, &attr, (char **)argv, environ);
-    posix_spawnattr_destroy(&attr);
-    if (rc == 0) self.lastSpawnTime = CFAbsoluteTimeGetCurrent();
+    CFAbsoluteTime t = 0;
+    int rc = [JPDaemonManager startDaemonWithLastSpawnTime:&t];
+    if (rc == 0) self.lastSpawnTime = t;
 
     if (rc != 0) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"启动失败"
@@ -3217,17 +3782,13 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)stopDaemon {
-    [NSFileManager.defaultManager removeItemAtPath:kFlag error:nil];
+    [JPDaemonManager stopDaemon];
     [self refreshStatus];
 }
 
-// 被杀统计：只在 JetsamEvent 目录或规则变化时才重新解析（签名比对，3 秒轮询不再空转），
-// 解析放后台串行队列（队列本身串行，无需 busy 标志），世代计数丢弃过期结果。
 - (void)refreshKilledStatsIfNeeded:(BOOL)force {
     if (!self.killedStatsCard) return;
 
-    // 签名 = 当天日期 + JetsamEvent 文件数 + 最新文件名 + 规则数；只列目录，不读文件，开销很小
-    // 日期保证半夜无新日志时 7 天窗口也能往前滚（每天最多因此多解析一次）
     NSCalendar *cal = [NSCalendar currentCalendar];
     NSDateComponents *dc = [cal components:(NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay)
                                   fromDate:[NSDate date]];
@@ -3308,14 +3869,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)ruleCardView:(JPRuleCardView *)card didChangeBand:(NSInteger)band {
-    card.rule.targetBand = band;
-}
-
-- (void)ruleCardViewDidFinishBandChange:(JPRuleCardView *)card {
-    [self saveConfig];
-}
-
 - (void)ruleCardViewDidTap:(JPRuleCardView *)card {
     if (card.rule.isConflict) {
         [self reselectAppForRule:card.rule];
@@ -3380,7 +3933,6 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
                 return YES;
             }
         } else {
-            // 小问题: 路径匹配仅使用 isEqualToString
             if ([pApp.pathFragment isEqualToString:rule.pathFragment]) {
                 return YES;
             }
@@ -3429,8 +3981,8 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         NSDictionary *attrs = [fm attributesOfItemAtPath:kStatus error:nil];
         NSDate *mtime = attrs.fileModificationDate;
 
+        // mtime > t0，说明守护进程已在规则保存后写出新的 status.txt
         if (mtime && [mtime compare:t0] == NSOrderedDescending) {
-            // mtime > t0，说明守护进程已在规则保存后写出新的 status.txt
             [t invalidate];
             [strongSelf refreshStatus];
             JPStatusInfo *currentSt = strongSelf.lastLoadedStatus ?: [JPStatusInfo loadCurrentStatus];
@@ -3464,26 +4016,59 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)showAddRuleSheet {
+    if (self.rules.count >= 32) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"规则已达上限"
+                                                                       message:@"最多支持添加 32 条保护规则"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
     JPAppPickerViewController *picker = [JPAppPickerViewController new];
     picker.allApps = self.installedApps;
     picker.existingRules = self.rules;
 
     __weak typeof(self) weakSelf = self;
     picker.onSelectApp = ^(NSString *pathFragment, NSString *displayName) {
+        JPRule *existing = nil;
+        for (JPRule *r in weakSelf.rules) {
+            if ([r.pathFragment isEqualToString:pathFragment]) {
+                existing = r;
+                break;
+            }
+        }
+        if (existing) {
+            [weakSelf openEditRuleController:existing];
+            return;
+        }
+
         JPRule *r = [JPRule new];
         r.type = JPRuleTypeProtect;
         r.pathFragment = pathFragment;
-        r.targetBand = 90;
+        r.targetBand = 50;
         r.displayName = displayName;
         [weakSelf evaluateRuleConflict:r];
         [weakSelf.rules addObject:r];
         [weakSelf rebuildRulesCards];
         NSDate *t0 = [NSDate date];
         [weakSelf saveConfig];
-        [weakSelf checkRuleRunStateAfterAdd:r appName:displayName targetBand:90 type:JPRuleTypeProtect saveTime:t0];
+        [weakSelf checkRuleRunStateAfterAdd:r appName:displayName targetBand:50 type:JPRuleTypeProtect saveTime:t0];
     };
 
     picker.onManualAdd = ^(NSString *pathFragment, JPRuleType type, NSInteger band) {
+        JPRule *existing = nil;
+        for (JPRule *r in weakSelf.rules) {
+            if ([r.pathFragment isEqualToString:pathFragment]) {
+                existing = r;
+                break;
+            }
+        }
+        if (existing) {
+            [weakSelf openEditRuleController:existing];
+            return;
+        }
+
         JPRule *r = [JPRule new];
         r.type = type;
         r.pathFragment = pathFragment;
@@ -3531,9 +4116,1544 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 @end
 
+
+#pragma mark - Views: MemPressure Rule Card
+
+@class JPMemPressureRuleCardView;
+@protocol JPMemPressureRuleCardViewDelegate <NSObject>
+@optional
+- (void)memPressureRuleCardViewDidTap:(JPMemPressureRuleCardView *)card;
+- (void)memPressureRuleCardViewDidRequestDelete:(JPMemPressureRuleCardView *)card;
+@end
+
+@interface JPMemPressureRuleCardView : UIView
+@property (nonatomic, strong) JPMemPressureRule *rule;
+@property (nonatomic, weak) id<JPMemPressureRuleCardViewDelegate> delegate;
+@property (nonatomic, strong) UIImageView *iconImageView;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *fragLabel;
+@property (nonatomic, strong) UILabel *legacyBadgeLabel;
+@property (nonatomic, strong) UILabel *thrLabel;
+@property (nonatomic, strong) UILabel *cdLabel;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UIButton *deleteButton;
+
+- (instancetype)initWithRule:(JPMemPressureRule *)rule
+                    delegate:(id<JPMemPressureRuleCardViewDelegate>)delegate
+                       floor:(JPMemPressureFloorEntry *)floor
+              globalCooldown:(NSInteger)globalCooldown
+               installedApps:(NSArray<JPInstalledApp *> *)apps;
+@end
+
+@implementation JPMemPressureRuleCardView
+
+- (instancetype)initWithRule:(JPMemPressureRule *)rule
+                    delegate:(id<JPMemPressureRuleCardViewDelegate>)delegate
+                       floor:(JPMemPressureFloorEntry *)floor
+              globalCooldown:(NSInteger)globalCooldown
+               installedApps:(NSArray<JPInstalledApp *> *)apps {
+    self = [super initWithFrame:CGRectZero];
+    if (self) {
+        _rule = rule;
+        _delegate = delegate;
+        [self setupUIWithFloor:floor globalCooldown:globalCooldown installedApps:apps];
+    }
+    return self;
+}
+
+- (void)setupUIWithFloor:(JPMemPressureFloorEntry *)floor
+          globalCooldown:(NSInteger)globalCooldown
+           installedApps:(NSArray<JPInstalledApp *> *)apps {
+    self.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    self.layer.cornerRadius = 14;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    self.clipsToBounds = YES;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.iconImageView = [UIImageView new];
+    self.iconImageView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.iconImageView.layer.cornerRadius = 8;
+    self.iconImageView.layer.cornerCurve = kCACornerCurveContinuous;
+    self.iconImageView.clipsToBounds = YES;
+    self.iconImageView.contentMode = UIViewContentModeScaleAspectFit;
+    self.iconImageView.image = JPIconForFragment(self.rule.frag, apps);
+    [self addSubview:self.iconImageView];
+
+    NSString *name = ResolveDisplayNameHelper(self.rule.frag, apps);
+    if (name.length == 0) name = self.rule.displayName ?: self.rule.frag;
+
+    self.titleLabel = [UILabel new];
+    self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    self.titleLabel.textColor = UIColor.labelColor;
+    self.titleLabel.text = name;
+    [self addSubview:self.titleLabel];
+
+    self.legacyBadgeLabel = [UILabel new];
+    self.legacyBadgeLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.legacyBadgeLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+    self.legacyBadgeLabel.textColor = UIColor.systemOrangeColor;
+    self.legacyBadgeLabel.text = @"旧格式";
+    self.legacyBadgeLabel.hidden = [self.rule.frag hasPrefix:@"bid:"];
+    [self addSubview:self.legacyBadgeLabel];
+
+    self.fragLabel = [UILabel new];
+    self.fragLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.fragLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    self.fragLabel.textColor = UIColor.secondaryLabelColor;
+    self.fragLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    self.fragLabel.text = self.rule.frag;
+    [self addSubview:self.fragLabel];
+
+    self.statusLabel = [UILabel new];
+    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    self.statusLabel.textColor = UIColor.secondaryLabelColor;
+    self.statusLabel.numberOfLines = 1;
+    [self addSubview:self.statusLabel];
+
+    self.thrLabel = [UILabel new];
+    self.thrLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.thrLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+    self.thrLabel.textAlignment = NSTextAlignmentRight;
+    self.thrLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.rule.thresholdMB];
+    [self addSubview:self.thrLabel];
+
+    self.cdLabel = [UILabel new];
+    self.cdLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.cdLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    self.cdLabel.textColor = UIColor.secondaryLabelColor;
+    self.cdLabel.textAlignment = NSTextAlignmentRight;
+    if (self.rule.cooldown > 0) {
+        self.cdLabel.text = [NSString stringWithFormat:@"冷却 %ld 秒", (long)self.rule.cooldown];
+    } else {
+        self.cdLabel.text = [NSString stringWithFormat:@"默认 %ld 秒", (long)globalCooldown];
+    }
+    [self addSubview:self.cdLabel];
+
+    self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.deleteButton setImage:[UIImage systemImageNamed:@"trash"] forState:UIControlStateNormal];
+    self.deleteButton.tintColor = UIColor.systemRedColor;
+    [self.deleteButton addTarget:self action:@selector(deleteTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.deleteButton];
+
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    chevron.translatesAutoresizingMaskIntoConstraints = NO;
+    chevron.tintColor = UIColor.tertiaryLabelColor;
+    chevron.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:chevron];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.iconImageView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+        [self.iconImageView.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.iconImageView.widthAnchor constraintEqualToConstant:40],
+        [self.iconImageView.heightAnchor constraintEqualToConstant:40],
+
+        [chevron.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
+        [chevron.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [chevron.widthAnchor constraintEqualToConstant:8],
+        [chevron.heightAnchor constraintEqualToConstant:13],
+
+        [self.deleteButton.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-4],
+        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.deleteButton.widthAnchor constraintEqualToConstant:32],
+        [self.deleteButton.heightAnchor constraintEqualToConstant:32],
+
+        [self.thrLabel.trailingAnchor constraintEqualToAnchor:self.deleteButton.leadingAnchor constant:-6],
+        [self.thrLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+        [self.thrLabel.widthAnchor constraintGreaterThanOrEqualToConstant:60],
+
+        [self.cdLabel.trailingAnchor constraintEqualToAnchor:self.thrLabel.trailingAnchor],
+        [self.cdLabel.topAnchor constraintEqualToAnchor:self.thrLabel.bottomAnchor constant:2],
+
+        [self.titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+        [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.thrLabel.leadingAnchor constant:-8],
+
+        [self.legacyBadgeLabel.leadingAnchor constraintEqualToAnchor:self.titleLabel.trailingAnchor constant:6],
+        [self.legacyBadgeLabel.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
+
+        [self.fragLabel.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:2],
+        [self.fragLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.fragLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.thrLabel.leadingAnchor constant:-8],
+
+        [self.statusLabel.topAnchor constraintEqualToAnchor:self.fragLabel.bottomAnchor constant:3],
+        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.statusLabel.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12]
+    ]];
+
+    BOOL installed = JPIsAppInstalled(self.rule.frag, apps);
+    if (!installed) {
+        self.statusLabel.text = @"未安装";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        self.alpha = 0.65;
+        self.thrLabel.textColor = UIColor.secondaryLabelColor;
+    } else if (!self.rule.isEnabled) {
+        self.statusLabel.text = @"已停用";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        self.alpha = 0.75;
+        self.thrLabel.textColor = UIColor.secondaryLabelColor;
+    } else if (self.rule.isDuplicate) {
+        self.statusLabel.text = @"⚠️ 重复，只有第一条生效";
+        self.statusLabel.textColor = UIColor.systemRedColor;
+        self.alpha = 1.0;
+        self.thrLabel.textColor = UIColor.systemBlueColor;
+    } else {
+        self.alpha = 1.0;
+        BOOL isLow = (floor && floor.median > 0 && self.rule.thresholdMB < (floor.median + 50.0));
+        if (isLow) {
+            self.thrLabel.textColor = UIColor.systemOrangeColor;
+            self.statusLabel.text = [NSString stringWithFormat:@"底线 ~%.1f MB (样本 %ld) · 阈值偏低", floor.median, (long)floor.sampleCount];
+            self.statusLabel.textColor = UIColor.systemOrangeColor;
+        } else if (floor && floor.median > 0) {
+            self.thrLabel.textColor = UIColor.systemBlueColor;
+            self.statusLabel.text = [NSString stringWithFormat:@"底线 ~%.1f MB (有效样本 %ld 个)", floor.median, (long)floor.sampleCount];
+            self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        } else {
+            self.thrLabel.textColor = UIColor.systemBlueColor;
+            self.statusLabel.text = @"暂无底线记录";
+            self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        }
+    }
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(cardTapped:)];
+    [self addGestureRecognizer:tap];
+}
+
+- (void)cardTapped:(UITapGestureRecognizer *)gesture {
+    CGPoint pt = [gesture locationInView:self];
+    if (CGRectContainsPoint(self.deleteButton.frame, pt)) return;
+    if ([self.delegate respondsToSelector:@selector(memPressureRuleCardViewDidTap:)]) {
+        [self.delegate memPressureRuleCardViewDidTap:self];
+    }
+}
+
+- (void)deleteTapped {
+    if ([self.delegate respondsToSelector:@selector(memPressureRuleCardViewDidRequestDelete:)]) {
+        [self.delegate memPressureRuleCardViewDidRequestDelete:self];
+    }
+}
+
+@end
+
+#pragma mark - Views: MemPressure Unknown Line Card
+
+@protocol JPMemPressureUnknownLineCardViewDelegate <NSObject>
+@optional
+- (void)memPressureUnknownLineCardViewDidRequestDelete:(JPMemPressureLine *)line;
+@end
+
+@interface JPMemPressureUnknownLineCardView : UIView
+@property (nonatomic, strong) JPMemPressureLine *line;
+@property (nonatomic, weak) id<JPMemPressureUnknownLineCardViewDelegate> delegate;
+@property (nonatomic, strong) UIImageView *iconImageView;
+@property (nonatomic, strong) UILabel *badgeLabel;
+@property (nonatomic, strong) UILabel *rawLabel;
+@property (nonatomic, strong) UILabel *tipLabel;
+@property (nonatomic, strong) UIButton *deleteButton;
+
+- (instancetype)initWithLine:(JPMemPressureLine *)line delegate:(id<JPMemPressureUnknownLineCardViewDelegate>)delegate;
+@end
+
+@implementation JPMemPressureUnknownLineCardView
+
+- (instancetype)initWithLine:(JPMemPressureLine *)line delegate:(id<JPMemPressureUnknownLineCardViewDelegate>)delegate {
+    self = [super initWithFrame:CGRectZero];
+    if (self) {
+        _line = line;
+        _delegate = delegate;
+        [self setupUI];
+    }
+    return self;
+}
+
+- (void)setupUI {
+    self.backgroundColor = [UIColor.systemRedColor colorWithAlphaComponent:0.08];
+    self.layer.borderColor = [UIColor.systemRedColor colorWithAlphaComponent:0.35].CGColor;
+    self.layer.borderWidth = 1.0;
+    self.layer.cornerRadius = 14;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    self.clipsToBounds = YES;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.iconImageView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"exclamationmark.triangle.fill"]];
+    self.iconImageView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.iconImageView.tintColor = UIColor.systemRedColor;
+    self.iconImageView.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:self.iconImageView];
+
+    self.badgeLabel = [UILabel new];
+    self.badgeLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.badgeLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
+    self.badgeLabel.textColor = UIColor.systemRedColor;
+    self.badgeLabel.text = @"无效/未知配置行（已忽略）";
+    [self addSubview:self.badgeLabel];
+
+    self.rawLabel = [UILabel new];
+    self.rawLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.rawLabel.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+    self.rawLabel.textColor = UIColor.labelColor;
+    self.rawLabel.numberOfLines = 2;
+    self.rawLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    self.rawLabel.text = self.line.rawText ?: @"";
+    [self addSubview:self.rawLabel];
+
+    self.tipLabel = [UILabel new];
+    self.tipLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tipLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    self.tipLabel.textColor = UIColor.secondaryLabelColor;
+    self.tipLabel.text = @"语法不符合规范，不可编辑，原样保留；可点击右侧删除";
+    [self addSubview:self.tipLabel];
+
+    self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.deleteButton setImage:[UIImage systemImageNamed:@"trash"] forState:UIControlStateNormal];
+    self.deleteButton.tintColor = UIColor.systemRedColor;
+    [self.deleteButton addTarget:self action:@selector(deleteTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.deleteButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.iconImageView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+        [self.iconImageView.topAnchor constraintEqualToAnchor:self.topAnchor constant:14],
+        [self.iconImageView.widthAnchor constraintEqualToConstant:24],
+        [self.iconImageView.heightAnchor constraintEqualToConstant:24],
+
+        [self.deleteButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
+        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.deleteButton.widthAnchor constraintEqualToConstant:32],
+        [self.deleteButton.heightAnchor constraintEqualToConstant:32],
+
+        [self.badgeLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+        [self.badgeLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:10],
+        [self.badgeLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+
+        [self.rawLabel.topAnchor constraintEqualToAnchor:self.badgeLabel.bottomAnchor constant:3],
+        [self.rawLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:10],
+        [self.rawLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+
+        [self.tipLabel.topAnchor constraintEqualToAnchor:self.rawLabel.bottomAnchor constant:3],
+        [self.tipLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:10],
+        [self.tipLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.tipLabel.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12],
+    ]];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(cardTapped:)];
+    [self addGestureRecognizer:tap];
+}
+
+- (void)cardTapped:(UITapGestureRecognizer *)g {
+    CGPoint pt = [g locationInView:self];
+    if (CGRectContainsPoint(self.deleteButton.frame, pt)) return;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"无法识别的配置行"
+                                                                   message:[NSString stringWithFormat:@"该行内容：\n\n%@\n\n该行不符合语法规范，守护进程已忽略并不生效。App 默认原样保留；若不需要，可点击删除。", self.line.rawText ?: @""]
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+    UIResponder *resp = self.nextResponder;
+    while (resp && ![resp isKindOfClass:[UIViewController class]]) {
+        resp = resp.nextResponder;
+    }
+    if (resp) {
+        [(UIViewController *)resp presentViewController:alert animated:YES completion:nil];
+    }
+}
+
+- (void)deleteTapped {
+    if ([self.delegate respondsToSelector:@selector(memPressureUnknownLineCardViewDidRequestDelete:)]) {
+        [self.delegate memPressureUnknownLineCardViewDidRequestDelete:self.line];
+    }
+}
+
+@end
+
+#pragma mark - Controllers: MemPressure Rule Edit
+
+@protocol JPMemPressureRuleEditViewControllerDelegate <NSObject>
+- (void)memPressureRuleEditViewControllerDidSave:(JPMemPressureRule *)rule;
+- (void)memPressureRuleEditViewControllerDidDelete:(JPMemPressureRule *)rule;
+@end
+
+@interface JPMemPressureRuleEditViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) JPMemPressureRule *rule;
+@property (nonatomic, strong) JPMemPressureFloorEntry *floor;
+@property (nonatomic, assign) NSInteger globalCooldown;
+@property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
+@property (nonatomic, weak) id<JPMemPressureRuleEditViewControllerDelegate> delegate;
+
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, assign) NSInteger currentThr;
+@property (nonatomic, assign) NSInteger currentCd;
+@property (nonatomic, assign) BOOL isEnabled;
+@property (nonatomic, assign) BOOL useGlobalCooldown;
+@property (nonatomic, strong) UILabel *thrValLabel;
+@property (nonatomic, strong) UILabel *thrWarnLabel;
+@property (nonatomic, strong) UILabel *cdValLabel;
+@property (nonatomic, assign) uint64_t memcapMB;
+@end
+
+@implementation JPMemPressureRuleEditViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"编辑内存释放规则";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+
+    self.memcapMB = JPGetDeviceMemcapMB();
+    self.currentThr = self.rule.thresholdMB;
+    if (self.currentThr < 100) self.currentThr = 100;
+    if (self.currentThr > (NSInteger)self.memcapMB) self.currentThr = (NSInteger)self.memcapMB;
+
+    self.currentCd = (self.rule.cooldown >= 60) ? self.rule.cooldown : (self.globalCooldown >= 60 ? self.globalCooldown : 120);
+    self.useGlobalCooldown = (self.rule.cooldown == 0);
+    self.isEnabled = self.rule.isEnabled;
+
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"取消"
+                                                                             style:UIBarButtonItemStylePlain
+                                                                            target:self
+                                                                            action:@selector(cancelTapped)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"保存"
+                                                                              style:UIBarButtonItemStyleDone
+                                                                             target:self
+                                                                             action:@selector(saveTapped)];
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    [self.view addSubview:self.tableView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.tableView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
+}
+
+- (void)cancelTapped {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)saveTapped {
+    self.rule.thresholdMB = self.currentThr;
+    self.rule.cooldown = self.useGlobalCooldown ? 0 : self.currentCd;
+    self.rule.isEnabled = self.isEnabled;
+    self.rule.isDirty = YES;
+
+    if ([self.delegate respondsToSelector:@selector(memPressureRuleEditViewControllerDidSave:)]) {
+        [self.delegate memPressureRuleEditViewControllerDidSave:self.rule];
+    }
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)confirmDelete {
+    NSString *name = ResolveDisplayNameHelper(self.rule.frag, self.installedApps);
+    if (name.length == 0) name = self.rule.displayName ?: self.rule.frag;
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除规则"
+                                                                   message:[NSString stringWithFormat:@"确定要移除对「%@」的内存释放规则吗？", name]
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        if ([weakSelf.delegate respondsToSelector:@selector(memPressureRuleEditViewControllerDidDelete:)]) {
+            [weakSelf.delegate memPressureRuleEditViewControllerDidDelete:weakSelf.rule];
+        }
+        [weakSelf dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - Table View
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return 5;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (section == 0) return 3;
+    if (section == 1) return 1;
+    if (section == 2) return self.useGlobalCooldown ? 1 : 2;
+    if (section == 3) return 1;
+    return 1;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (section == 0) return @"应用信息";
+    if (section == 1) return [NSString stringWithFormat:@"内存释放阈值（100 ～ %llu MB）", self.memcapMB];
+    if (section == 2) return @"触发冷却时间（60 ～ 86400 秒）";
+    if (section == 3) return @"规则状态";
+    return nil;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 1) {
+        return @"每个 App 都有降不下去的底线。阈值低于底线，会一直发信号、白占 CPU，内存也不会再少。";
+    }
+    return nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section == 0) {
+        if (indexPath.row == 0) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+            cell.textLabel.text = @"应用名称";
+            NSString *name = ResolveDisplayNameHelper(self.rule.frag, self.installedApps);
+            cell.detailTextLabel.text = name.length > 0 ? name : (self.rule.displayName ?: @"未命名");
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        } else if (indexPath.row == 1) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+            cell.textLabel.text = @"规则标识";
+            cell.detailTextLabel.text = self.rule.frag;
+            cell.detailTextLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        } else {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+            cell.textLabel.text = @"底线记录";
+            if (self.floor && self.floor.median > 0) {
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"中位数 %.1f MB (有效样本 %ld 个)", self.floor.median, (long)self.floor.sampleCount];
+            } else {
+                cell.detailTextLabel.text = @"还没有记录，触发几次后会显示";
+            }
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        }
+    } else if (indexPath.section == 1) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        self.thrValLabel = [UILabel new];
+        self.thrValLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        self.thrValLabel.font = [UIFont systemFontOfSize:22 weight:UIFontWeightBold];
+        self.thrValLabel.textAlignment = NSTextAlignmentCenter;
+
+        UIButton *minusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        minusBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        [minusBtn setTitle:@"-50" forState:UIControlStateNormal];
+        minusBtn.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+        [minusBtn addTarget:self action:@selector(thrMinusTapped) forControlEvents:UIControlEventTouchUpInside];
+
+        UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        plusBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        [plusBtn setTitle:@"+50" forState:UIControlStateNormal];
+        plusBtn.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+        [plusBtn addTarget:self action:@selector(thrPlusTapped) forControlEvents:UIControlEventTouchUpInside];
+
+        self.thrWarnLabel = [UILabel new];
+        self.thrWarnLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        self.thrWarnLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        self.thrWarnLabel.textColor = UIColor.systemOrangeColor;
+        self.thrWarnLabel.numberOfLines = 0;
+        self.thrWarnLabel.textAlignment = NSTextAlignmentCenter;
+
+        [cell.contentView addSubview:minusBtn];
+        [cell.contentView addSubview:self.thrValLabel];
+        [cell.contentView addSubview:plusBtn];
+        [cell.contentView addSubview:self.thrWarnLabel];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [minusBtn.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+            [minusBtn.centerYAnchor constraintEqualToAnchor:self.thrValLabel.centerYAnchor],
+            [minusBtn.widthAnchor constraintEqualToConstant:60],
+            [minusBtn.heightAnchor constraintEqualToConstant:36],
+
+            [plusBtn.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+            [plusBtn.centerYAnchor constraintEqualToAnchor:self.thrValLabel.centerYAnchor],
+            [plusBtn.widthAnchor constraintEqualToConstant:60],
+            [plusBtn.heightAnchor constraintEqualToConstant:36],
+
+            [self.thrValLabel.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:14],
+            [self.thrValLabel.centerXAnchor constraintEqualToAnchor:cell.contentView.centerXAnchor],
+
+            [self.thrWarnLabel.topAnchor constraintEqualToAnchor:self.thrValLabel.bottomAnchor constant:8],
+            [self.thrWarnLabel.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+            [self.thrWarnLabel.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+            [self.thrWarnLabel.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-12]
+        ]];
+
+        [self updateThresholdDisplay];
+        return cell;
+    } else if (indexPath.section == 2) {
+        if (indexPath.row == 0) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            cell.textLabel.text = @"使用全局默认冷却";
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+            UISwitch *sw = [UISwitch new];
+            sw.on = self.useGlobalCooldown;
+            [sw addTarget:self action:@selector(globalCooldownSwitchToggled:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
+            return cell;
+        } else {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+            self.cdValLabel = [UILabel new];
+            self.cdValLabel.translatesAutoresizingMaskIntoConstraints = NO;
+            self.cdValLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+            self.cdValLabel.textColor = UIColor.labelColor;
+            self.cdValLabel.textAlignment = NSTextAlignmentCenter;
+            self.cdValLabel.text = [NSString stringWithFormat:@"%ld 秒", (long)self.currentCd];
+
+            UIButton *minusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            minusBtn.translatesAutoresizingMaskIntoConstraints = NO;
+            [minusBtn setTitle:@"-30s" forState:UIControlStateNormal];
+            minusBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+            [minusBtn addTarget:self action:@selector(cdMinusTapped) forControlEvents:UIControlEventTouchUpInside];
+
+            UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+            plusBtn.translatesAutoresizingMaskIntoConstraints = NO;
+            [plusBtn setTitle:@"+30s" forState:UIControlStateNormal];
+            plusBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+            [plusBtn addTarget:self action:@selector(cdPlusTapped) forControlEvents:UIControlEventTouchUpInside];
+
+            [cell.contentView addSubview:minusBtn];
+            [cell.contentView addSubview:self.cdValLabel];
+            [cell.contentView addSubview:plusBtn];
+
+            [NSLayoutConstraint activateConstraints:@[
+                [minusBtn.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+                [minusBtn.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+                [minusBtn.widthAnchor constraintEqualToConstant:60],
+
+                [plusBtn.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+                [plusBtn.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+                [plusBtn.widthAnchor constraintEqualToConstant:60],
+
+                [self.cdValLabel.centerXAnchor constraintEqualToAnchor:cell.contentView.centerXAnchor],
+                [self.cdValLabel.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:12],
+                [self.cdValLabel.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-12]
+            ]];
+
+            return cell;
+        }
+    } else if (indexPath.section == 3) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.textLabel.text = @"启用此规则";
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+        UISwitch *sw = [UISwitch new];
+        sw.on = self.isEnabled;
+        [sw addTarget:self action:@selector(enabledSwitchToggled:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = sw;
+        return cell;
+    } else {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.textLabel.text = @"删除规则";
+        cell.textLabel.textColor = UIColor.systemRedColor;
+        cell.textLabel.textAlignment = NSTextAlignmentCenter;
+        return cell;
+    }
+}
+
+- (void)updateThresholdDisplay {
+    self.thrValLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.currentThr];
+    BOOL isLow = (self.floor && self.floor.median > 0 && self.currentThr < (self.floor.median + 50.0));
+    if (isLow) {
+        self.thrValLabel.textColor = UIColor.systemOrangeColor;
+        self.thrWarnLabel.text = [NSString stringWithFormat:@"⚠️ 阈值低于「底线 + 50 MB」（底线 %.1f MB），可能频繁无效触发并导致冷却退避。", self.floor.median];
+        self.thrWarnLabel.hidden = NO;
+    } else {
+        self.thrValLabel.textColor = UIColor.systemBlueColor;
+        self.thrWarnLabel.hidden = YES;
+    }
+}
+
+- (void)thrMinusTapped {
+    self.currentThr -= 50;
+    if (self.currentThr < 100) self.currentThr = 100;
+    [self updateThresholdDisplay];
+}
+
+- (void)thrPlusTapped {
+    self.currentThr += 50;
+    if (self.currentThr > (NSInteger)self.memcapMB) self.currentThr = (NSInteger)self.memcapMB;
+    [self updateThresholdDisplay];
+}
+
+- (void)cdMinusTapped {
+    self.currentCd -= 30;
+    if (self.currentCd < 60) self.currentCd = 60;
+    self.cdValLabel.text = [NSString stringWithFormat:@"%ld 秒", (long)self.currentCd];
+}
+
+- (void)cdPlusTapped {
+    self.currentCd += 30;
+    if (self.currentCd > 86400) self.currentCd = 86400;
+    self.cdValLabel.text = [NSString stringWithFormat:@"%ld 秒", (long)self.currentCd];
+}
+
+- (void)globalCooldownSwitchToggled:(UISwitch *)sender {
+    self.useGlobalCooldown = sender.isOn;
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:2] withRowAnimation:UITableViewRowAnimationAutomatic];
+}
+
+- (void)enabledSwitchToggled:(UISwitch *)sender {
+    self.isEnabled = sender.isOn;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section == 4) {
+        [self confirmDelete];
+    }
+}
+
+@end
+
+#pragma mark - Controllers: MemPressure ViewController
+
+@interface JPMemPressureViewController : UIViewController <JPMemPressureRuleCardViewDelegate, JPMemPressureRuleEditViewControllerDelegate, JPMemPressureUnknownLineCardViewDelegate>
+@property (nonatomic, strong) JPMemPressureConfig *config;
+@property (nonatomic, copy) NSDictionary<NSString *, JPMemPressureFloorEntry *> *floors;
+@property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
+
+@property (nonatomic, strong) UIScrollView *scrollView;
+@property (nonatomic, strong) UIStackView *contentStackView;
+
+@property (nonatomic, strong) UIButton *deadBanner;
+@property (nonatomic, strong) UISwitch *masterSwitch;
+@property (nonatomic, strong) UILabel *moduleStatusLabel;
+@property (nonatomic, strong) UILabel *rulesSectionHeaderLabel;
+@property (nonatomic, strong) UIStackView *rulesStackView;
+@property (nonatomic, strong) UIView *addRuleCard;
+@property (nonatomic, strong) UIView *globalCooldownCard;
+@property (nonatomic, strong) UILabel *globalCooldownValLabel;
+
+@property (nonatomic, strong) UIView *saveNoticeToast;
+@property (nonatomic, strong) NSTimer *saveNoticeTimer;
+@property (nonatomic, strong) NSTimer *pollingTimer;
+@property (nonatomic, assign) CFAbsoluteTime lastSpawnTime;
+@end
+
+@implementation JPMemPressureViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"内存释放";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+    self.navigationController.navigationBar.prefersLargeTitles = YES;
+
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"arrow.clockwise"]
+                                                                              style:UIBarButtonItemStylePlain
+                                                                             target:self
+                                                                             action:@selector(refreshStatus)];
+
+    [self setupScrollView];
+    [self setupSaveNoticeToast];
+    [self loadConfigAndFloors];
+    [self rebuildRulesCards];
+    [self refreshStatus];
+
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(refreshStatus)
+                                                 name:UIApplicationDidBecomeActiveNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(stopPollingTimer)
+                                                 name:UIApplicationDidEnterBackgroundNotification
+                                               object:nil];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self loadConfigAndFloors];
+    [self rebuildRulesCards];
+    [self refreshStatus];
+    [self startPollingTimer];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self stopPollingTimer];
+}
+
+- (void)dealloc {
+    [self stopPollingTimer];
+    [self.saveNoticeTimer invalidate];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+#pragma mark - Timer
+
+- (void)startPollingTimer {
+    [self stopPollingTimer];
+    __weak typeof(self) weakSelf = self;
+    self.pollingTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        [weakSelf refreshStatus];
+    }];
+}
+
+- (void)stopPollingTimer {
+    [self.pollingTimer invalidate];
+    self.pollingTimer = nil;
+}
+
+#pragma mark - UI Setup
+
+- (void)setupScrollView {
+    self.scrollView = [UIScrollView new];
+    self.scrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.scrollView.alwaysBounceVertical = YES;
+    [self.view addSubview:self.scrollView];
+
+    self.contentStackView = [UIStackView new];
+    self.contentStackView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.contentStackView.axis = UILayoutConstraintAxisVertical;
+    self.contentStackView.spacing = 16;
+    [self.scrollView addSubview:self.contentStackView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.scrollView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.scrollView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.scrollView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.scrollView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+
+        [self.contentStackView.topAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.topAnchor constant:12],
+        [self.contentStackView.leadingAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.leadingAnchor constant:16],
+        [self.contentStackView.trailingAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.trailingAnchor constant:-16],
+        [self.contentStackView.bottomAnchor constraintEqualToAnchor:self.scrollView.contentLayoutGuide.bottomAnchor constant:-32],
+        [self.contentStackView.widthAnchor constraintEqualToAnchor:self.scrollView.frameLayoutGuide.widthAnchor constant:-32]
+    ]];
+
+    self.deadBanner = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.deadBanner.translatesAutoresizingMaskIntoConstraints = NO;
+    self.deadBanner.backgroundColor = UIColor.systemRedColor;
+    self.deadBanner.layer.cornerRadius = 12;
+    self.deadBanner.layer.cornerCurve = kCACornerCurveContinuous;
+    [self.deadBanner setTitle:@"守护进程未运行，点击启动" forState:UIControlStateNormal];
+    [self.deadBanner setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.deadBanner.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    [self.deadBanner.heightAnchor constraintEqualToConstant:44].active = YES;
+    [self.deadBanner addTarget:self action:@selector(startDaemon) forControlEvents:UIControlEventTouchUpInside];
+    self.deadBanner.hidden = YES;
+    [self.contentStackView addArrangedSubview:self.deadBanner];
+
+    // Master Switch & Status Card
+    UIView *masterCard = [self createMasterSwitchCard];
+    [self.contentStackView addArrangedSubview:masterCard];
+
+    // Fixed Note
+    UILabel *note = [UILabel new];
+    note.translatesAutoresizingMaskIntoConstraints = NO;
+    note.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    note.textColor = UIColor.secondaryLabelColor;
+    note.numberOfLines = 0;
+    note.text = @"每个 App 都有降不下去的底线。阈值低于底线，会一直发信号、白占 CPU，内存也不会再少。";
+    [self.contentStackView addArrangedSubview:note];
+
+    // Rules Section
+    self.rulesSectionHeaderLabel = [self createSectionHeader:@"规则列表"];
+    self.rulesStackView = [UIStackView new];
+    self.rulesStackView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.rulesStackView.axis = UILayoutConstraintAxisVertical;
+    self.rulesStackView.spacing = 12;
+
+    [self.contentStackView addArrangedSubview:self.rulesSectionHeaderLabel];
+    [self.contentStackView addArrangedSubview:self.rulesStackView];
+
+    // Add Rule Card
+    self.addRuleCard = [self createAddRuleCard];
+    [self.contentStackView addArrangedSubview:self.addRuleCard];
+
+    // Global Cooldown Card
+    self.globalCooldownCard = [self createGlobalCooldownCard];
+    [self.contentStackView addArrangedSubview:self.globalCooldownCard];
+
+    // Footer
+    UILabel *footer = [UILabel new];
+    footer.translatesAutoresizingMaskIntoConstraints = NO;
+    footer.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    footer.textColor = UIColor.tertiaryLabelColor;
+    footer.textAlignment = NSTextAlignmentCenter;
+    footer.numberOfLines = 0;
+    footer.text = @"改动实时自动保存 · 亮屏约 10 秒内，锁屏最长约 60 秒生效";
+    [self.contentStackView addArrangedSubview:footer];
+}
+
+- (UILabel *)createSectionHeader:(NSString *)title {
+    UILabel *lbl = [UILabel new];
+    lbl.translatesAutoresizingMaskIntoConstraints = NO;
+    lbl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    lbl.textColor = UIColor.secondaryLabelColor;
+    lbl.text = title;
+    return lbl;
+}
+
+- (UIView *)createMasterSwitchCard {
+    UIView *card = [UIView new];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    card.layer.cornerRadius = 14;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.clipsToBounds = YES;
+
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"bolt.fill"]];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.tintColor = UIColor.systemOrangeColor;
+
+    UILabel *title = [UILabel new];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    title.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    title.textColor = UIColor.labelColor;
+    title.text = @"内存释放";
+
+    self.moduleStatusLabel = [UILabel new];
+    self.moduleStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.moduleStatusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    self.moduleStatusLabel.textColor = UIColor.secondaryLabelColor;
+    self.moduleStatusLabel.text = @"读取模块状态中...";
+
+    self.masterSwitch = [UISwitch new];
+    self.masterSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.masterSwitch addTarget:self action:@selector(masterSwitchToggled:) forControlEvents:UIControlEventValueChanged];
+
+    [card addSubview:icon];
+    [card addSubview:title];
+    [card addSubview:self.moduleStatusLabel];
+    [card addSubview:self.masterSwitch];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [icon.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+        [icon.widthAnchor constraintEqualToConstant:24],
+        [icon.heightAnchor constraintEqualToConstant:24],
+
+        [title.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
+        [title.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:12],
+
+        [self.moduleStatusLabel.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:3],
+        [self.moduleStatusLabel.leadingAnchor constraintEqualToAnchor:title.leadingAnchor],
+        [self.moduleStatusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.masterSwitch.leadingAnchor constant:-8],
+        [self.moduleStatusLabel.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
+
+        [self.masterSwitch.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [self.masterSwitch.centerYAnchor constraintEqualToAnchor:card.centerYAnchor]
+    ]];
+
+    return card;
+}
+
+- (UIView *)createAddRuleCard {
+    UIView *card = [UIView new];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    card.layer.cornerRadius = 14;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.clipsToBounds = YES;
+
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"plus.circle.fill"]];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.tintColor = UIColor.systemBlueColor;
+
+    UILabel *title = [UILabel new];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    title.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    title.textColor = UIColor.systemBlueColor;
+    title.text = @"添加规则";
+
+    UIImageView *chev = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    chev.translatesAutoresizingMaskIntoConstraints = NO;
+    chev.tintColor = UIColor.tertiaryLabelColor;
+
+    [card addSubview:icon];
+    [card addSubview:title];
+    [card addSubview:chev];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [icon.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+        [icon.widthAnchor constraintEqualToConstant:22],
+        [icon.heightAnchor constraintEqualToConstant:22],
+
+        [title.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:10],
+        [title.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+
+        [chev.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [chev.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+        [chev.widthAnchor constraintEqualToConstant:12],
+        [chev.heightAnchor constraintEqualToConstant:14],
+
+        [card.heightAnchor constraintEqualToConstant:52]
+    ]];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(showAddRuleSheet)];
+    [card addGestureRecognizer:tap];
+    card.userInteractionEnabled = YES;
+    return card;
+}
+
+- (UIView *)createGlobalCooldownCard {
+    UIView *card = [UIView new];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    card.layer.cornerRadius = 14;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.clipsToBounds = YES;
+
+    UILabel *title = [UILabel new];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    title.textColor = UIColor.labelColor;
+    title.text = @"全局默认冷却";
+
+    self.globalCooldownValLabel = [UILabel new];
+    self.globalCooldownValLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.globalCooldownValLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+    self.globalCooldownValLabel.textColor = UIColor.secondaryLabelColor;
+    self.globalCooldownValLabel.textAlignment = NSTextAlignmentRight;
+
+    UIImageView *chev = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    chev.translatesAutoresizingMaskIntoConstraints = NO;
+    chev.tintColor = UIColor.tertiaryLabelColor;
+
+    [card addSubview:title];
+    [card addSubview:self.globalCooldownValLabel];
+    [card addSubview:chev];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [title.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+
+        [chev.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [chev.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+        [chev.widthAnchor constraintEqualToConstant:10],
+        [chev.heightAnchor constraintEqualToConstant:13],
+
+        [self.globalCooldownValLabel.trailingAnchor constraintEqualToAnchor:chev.leadingAnchor constant:-8],
+        [self.globalCooldownValLabel.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+
+        [card.heightAnchor constraintEqualToConstant:50]
+    ]];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(editGlobalCooldown)];
+    [card addGestureRecognizer:tap];
+    card.userInteractionEnabled = YES;
+    return card;
+}
+
+- (void)setupSaveNoticeToast {
+    self.saveNoticeToast = [UIView new];
+    self.saveNoticeToast.translatesAutoresizingMaskIntoConstraints = NO;
+    self.saveNoticeToast.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull tc) {
+        if (tc.userInterfaceStyle == UIUserInterfaceStyleDark) {
+            return [UIColor colorWithWhite:0.25 alpha:0.96];
+        } else {
+            return [UIColor colorWithWhite:0.95 alpha:0.96];
+        }
+    }];
+    self.saveNoticeToast.layer.cornerRadius = 18;
+    self.saveNoticeToast.layer.cornerCurve = kCACornerCurveContinuous;
+    self.saveNoticeToast.layer.shadowColor = UIColor.blackColor.CGColor;
+    self.saveNoticeToast.layer.shadowOpacity = 0.12;
+    self.saveNoticeToast.layer.shadowOffset = CGSizeMake(0, 3);
+    self.saveNoticeToast.layer.shadowRadius = 8;
+    self.saveNoticeToast.userInteractionEnabled = NO;
+    self.saveNoticeToast.alpha = 0.0;
+
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"checkmark.circle.fill"]];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.tintColor = UIColor.systemGreenColor;
+
+    UILabel *lbl = [UILabel new];
+    lbl.translatesAutoresizingMaskIntoConstraints = NO;
+    lbl.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    lbl.textColor = UIColor.labelColor;
+    lbl.text = @"改动已保存 · 亮屏约 10 秒内，锁屏最长约 60 秒生效";
+
+    [self.saveNoticeToast addSubview:icon];
+    [self.saveNoticeToast addSubview:lbl];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.leadingAnchor constraintEqualToAnchor:self.saveNoticeToast.leadingAnchor constant:14],
+        [icon.centerYAnchor constraintEqualToAnchor:self.saveNoticeToast.centerYAnchor],
+        [icon.widthAnchor constraintEqualToConstant:18],
+        [icon.heightAnchor constraintEqualToConstant:18],
+
+        [lbl.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:8],
+        [lbl.trailingAnchor constraintEqualToAnchor:self.saveNoticeToast.trailingAnchor constant:-14],
+        [lbl.centerYAnchor constraintEqualToAnchor:self.saveNoticeToast.centerYAnchor],
+
+        [self.saveNoticeToast.heightAnchor constraintEqualToConstant:36]
+    ]];
+
+    [self.view addSubview:self.saveNoticeToast];
+    [NSLayoutConstraint activateConstraints:@[
+        [self.saveNoticeToast.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [self.saveNoticeToast.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8]
+    ]];
+}
+
+- (void)showSaveNotice {
+    [self.saveNoticeTimer invalidate];
+    [self.view bringSubviewToFront:self.saveNoticeToast];
+    [UIView animateWithDuration:0.2 animations:^{
+        self.saveNoticeToast.alpha = 1.0;
+        self.saveNoticeToast.transform = CGAffineTransformIdentity;
+    }];
+
+    __weak typeof(self) weakSelf = self;
+    self.saveNoticeTimer = [NSTimer scheduledTimerWithTimeInterval:2.5 repeats:NO block:^(NSTimer * _Nonnull timer) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [UIView animateWithDuration:0.25 animations:^{
+            strongSelf.saveNoticeToast.alpha = 0.0;
+            strongSelf.saveNoticeToast.transform = CGAffineTransformMakeTranslation(0, -8);
+        }];
+    }];
+}
+
+#pragma mark - Config & State Management
+
+- (NSString *)currentConfigPath {
+    return self.masterSwitch.isOn ? kMemPressureConfig : kMemPressureConfigOff;
+}
+
+- (void)loadConfigAndFloors {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL onExists = [fm fileExistsAtPath:kMemPressureConfig];
+    BOOL offExists = [fm fileExistsAtPath:kMemPressureConfigOff];
+
+    if (onExists && offExists) {
+        NSString *bakPath = [kMemPressureConfigOff stringByAppendingString:@".bak"];
+        [fm removeItemAtPath:bakPath error:nil];
+        NSError *moveErr = nil;
+        [fm moveItemAtPath:kMemPressureConfigOff toPath:bakPath error:&moveErr];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"配置状态恢复"
+                                                                       message:@"同时检测到已启用与已停用配置文件。已按已启用配置生效，已停用文件已备份为 mempressure.txt.off.bak。"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        offExists = NO;
+    }
+
+    if (onExists) {
+        self.masterSwitch.on = YES;
+        self.config = [JPMemPressureConfig loadFromPath:kMemPressureConfig];
+    } else if (offExists) {
+        self.masterSwitch.on = NO;
+        self.config = [JPMemPressureConfig loadFromPath:kMemPressureConfigOff];
+    } else {
+        self.masterSwitch.on = NO;
+        self.config = [JPMemPressureConfig new];
+        self.config.lines = [NSMutableArray array];
+        self.config.rules = [NSMutableArray array];
+        self.config.globalCooldown = 120;
+        self.config.hasExplicitGlobalCooldown = YES;
+        self.config.hasTrailingNewline = YES;
+    }
+
+    self.floors = [JPMemPressureFloorEntry loadFloorFile];
+    self.installedApps = [JPInstalledApp scanInstalledApps];
+}
+
+- (void)saveConfig {
+    NSString *path = [self currentConfigPath];
+    NSError *err = nil;
+    BOOL ok = [self.config saveToPath:path error:&err];
+    if (!ok) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"保存配置失败"
+                                                                       message:[NSString stringWithFormat:@"写入配置文件失败：%@", err ? err.localizedDescription : @"未知错误"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        [self loadConfigAndFloors];
+        [self rebuildRulesCards];
+        return;
+    }
+    [self showSaveNotice];
+}
+
+- (void)masterSwitchToggled:(UISwitch *)sender {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSError *err = nil;
+    BOOL moveOk = YES;
+    if (sender.isOn) {
+        if ([fm fileExistsAtPath:kMemPressureConfigOff]) {
+            moveOk = [fm moveItemAtPath:kMemPressureConfigOff toPath:kMemPressureConfig error:&err];
+        } else if (![fm fileExistsAtPath:kMemPressureConfig]) {
+            NSString *initContent = @"# 由 JetPilot App 维护；手改也可以，App 会保留看不懂的行\ncooldown 120\n";
+            moveOk = [initContent writeToFile:kMemPressureConfig atomically:YES encoding:NSUTF8StringEncoding error:&err];
+        }
+    } else {
+        if ([fm fileExistsAtPath:kMemPressureConfig]) {
+            moveOk = [fm moveItemAtPath:kMemPressureConfig toPath:kMemPressureConfigOff error:&err];
+        }
+    }
+    if (!moveOk) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"切换开关失败"
+                                                                       message:[NSString stringWithFormat:@"更改配置文件状态失败：%@", err ? err.localizedDescription : @"未知错误"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+    }
+    [self loadConfigAndFloors];
+    [self rebuildRulesCards];
+    [self refreshStatus];
+    if (moveOk) {
+        [self showSaveNotice];
+    }
+}
+
+- (void)rebuildRulesCards {
+    [self.config updateDuplicateRules];
+
+    for (UIView *v in self.rulesStackView.arrangedSubviews) {
+        [self.rulesStackView removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+
+    NSUInteger visibleCardsCount = 0;
+    for (JPMemPressureLine *line in self.config.lines) {
+        if (line.type == JPMemPressureLineTypeRule || line.type == JPMemPressureLineTypeDisabledRule) {
+            visibleCardsCount++;
+        } else if (line.type == JPMemPressureLineTypeUnknown) {
+            visibleCardsCount++;
+        }
+    }
+
+    if (visibleCardsCount == 0) {
+        UIView *emptyCard = [UIView new];
+        emptyCard.translatesAutoresizingMaskIntoConstraints = NO;
+        emptyCard.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+        emptyCard.layer.cornerRadius = 14;
+        emptyCard.layer.cornerCurve = kCACornerCurveContinuous;
+
+        UILabel *emptyLabel = [UILabel new];
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        emptyLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+        emptyLabel.textColor = UIColor.secondaryLabelColor;
+        emptyLabel.text = @"暂无规则，点击下方「添加规则」进行配置";
+        emptyLabel.textAlignment = NSTextAlignmentCenter;
+        [emptyCard addSubview:emptyLabel];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [emptyLabel.centerXAnchor constraintEqualToAnchor:emptyCard.centerXAnchor],
+            [emptyLabel.centerYAnchor constraintEqualToAnchor:emptyCard.centerYAnchor],
+            [emptyCard.heightAnchor constraintEqualToConstant:64]
+        ]];
+        [self.rulesStackView addArrangedSubview:emptyCard];
+    } else {
+        for (JPMemPressureLine *line in self.config.lines) {
+            if (line.type == JPMemPressureLineTypeRule || line.type == JPMemPressureLineTypeDisabledRule) {
+                JPMemPressureRule *rule = line.rule;
+                if (!rule) continue;
+                JPMemPressureFloorEntry *floor = self.floors[rule.frag];
+                if (!floor && [rule.frag hasPrefix:@"bid:"]) {
+                    floor = self.floors[[rule.frag substringFromIndex:4]];
+                }
+                JPMemPressureRuleCardView *card = [[JPMemPressureRuleCardView alloc] initWithRule:rule
+                                                                                         delegate:self
+                                                                                            floor:floor
+                                                                                   globalCooldown:self.config.globalCooldown
+                                                                                    installedApps:self.installedApps];
+                [self.rulesStackView addArrangedSubview:card];
+            } else if (line.type == JPMemPressureLineTypeUnknown) {
+                JPMemPressureUnknownLineCardView *card = [[JPMemPressureUnknownLineCardView alloc] initWithLine:line delegate:self];
+                [self.rulesStackView addArrangedSubview:card];
+            }
+        }
+    }
+
+    self.rulesSectionHeaderLabel.text = [NSString stringWithFormat:@"规则列表 (%lu)", (unsigned long)self.config.rules.count];
+
+    if (self.config.hasExplicitGlobalCooldown) {
+        self.globalCooldownValLabel.text = [NSString stringWithFormat:@"%ld 秒", (long)self.config.globalCooldown];
+    } else {
+        self.globalCooldownValLabel.text = [NSString stringWithFormat:@"%ld 秒（默认，未设置）", (long)self.config.globalCooldown];
+    }
+}
+
+- (void)refreshStatus {
+    JPDaemonState dState = [JPDaemonManager daemonStateWithLastSpawnTime:self.lastSpawnTime];
+    BOOL running = (dState == JPDaemonStateRunning);
+    self.deadBanner.hidden = (dState != JPDaemonStateDead);
+
+    if (!running) {
+        self.moduleStatusLabel.text = @"守护进程未运行";
+        self.moduleStatusLabel.textColor = UIColor.systemRedColor;
+        return;
+    }
+
+    NSString *stateContent = [NSString stringWithContentsOfFile:kMemPressureState encoding:NSUTF8StringEncoding error:nil];
+    if (!stateContent || stateContent.length == 0) {
+        self.moduleStatusLabel.text = @"模块状态：读取中...";
+        self.moduleStatusLabel.textColor = UIColor.secondaryLabelColor;
+        return;
+    }
+
+    NSString *stateVal = @"off";
+    NSString *reasonVal = @"-";
+    NSArray<NSString *> *toks = [stateContent componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    for (NSString *tok in toks) {
+        if ([tok hasPrefix:@"state="]) stateVal = [tok substringFromIndex:6];
+        if ([tok hasPrefix:@"reason="]) reasonVal = [tok substringFromIndex:7];
+    }
+
+    if ([stateVal isEqualToString:@"on"]) {
+        self.moduleStatusLabel.text = @"模块状态：正常运行中";
+        self.moduleStatusLabel.textColor = UIColor.systemGreenColor;
+    } else if ([stateVal isEqualToString:@"disabled"]) {
+        self.moduleStatusLabel.text = [NSString stringWithFormat:@"模块状态：已停用（%@，重启守护进程复位）", reasonVal];
+        self.moduleStatusLabel.textColor = UIColor.systemRedColor;
+    } else if ([stateVal isEqualToString:@"unsupported"]) {
+        self.moduleStatusLabel.text = [NSString stringWithFormat:@"模块状态：不支持（%@，系统未开放内存压力接口）", reasonVal];
+        self.moduleStatusLabel.textColor = UIColor.systemRedColor;
+    } else if ([stateVal isEqualToString:@"fatal"]) {
+        self.moduleStatusLabel.text = [NSString stringWithFormat:@"模块状态：致命错误（%@）", reasonVal];
+        self.moduleStatusLabel.textColor = UIColor.systemRedColor;
+    } else if ([stateVal isEqualToString:@"off"]) {
+        self.moduleStatusLabel.text = @"模块状态：未开启（请配置规则并打开总开关）";
+        self.moduleStatusLabel.textColor = UIColor.secondaryLabelColor;
+    } else {
+        self.moduleStatusLabel.text = [NSString stringWithFormat:@"模块状态：%@", stateVal];
+        self.moduleStatusLabel.textColor = UIColor.systemOrangeColor;
+    }
+}
+
+- (void)startDaemon {
+    if ([JPDaemonManager daemonStateWithLastSpawnTime:self.lastSpawnTime] == JPDaemonStateDead) {
+        [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
+    }
+    CFAbsoluteTime t = 0;
+    int rc = [JPDaemonManager startDaemonWithLastSpawnTime:&t];
+    if (rc == 0) self.lastSpawnTime = t;
+    [self refreshStatus];
+}
+
+#pragma mark - Actions
+
+- (void)showAddRuleSheet {
+    if (self.config.rules.count >= 32) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"规则已达上限"
+                                                                       message:@"最多支持添加 32 条内存释放规则"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    JPAppPickerViewController *picker = [JPAppPickerViewController new];
+    picker.userAppsOnly = YES;
+    picker.allApps = self.installedApps;
+    __weak typeof(self) weakSelf = self;
+    picker.isAppExistingBlock = ^BOOL(JPInstalledApp *app) {
+        NSString *bidFrag = [NSString stringWithFormat:@"bid:%@", app.bundleId];
+        for (JPMemPressureRule *r in weakSelf.config.rules) {
+            if ([r.frag isEqualToString:bidFrag]) return YES;
+        }
+        return NO;
+    };
+
+    picker.onSelectApp = ^(NSString *pathFragment, NSString *displayName) {
+        JPMemPressureRule *existing = nil;
+        for (JPMemPressureRule *r in weakSelf.config.rules) {
+            if ([r.frag isEqualToString:pathFragment]) {
+                existing = r;
+                break;
+            }
+        }
+        if (existing) {
+            [weakSelf openEditRuleController:existing];
+            return;
+        }
+
+        NSInteger defaultThr = 600;
+        JPMemPressureFloorEntry *floor = weakSelf.floors[pathFragment];
+        if (!floor && [pathFragment hasPrefix:@"bid:"]) {
+            floor = weakSelf.floors[[pathFragment substringFromIndex:4]];
+        }
+        if (floor && floor.median > 0) {
+            defaultThr = (NSInteger)(ceil((floor.median + 100.0) / 50.0) * 50.0);
+        }
+        if (defaultThr < 100) defaultThr = 100;
+        uint64_t memcap = JPGetDeviceMemcapMB();
+        if (defaultThr > (NSInteger)memcap) defaultThr = (NSInteger)memcap;
+
+        JPMemPressureRule *newRule = [JPMemPressureRule new];
+        newRule.frag = pathFragment;
+        newRule.displayName = displayName;
+        newRule.thresholdMB = defaultThr;
+        newRule.cooldown = 0;
+        newRule.isEnabled = YES;
+        newRule.isDirty = YES;
+
+        JPMemPressureLine *newLine = [JPMemPressureLine new];
+        newLine.type = JPMemPressureLineTypeRule;
+        newLine.rule = newRule;
+        newLine.isDirty = YES;
+
+        [weakSelf.config.lines addObject:newLine];
+        [weakSelf.config.rules addObject:newRule];
+
+        weakSelf.config.hasExplicitGlobalCooldown = YES;
+
+        [weakSelf saveConfig];
+        [weakSelf rebuildRulesCards];
+    };
+
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
+    if (@available(iOS 15.0, *)) {
+        UISheetPresentationController *sheet = nav.sheetPresentationController;
+        sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+        sheet.prefersGrabberVisible = YES;
+    }
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)openEditRuleController:(JPMemPressureRule *)rule {
+    JPMemPressureFloorEntry *floor = self.floors[rule.frag];
+    if (!floor && [rule.frag hasPrefix:@"bid:"]) {
+        floor = self.floors[[rule.frag substringFromIndex:4]];
+    }
+
+    JPMemPressureRuleEditViewController *vc = [JPMemPressureRuleEditViewController new];
+    vc.rule = rule;
+    vc.floor = floor;
+    vc.globalCooldown = self.config.globalCooldown;
+    vc.installedApps = self.installedApps;
+    vc.delegate = self;
+
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)editGlobalCooldown {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"全局默认冷却"
+                                                                   message:@"未单独设置冷却时间的规则将使用此默认值"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    NSArray<NSNumber *> *presets = @[@60, @120, @300, @600, @1800];
+    for (NSNumber *p in presets) {
+        NSString *title = [NSString stringWithFormat:@"%ld 秒%@", [p integerValue], [p integerValue] == 120 ? @"（推荐）" : @""];
+        [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            self.config.globalCooldown = [p integerValue];
+            self.config.hasExplicitGlobalCooldown = YES;
+            [self saveConfig];
+            [self rebuildRulesCards];
+        }]];
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"自定义秒数..." style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [weakSelf showCustomCooldownPrompt];
+    }]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    if (alert.popoverPresentationController) {
+        alert.popoverPresentationController.sourceView = self.globalCooldownCard;
+        alert.popoverPresentationController.sourceRect = self.globalCooldownCard.bounds;
+    }
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showCustomCooldownPrompt {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"自定义默认冷却"
+                                                                   message:@"请输入 60 ～ 86400 之间的秒数"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+        textField.placeholder = @"秒数 (60 - 86400)";
+        textField.text = [NSString stringWithFormat:@"%ld", (long)self.config.globalCooldown];
+    }];
+
+    __weak typeof(alert) weakAlert = alert;
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        NSString *txt = weakAlert.textFields.firstObject.text;
+        NSInteger val = [txt integerValue];
+        if (val < 60) val = 60;
+        if (val > 86400) val = 86400;
+        weakSelf.config.globalCooldown = val;
+        weakSelf.config.hasExplicitGlobalCooldown = YES;
+        [weakSelf saveConfig];
+        [weakSelf rebuildRulesCards];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - JPMemPressureRuleCardViewDelegate
+
+- (void)memPressureRuleCardViewDidTap:(JPMemPressureRuleCardView *)card {
+    [self openEditRuleController:card.rule];
+}
+
+- (void)memPressureRuleCardViewDidRequestDelete:(JPMemPressureRuleCardView *)card {
+    JPMemPressureRule *rule = card.rule;
+    NSString *name = ResolveDisplayNameHelper(rule.frag, self.installedApps);
+    if (name.length == 0) name = rule.displayName ?: rule.frag;
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除规则"
+                                                                   message:[NSString stringWithFormat:@"确定要移除对「%@」的内存释放规则吗？", name]
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"移除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        [weakSelf deleteRule:rule];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    if (alert.popoverPresentationController) {
+        alert.popoverPresentationController.sourceView = card;
+        alert.popoverPresentationController.sourceRect = card.bounds;
+    }
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)deleteRule:(JPMemPressureRule *)rule {
+    [self.config.rules removeObject:rule];
+    JPMemPressureLine *targetLine = nil;
+    for (JPMemPressureLine *l in self.config.lines) {
+        if (l.rule == rule) {
+            targetLine = l;
+            break;
+        }
+    }
+    if (targetLine) {
+        [self.config.lines removeObject:targetLine];
+    }
+    [self saveConfig];
+    [self rebuildRulesCards];
+}
+
+#pragma mark - JPMemPressureUnknownLineCardViewDelegate
+
+- (void)memPressureUnknownLineCardViewDidRequestDelete:(JPMemPressureLine *)line {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除无效配置行"
+                                                                   message:[NSString stringWithFormat:@"确定要移除此无效配置行吗？\n\n%@", line.rawText ?: @""]
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"移除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        [weakSelf.config.lines removeObject:line];
+        [weakSelf saveConfig];
+        [weakSelf rebuildRulesCards];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - JPMemPressureRuleEditViewControllerDelegate
+
+- (void)memPressureRuleEditViewControllerDidSave:(JPMemPressureRule *)rule {
+    [self saveConfig];
+    [self rebuildRulesCards];
+}
+
+- (void)memPressureRuleEditViewControllerDidDelete:(JPMemPressureRule *)rule {
+    [self deleteRule:rule];
+}
+
+@end
+
+
 #pragma mark - App Delegate & Main
 
-@interface AppDelegate : UIResponder <UIApplicationDelegate>
+@interface AppDelegate : UIResponder <UIApplicationDelegate, UITabBarControllerDelegate>
 @property (nonatomic, strong) UIWindow *window;
 @end
 
@@ -3541,9 +5661,24 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-    MainViewController *vc = [MainViewController new];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    self.window.rootViewController = nav;
+
+    MainViewController *vc1 = [MainViewController new];
+    UINavigationController *nav1 = [[UINavigationController alloc] initWithRootViewController:vc1];
+    nav1.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"进程优先级"
+                                                    image:[UIImage systemImageNamed:@"slider.horizontal.3"]
+                                                      tag:0];
+
+    JPMemPressureViewController *vc2 = [JPMemPressureViewController new];
+    UINavigationController *nav2 = [[UINavigationController alloc] initWithRootViewController:vc2];
+    nav2.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"内存释放"
+                                                    image:[UIImage systemImageNamed:@"memorychip"]
+                                                      tag:1];
+
+    UITabBarController *tabBar = [UITabBarController new];
+    tabBar.viewControllers = @[nav1, nav2];
+    tabBar.delegate = self;
+
+    self.window.rootViewController = tabBar;
     [self.window makeKeyAndVisible];
     return YES;
 }

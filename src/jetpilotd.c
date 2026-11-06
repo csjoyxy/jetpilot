@@ -46,6 +46,7 @@ extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <sys/resource.h>
 #include <dispatch/dispatch.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <math.h>
 
 /* kern.memorypressure_manual_trigger 相关定义
  * TEST_LOW_MEMORY_TRIGGER_ONE 来自 xnu-8796.101.5 kern_memorystatus_notify.c */
@@ -131,8 +132,6 @@ extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buf
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
 #define MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES  2
-#define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES  8
-#define MEMORYSTATUS_MEMLIMIT_ATTR_FATAL          0x1
 
 /* iOS 16+ 档位参考值 */
 #define BAND_IDLE        0
@@ -153,13 +152,6 @@ typedef struct memorystatus_priority_properties {
     uint64_t user_data;
 } memorystatus_priority_properties_t;
 
-typedef struct memorystatus_memlimit_properties {
-    int32_t  memlimit_active;        /* 前台限额 MB */
-    uint32_t memlimit_active_attr;   /* 前台属性 (0x1=FATAL) */
-    int32_t  memlimit_inactive;      /* 后台限额 MB */
-    uint32_t memlimit_inactive_attr; /* 后台属性 (0x1=FATAL) */
-} memorystatus_memlimit_properties_t;
-
 extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
                                 void *buffer, size_t buffersize);
 
@@ -169,7 +161,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define FLAG_PATH   CONFIG_DIR "/running.flag"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define PID_PATH    CONFIG_DIR "/daemon.pid"
-#define JP_VERSION   "0.7.1"
+#define JP_VERSION   "0.7.2"
 #define LOG_PATH     CONFIG_DIR "/daemon.log"
 #define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
 #define LOG_MAX_BYTES (256 * 1024)
@@ -712,6 +704,8 @@ static int wait_lock_change(int secs) {
 #define MEMP_STATE_PATH    CONFIG_DIR "/mempressure_state.txt"
 #define MEMP_TAINT_PATH    CONFIG_DIR "/mempressure_taint.txt"
 #define MEMP_FATAL_PATH    CONFIG_DIR "/mempressure_fatal"
+#define MEMP_FLOOR_PATH    CONFIG_DIR "/mempressure_floor.txt"
+#define MEMP_FLOOR_TMP     CONFIG_DIR "/mempressure_floor.txt.tmp"
 
 #define MEMP_MAX_RULES     32
 #define MEMP_MAX_TAINT     8
@@ -721,6 +715,9 @@ static int wait_lock_change(int secs) {
 #define MEMP_MAX_COOLDOWN     86400
 #define MEMP_MIN_THR_MB       100
 #define MEMP_DEFAULT_THR_MB   600
+
+#define MEMP_MAX_FLOOR_ENTRIES (MEMP_MAX_RULES + 16)
+#define MEMP_MAX_FLOOR_SAMPLES 5
 
 typedef enum {
     MEMP_STATE_OFF = 0,
@@ -739,9 +736,12 @@ typedef enum {
 typedef struct {
     char    frag[256];
     int32_t thr_mb;       /* 阈值 MB (100 .. memcap) */
+    int32_t cooldown;     /* 单条冷却秒 (60 .. 86400, 0 = 用全局) */
     int     is_bid;       /* 1 = bid: 开头, 0 = 路径片段 */
     time_t  last_warn_sec;/* CLOCK_MONOTONIC 秒，冷却起点 */
     time_t  last_skip_sec;/* 上次输出 skip 日志的 CLOCK_MONOTONIC 秒 (限频 60s) */
+    int     ineff;        /* 连续无效次数 (freed < 30) */
+    int32_t eff_cd;       /* 有效冷却 (退避后可能翻倍) */
 } memp_rule_t;
 
 static memp_rule_t g_memp_rules[MEMP_MAX_RULES];
@@ -749,6 +749,18 @@ static int g_nmemp_rules = 0;
 static int g_memp_cooldown = MEMP_DEFAULT_COOLDOWN;
 static int g_memp_cfg_file_absent = 1;
 static int g_memp_cfg_first_load = 1;
+
+/* 底线记录表 */
+typedef struct {
+    char   frag[256];
+    time_t last_time;
+    int    nsamp;
+    double samples[MEMP_MAX_FLOOR_SAMPLES];
+} memp_floor_entry_t;
+
+static memp_floor_entry_t g_memp_floors[MEMP_MAX_FLOOR_ENTRIES];
+static int g_nmemp_floors = 0;
+static void memp_floor_load(void);
 
 static uint64_t g_memp_memcap = 2048;
 static int g_memp_memcap_fallback = 0;
@@ -779,6 +791,9 @@ typedef struct {
     uint64_t start_tvusec;
     time_t   warn_mono_sec;
     double   fp_before_mb;
+    int      band_warn;
+    int      fg_ok;
+    int      nsamp;
 } memp_post_slot_t;
 
 static memp_post_slot_t g_memp_post = {0};
@@ -1220,6 +1235,7 @@ static void mempressure_init(void) {
     if (g_memp_state != MEMP_STATE_FATAL) {
         memp_taint_load();
         memp_check_boot_reset();
+        memp_floor_load();
     }
 }
 
@@ -1376,37 +1392,369 @@ static void memp_log_skip(memp_rule_t *rule, pid_t pid, double fp_mb, int thr_mb
            (comp_str && comp_str[0]) ? comp_str : "-", ok, moved, gone, rfail);
 }
 
-static void memp_post_check(void) {
+static int memp_rule_cfg_equal(const memp_rule_t *a, const memp_rule_t *b) {
+    if (!a || !b) return 0;
+    if (strcmp(a->frag, b->frag) != 0) return 0;
+    if (a->thr_mb != b->thr_mb) return 0;
+    if (a->cooldown != b->cooldown) return 0;
+    return 1;
+}
+
+static void memp_floor_format_median(const double *samples, int nsamp, char *buf, size_t sz) {
+    if (nsamp < 3 || nsamp > MEMP_MAX_FLOOR_SAMPLES) {
+        snprintf(buf, sz, "NA");
+        return;
+    }
+    double sorted[MEMP_MAX_FLOOR_SAMPLES];
+    memcpy(sorted, samples, sizeof(double) * nsamp);
+    for (int a = 0; a < nsamp - 1; a++) {
+        for (int b = 0; b < nsamp - 1 - a; b++) {
+            if (sorted[b] > sorted[b + 1]) {
+                double tmp = sorted[b];
+                sorted[b] = sorted[b + 1];
+                sorted[b + 1] = tmp;
+            }
+        }
+    }
+    double med = 0.0;
+    if (nsamp == 3) {
+        med = sorted[1];
+    } else if (nsamp == 4) {
+        med = round(((sorted[1] + sorted[2]) / 2.0) * 10.0) / 10.0;
+    } else if (nsamp == 5) {
+        med = sorted[2];
+    }
+    snprintf(buf, sz, "%.1f", med);
+}
+
+static void memp_floor_get_median_str(const char *frag, char *buf, size_t sz) {
+    if (!frag || !buf || sz == 0) return;
+    snprintf(buf, sz, "NA");
+    for (int i = 0; i < g_nmemp_floors; i++) {
+        if (strcmp(g_memp_floors[i].frag, frag) == 0) {
+            memp_floor_entry_t *fe = &g_memp_floors[i];
+            memp_floor_format_median(fe->samples, fe->nsamp, buf, sz);
+            return;
+        }
+    }
+}
+
+static void memp_floor_save(void) {
+    FILE *f = fopen(MEMP_FLOOR_TMP, "w");
+    if (!f) return;
+    fprintf(f, "# jetpilot floor v1\n");
+    for (int i = 0; i < g_nmemp_floors; i++) {
+        memp_floor_entry_t *fe = &g_memp_floors[i];
+        char med_str[32];
+        memp_floor_format_median(fe->samples, fe->nsamp, med_str, sizeof(med_str));
+        char s_buf[256] = "";
+        char *sp = s_buf;
+        size_t rem = sizeof(s_buf);
+        for (int s = 0; s < fe->nsamp; s++) {
+            int n = snprintf(sp, rem, "%s%.1f", (s > 0 ? "," : ""), fe->samples[s]);
+            if (n > 0 && (size_t)n < rem) {
+                sp += n;
+                rem -= (size_t)n;
+            }
+        }
+        fprintf(f, "%s t=%ld n=%d med=%s s=%s\n",
+                fe->frag, (long)fe->last_time, fe->nsamp, med_str, s_buf);
+    }
+    fflush(f);
+    int werr = ferror(f);
+    fclose(f);
+    if (werr) {
+        unlink(MEMP_FLOOR_TMP);
+        return;
+    }
+    if (rename(MEMP_FLOOR_TMP, MEMP_FLOOR_PATH) != 0) {
+        char eb[128];
+        memp_fmt_errno(errno, eb, sizeof(eb));
+        jp_log("MEMP floor_save_fail errno=%s", eb);
+        unlink(MEMP_FLOOR_TMP);
+    }
+}
+
+static void memp_floor_prune(void) {
+    int non_rule_count = 0;
+    for (int i = 0; i < g_nmemp_floors; i++) {
+        int is_rule = 0;
+        for (int r = 0; r < g_nmemp_rules; r++) {
+            if (strcmp(g_memp_floors[i].frag, g_memp_rules[r].frag) == 0) {
+                is_rule = 1;
+                break;
+            }
+        }
+        if (!is_rule) non_rule_count++;
+    }
+
+    int modified = 0;
+    while (non_rule_count > 16) {
+        int oldest_idx = -1;
+        time_t oldest_time = 0;
+        for (int i = 0; i < g_nmemp_floors; i++) {
+            int is_rule = 0;
+            for (int r = 0; r < g_nmemp_rules; r++) {
+                if (strcmp(g_memp_floors[i].frag, g_memp_rules[r].frag) == 0) {
+                    is_rule = 1;
+                    break;
+                }
+            }
+            if (!is_rule) {
+                if (oldest_idx == -1 || g_memp_floors[i].last_time < oldest_time) {
+                    oldest_idx = i;
+                    oldest_time = g_memp_floors[i].last_time;
+                }
+            }
+        }
+        if (oldest_idx >= 0) {
+            for (int i = oldest_idx; i < g_nmemp_floors - 1; i++) {
+                g_memp_floors[i] = g_memp_floors[i + 1];
+            }
+            g_nmemp_floors--;
+            non_rule_count--;
+            modified = 1;
+        } else {
+            break;
+        }
+    }
+    if (modified) {
+        memp_floor_save();
+    }
+}
+
+static void memp_floor_add_sample(const char *frag, double fp_post30) {
+    if (!frag || frag[0] == '\0') return;
+    memp_floor_entry_t *entry = NULL;
+    for (int i = 0; i < g_nmemp_floors; i++) {
+        if (strcmp(g_memp_floors[i].frag, frag) == 0) {
+            entry = &g_memp_floors[i];
+            break;
+        }
+    }
+    if (!entry) {
+        if (g_nmemp_floors >= MEMP_MAX_FLOOR_ENTRIES) {
+            memp_floor_prune();
+        }
+        if (g_nmemp_floors < MEMP_MAX_FLOOR_ENTRIES) {
+            entry = &g_memp_floors[g_nmemp_floors++];
+            memset(entry, 0, sizeof(*entry));
+            strncpy(entry->frag, frag, sizeof(entry->frag) - 1);
+        } else {
+            return;
+        }
+    }
+    if (entry->nsamp < MEMP_MAX_FLOOR_SAMPLES) {
+        entry->samples[entry->nsamp++] = fp_post30;
+    } else {
+        for (int i = 0; i < MEMP_MAX_FLOOR_SAMPLES - 1; i++) {
+            entry->samples[i] = entry->samples[i + 1];
+        }
+        entry->samples[MEMP_MAX_FLOOR_SAMPLES - 1] = fp_post30;
+    }
+    entry->last_time = time(NULL);
+    memp_floor_save();
+}
+
+static void memp_floor_load(void) {
+    FILE *f = fopen(MEMP_FLOOR_PATH, "r");
+    if (!f) return;
+    char line[512];
+    int line_no = 0;
+    int is_v1 = 0;
+    int had_bad = 0;
+    g_nmemp_floors = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line_no++;
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\r' || *p == '\n' || *p == '\0') continue;
+        if (line_no == 1) {
+            if (strncmp(p, "# jetpilot floor v1", 19) == 0) {
+                is_v1 = 1;
+            } else {
+                jp_log("MEMP floor_reset reason=version");
+                fclose(f);
+                return;
+            }
+            continue;
+        }
+        if (*p == '#') continue;
+        if (!is_v1) continue;
+
+        char frag[256] = {0};
+        long t_val = 0;
+        int n_val = 0;
+        char s_val[256] = {0};
+        char line_copy[512];
+        strncpy(line_copy, p, sizeof(line_copy) - 1);
+        line_copy[sizeof(line_copy) - 1] = '\0';
+
+        char *saveptr = NULL;
+        char *tok = strtok_r(line_copy, " \t\r\n", &saveptr);
+        if (!tok) continue;
+        strncpy(frag, tok, sizeof(frag) - 1);
+        while ((tok = strtok_r(NULL, " \t\r\n", &saveptr)) != NULL) {
+            if (strncmp(tok, "t=", 2) == 0) {
+                t_val = strtol(tok + 2, NULL, 10);
+            } else if (strncmp(tok, "n=", 2) == 0) {
+                n_val = (int)strtol(tok + 2, NULL, 10);
+            } else if (strncmp(tok, "s=", 2) == 0) {
+                strncpy(s_val, tok + 2, sizeof(s_val) - 1);
+            }
+        }
+        if (frag[0] == '\0' || n_val <= 0 || n_val > MEMP_MAX_FLOOR_SAMPLES || s_val[0] == '\0') {
+            had_bad = 1;
+            continue;
+        }
+
+        double parsed_samples[MEMP_MAX_FLOOR_SAMPLES];
+        int n_parsed_samples = 0;
+        char *sp = s_val;
+        char *subptr = NULL;
+        char *stok = strtok_r(sp, ",", &subptr);
+        while (stok && n_parsed_samples < MEMP_MAX_FLOOR_SAMPLES) {
+            char *endp = NULL;
+            double v = strtod(stok, &endp);
+            if (!endp || endp == stok) break;
+            parsed_samples[n_parsed_samples++] = v;
+            stok = strtok_r(NULL, ",", &subptr);
+        }
+
+        /* 核对 n= 与 s= 里实际样本数是否一致，以 s= 为准；不一致时把这一行当坏行跳过 */
+        if (n_parsed_samples != n_val) {
+            had_bad = 1;
+            continue;
+        }
+
+        if (g_nmemp_floors < MEMP_MAX_FLOOR_ENTRIES) {
+            memp_floor_entry_t *fe = &g_memp_floors[g_nmemp_floors++];
+            memset(fe, 0, sizeof(*fe));
+            strncpy(fe->frag, frag, sizeof(fe->frag) - 1);
+            fe->last_time = (time_t)t_val;
+            fe->nsamp = n_parsed_samples;
+            memcpy(fe->samples, parsed_samples, sizeof(double) * n_parsed_samples);
+        }
+    }
+    fclose(f);
+    if (had_bad && g_nmemp_floors == 0) {
+        jp_log("MEMP floor_reset reason=corrupt");
+    }
+}
+
+static void memp_backoff_on_sample(const char *frag, double freed_mb) {
+    memp_rule_t *rule = NULL;
+    for (int i = 0; i < g_nmemp_rules; i++) {
+        if (strcmp(g_memp_rules[i].frag, frag) == 0) {
+            rule = &g_memp_rules[i];
+            break;
+        }
+    }
+    if (!rule) return;
+
+    int32_t base_cd = rule->cooldown > 0 ? rule->cooldown : g_memp_cooldown;
+    if (rule->eff_cd <= 0) rule->eff_cd = base_cd;
+
+    if (freed_mb < 30.0) {
+        rule->ineff++;
+        if (rule->ineff >= 3) {
+            int32_t max_limit = 1800 > base_cd ? 1800 : base_cd;
+            int32_t new_cd = rule->eff_cd * 2;
+            if (new_cd > max_limit) new_cd = max_limit;
+            rule->eff_cd = new_cd;
+            rule->ineff = 0;
+            char med_str[32] = "NA";
+            memp_floor_get_median_str(rule->frag, med_str, sizeof(med_str));
+            jp_log("MEMP backoff app=%s cd=%d floor=%s", rule->frag, (int)rule->eff_cd, med_str);
+        }
+    } else {
+        if (rule->eff_cd != base_cd) {
+            jp_log("MEMP backoff_reset app=%s cd=%d", rule->frag, (int)base_cd);
+        }
+        rule->eff_cd = base_cd;
+        rule->ineff = 0;
+    }
+}
+
+static void memp_post_sample(memorystatus_priority_entry_t *list, int count) {
     if (!g_memp_post.valid) return;
+
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
+
+    /* 每轮采样 */
+    if (g_locked) {
+        g_memp_post.fg_ok = 0;
+    }
+    uint64_t cur_sec = 0, cur_usec = 0;
+    if (memp_get_process_start_time(g_memp_post.pid, &cur_sec, &cur_usec) != 0 ||
+        cur_sec != g_memp_post.start_tvsec || cur_usec != g_memp_post.start_tvusec) {
+        g_memp_post.fg_ok = 0;
+    } else {
+        int found = 0;
+        int cur_prio = -1;
+        if (list && count > 0) {
+            for (int i = 0; i < count; i++) {
+                if (list[i].pid == g_memp_post.pid) {
+                    found = 1;
+                    cur_prio = list[i].priority;
+                    break;
+                }
+            }
+        }
+        if (!found || cur_prio != 100) {
+            g_memp_post.fg_ok = 0;
+        }
+    }
+    g_memp_post.nsamp++;
+
     if (now.tv_sec - g_memp_post.warn_mono_sec < 30) return;
 
     long dt = (long)(now.tv_sec - g_memp_post.warn_mono_sec);
     char fp_post30_buf[64] = "gone";
+    char freed_buf[64] = "NA";
+    int is_num = 0;
+    double fp_post30_val = 0.0;
+    double freed_mb = 0.0;
 
-    uint64_t cur_sec = 0, cur_usec = 0;
+    cur_sec = 0; cur_usec = 0;
     if (memp_get_process_start_time(g_memp_post.pid, &cur_sec, &cur_usec) == 0 &&
         cur_sec == g_memp_post.start_tvsec && cur_usec == g_memp_post.start_tvusec) {
         uint64_t fp_bytes = 0;
         int rerr = memp_get_phys_footprint(g_memp_post.pid, &fp_bytes);
         if (rerr == 0) {
-            snprintf(fp_post30_buf, sizeof(fp_post30_buf), "%.1f", (double)fp_bytes / (1024.0 * 1024.0));
+            fp_post30_val = (double)fp_bytes / (1024.0 * 1024.0);
+            snprintf(fp_post30_buf, sizeof(fp_post30_buf), "%.1f", fp_post30_val);
+            freed_mb = g_memp_post.fp_before_mb - fp_post30_val;
+            snprintf(freed_buf, sizeof(freed_buf), "%.1f", freed_mb);
+            is_num = 1;
         } else {
             snprintf(fp_post30_buf, sizeof(fp_post30_buf), "NA:%d", rerr);
         }
+    } else {
+        g_memp_post.fg_ok = 0;
     }
 
-    jp_log("MEMP post app=%s pid=%d fp_before=%.1f fp_post30=%s dt=%ld",
-           g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb, fp_post30_buf, dt);
+    jp_log("MEMP post app=%s pid=%d fp_before=%.1f fp_post30=%s dt=%ld fg_ok=%d nsamp=%d freed=%s",
+           g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb,
+           fp_post30_buf, dt, g_memp_post.fg_ok, g_memp_post.nsamp, freed_buf);
+
+    if (g_memp_post.fg_ok == 1 && is_num) {
+        memp_floor_add_sample(g_memp_post.frag, fp_post30_val);
+        memp_backoff_on_sample(g_memp_post.frag, freed_mb);
+    }
+
     g_memp_post.valid = 0;
 }
 
-static void memp_post_register(const char *frag, pid_t pid, uint64_t tvsec, uint64_t tvusec, time_t warn_sec, double fp_before_mb) {
+/* 登记 post 观察槽（§八）
+ * cur_band: 目标触发时的档位。当前门控要求 cur == 100（见 mempressure_check 候选进程选取），
+ * 传入选中档位以便放宽门控时 band_warn 仍保持准确 */
+static void memp_post_register(const char *frag, pid_t pid, uint64_t tvsec, uint64_t tvusec, time_t warn_sec, double fp_before_mb, int cur_band) {
     if (g_memp_post.valid) {
         long dt = (long)(warn_sec - g_memp_post.warn_mono_sec);
-        jp_log("MEMP post app=%s pid=%d fp_before=%.1f fp_post30=dropped dt=%ld",
-               g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb, dt);
+        jp_log("MEMP post app=%s pid=%d fp_before=%.1f fp_post30=dropped dt=%ld fg_ok=0 nsamp=%d freed=NA",
+               g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb, dt, g_memp_post.nsamp);
     }
     g_memp_post.valid = 1;
     strncpy(g_memp_post.frag, frag ? frag : "", sizeof(g_memp_post.frag) - 1);
@@ -1416,6 +1764,9 @@ static void memp_post_register(const char *frag, pid_t pid, uint64_t tvsec, uint
     g_memp_post.start_tvusec = tvusec;
     g_memp_post.warn_mono_sec = warn_sec;
     g_memp_post.fp_before_mb = fp_before_mb;
+    g_memp_post.band_warn = cur_band;
+    g_memp_post.fg_ok = 1;
+    g_memp_post.nsamp = 0;
 }
 
 static int mempressure_load_config(void) {
@@ -1430,11 +1781,18 @@ static int mempressure_load_config(void) {
         int line_no = 0;
         while (fgets(line, sizeof(line), f)) {
             line_no++;
+            size_t llen = strlen(line);
+            int oversized = 0;
+            if (llen == sizeof(line) - 1 && line[llen - 1] != '\n' && !feof(f)) {
+                oversized = 1;
+                int c;
+                while ((c = fgetc(f)) != EOF && c != '\n') {}
+            }
+
             char *p = line;
             while (*p == ' ' || *p == '\t') p++;
-            if (*p == '#' || *p == '\n' || *p == '\0') continue;
+            if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0') continue;
 
-            /* 去除末尾换行 */
             char raw_text[512];
             strncpy(raw_text, p, sizeof(raw_text) - 1);
             raw_text[sizeof(raw_text) - 1] = '\0';
@@ -1443,17 +1801,40 @@ static int mempressure_load_config(void) {
             char *cr = strchr(raw_text, '\r');
             if (cr) *cr = '\0';
 
-            char tok1[256] = {0}, tok2[256] = {0}, tok3[256] = {0};
-            int ntokens = sscanf(p, "%255s %255s %255s", tok1, tok2, tok3);
-            if (ntokens <= 0) continue;
+            if (oversized) {
+                jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                continue;
+            }
 
-            if (strcmp(tok1, "cooldown") == 0) {
+            char line_copy[512];
+            strncpy(line_copy, raw_text, sizeof(line_copy) - 1);
+            line_copy[sizeof(line_copy) - 1] = '\0';
+
+            char *tokens[10];
+            int ntokens = 0;
+            char *saveptr = NULL;
+            char *tok = strtok_r(line_copy, " \t", &saveptr);
+            while (tok) {
+                if (ntokens < 9) {
+                    tokens[ntokens] = tok;
+                }
+                ntokens++;
+                tok = strtok_r(NULL, " \t", &saveptr);
+            }
+
+            if (ntokens <= 0) continue;
+            if (ntokens > 8) {
+                jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                continue;
+            }
+
+            if (strcmp(tokens[0], "cooldown") == 0) {
                 if (ntokens != 2) {
                     jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
                 char *endp = NULL;
-                long cd = strtol(tok2, &endp, 10);
+                long cd = strtol(tokens[1], &endp, 10);
                 if (!endp || *endp != '\0' || cd < MEMP_MIN_COOLDOWN || cd > MEMP_MAX_COOLDOWN) {
                     jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
@@ -1461,18 +1842,14 @@ static int mempressure_load_config(void) {
                 new_cooldown = (int)cd;
             } else {
                 /* 规则行 */
-                if (ntokens > 2) {
-                    jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                    continue;
-                }
                 if (nparsed >= MEMP_MAX_RULES) {
                     jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
-                /* 检查片段重复 */
+
                 int duplicate = 0;
                 for (int i = 0; i < nparsed; i++) {
-                    if (strcmp(parsed_rules[i].frag, tok1) == 0) {
+                    if (strcmp(parsed_rules[i].frag, tokens[0]) == 0) {
                         duplicate = 1;
                         break;
                     }
@@ -1481,23 +1858,71 @@ static int mempressure_load_config(void) {
                     jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
+
                 int thr = MEMP_DEFAULT_THR_MB;
-                if (ntokens == 2) {
+                int rule_cd = 0;
+                int has_cd = 0;
+                int bad = 0;
+                int idx = 1;
+
+                if (idx < ntokens && strchr(tokens[idx], '=') == NULL) {
                     char *endp = NULL;
-                    long val = strtol(tok2, &endp, 10);
+                    long val = strtol(tokens[idx], &endp, 10);
                     if (!endp || *endp != '\0' || val < MEMP_MIN_THR_MB || (uint64_t)val > g_memp_memcap) {
-                        jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                        continue;
+                        bad = 1;
+                    } else {
+                        thr = (int)val;
                     }
-                    thr = (int)val;
+                    idx++;
                 }
+
+                if (bad) {
+                    jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    continue;
+                }
+
+                for (; idx < ntokens; idx++) {
+                    char *eq = strchr(tokens[idx], '=');
+                    if (!eq || eq == tokens[idx]) {
+                        bad = 1;
+                        break;
+                    }
+                    *eq = '\0';
+                    char *key = tokens[idx];
+                    char *val = eq + 1;
+                    if (strcmp(key, "cooldown") != 0) {
+                        bad = 1;
+                        break;
+                    }
+                    if (has_cd) {
+                        bad = 1;
+                        break;
+                    }
+                    char *endp = NULL;
+                    long cd = strtol(val, &endp, 10);
+                    if (!endp || *endp != '\0' || cd < MEMP_MIN_COOLDOWN || cd > MEMP_MAX_COOLDOWN) {
+                        bad = 1;
+                        break;
+                    }
+                    rule_cd = (int)cd;
+                    has_cd = 1;
+                }
+
+                if (bad) {
+                    jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    continue;
+                }
+
                 memp_rule_t *r = &parsed_rules[nparsed++];
-                strncpy(r->frag, tok1, sizeof(r->frag) - 1);
+                strncpy(r->frag, tokens[0], sizeof(r->frag) - 1);
                 r->frag[sizeof(r->frag) - 1] = '\0';
                 r->thr_mb = thr;
-                r->is_bid = (strncmp(tok1, "bid:", 4) == 0);
+                r->cooldown = rule_cd;
+                r->is_bid = (strncmp(tokens[0], "bid:", 4) == 0);
                 r->last_warn_sec = 0;
                 r->last_skip_sec = 0;
+                r->ineff = 0;
+                r->eff_cd = (rule_cd > 0 ? rule_cd : new_cooldown);
             }
         }
         fclose(f);
@@ -1516,8 +1941,7 @@ static int mempressure_load_config(void) {
         changed = 1;
     } else {
         for (int i = 0; i < nparsed; i++) {
-            if (strcmp(parsed_rules[i].frag, g_memp_rules[i].frag) != 0 ||
-                parsed_rules[i].thr_mb != g_memp_rules[i].thr_mb) {
+            if (!memp_rule_cfg_equal(&parsed_rules[i], &g_memp_rules[i])) {
                 changed = 1;
                 break;
             }
@@ -1525,21 +1949,47 @@ static int mempressure_load_config(void) {
     }
 
     if (changed) {
+        int rule_cd_count = 0;
+        for (int i = 0; i < nparsed; i++) {
+            if (parsed_rules[i].cooldown > 0) rule_cd_count++;
+        }
+
         char cap_str[64];
         if (g_memp_memcap_fallback) {
             snprintf(cap_str, sizeof(cap_str), "2048(fallback)");
         } else {
             snprintf(cap_str, sizeof(cap_str), "%llu", (unsigned long long)g_memp_memcap);
         }
-        jp_log("MEMP cfg rules=%d cooldown=%d file=%s memcap=%s",
-               nparsed, new_cooldown, file_absent ? "absent" : "ok", cap_str);
+        jp_log("MEMP cfg rules=%d cooldown=%d file=%s memcap=%s rule_cd=%d",
+               nparsed, new_cooldown, file_absent ? "absent" : "ok", cap_str, rule_cd_count);
 
-        /* 继承相同片段的冷却状态 */
         for (int i = 0; i < nparsed; i++) {
+            char cd_str[32];
+            if (parsed_rules[i].cooldown > 0) {
+                snprintf(cd_str, sizeof(cd_str), "%d", (int)parsed_rules[i].cooldown);
+            } else {
+                snprintf(cd_str, sizeof(cd_str), "global");
+            }
+            jp_log("MEMP cfg_rule i=%d app=%s thr=%d cd=%s",
+                   i, parsed_rules[i].frag, (int)parsed_rules[i].thr_mb, cd_str);
+        }
+
+        /* 继承相同片段的冷却与退避状态 */
+        for (int i = 0; i < nparsed; i++) {
+            int32_t base_cd = parsed_rules[i].cooldown > 0 ? parsed_rules[i].cooldown : new_cooldown;
+            parsed_rules[i].ineff = 0;
+            parsed_rules[i].eff_cd = base_cd;
             for (int j = 0; j < g_nmemp_rules; j++) {
                 if (strcmp(parsed_rules[i].frag, g_memp_rules[j].frag) == 0) {
                     parsed_rules[i].last_warn_sec = g_memp_rules[j].last_warn_sec;
                     parsed_rules[i].last_skip_sec = g_memp_rules[j].last_skip_sec;
+                    int same_cfg = (parsed_rules[i].thr_mb == g_memp_rules[j].thr_mb &&
+                                    parsed_rules[i].cooldown == g_memp_rules[j].cooldown &&
+                                    (parsed_rules[i].cooldown > 0 || new_cooldown == g_memp_cooldown));
+                    if (same_cfg) {
+                        parsed_rules[i].ineff = g_memp_rules[j].ineff;
+                        parsed_rules[i].eff_cd = g_memp_rules[j].eff_cd > 0 ? g_memp_rules[j].eff_cd : base_cd;
+                    }
                     break;
                 }
             }
@@ -1548,149 +1998,21 @@ static int mempressure_load_config(void) {
         g_nmemp_rules = nparsed;
         g_memp_cooldown = new_cooldown;
         g_memp_cfg_file_absent = file_absent;
+        memp_floor_prune();
     }
 
     return file_absent ? -1 : 0;
 }
 
-/* ---- 微信内存限额只读诊断 (v0.7.1) ---- */
-static pid_t s_memp_wx_pid = 0;
-static int s_memp_wx_read_first = 0;    /* 是否已完成首次读数 */
-static int s_memp_wx_read_fg = 0;       /* 是否已有前台读数 */
-static int s_memp_wx_cut_bg_done = 0;   /* 是否已有切后台复读 */
-static time_t s_memp_wx_bg_time = 0;    /* 微信从前台切到后台的时刻 */
-static int s_memp_wx_bg60_done = 0;     /* 是否已取过切后台 60 秒读数 */
-static int s_memp_wx_read_bg60 = 0;     /* 是否已有切后台 60 秒读数 */
-static int s_memp_wx_last_fg = 0;       /* 上一轮是否处于前台 */
-
-/* 检查并记录缺失的读数 */
-static void memp_diag_memlimit_check_missing(void) {
-    if (s_memp_wx_pid > 0) {
-        if (s_memp_wx_read_fg && !s_memp_wx_cut_bg_done) {
-            jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d missing=bg", (int)s_memp_wx_pid);
-        } else if (s_memp_wx_read_fg && s_memp_wx_cut_bg_done && !s_memp_wx_read_bg60) {
-            jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d missing=bg60", (int)s_memp_wx_pid);
-        } else if (!s_memp_wx_read_fg && s_memp_wx_read_first) {
-            jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d missing=fg", (int)s_memp_wx_pid);
-        }
-    }
-}
-
-/* 读取微信内存限额并打印日志 (只读，不调用 SET) */
-static int memp_diag_read_memlimit(pid_t pid, const char *state_str) {
-    memorystatus_memlimit_properties_t props;
-    memset(&props, 0, sizeof(props));
-    int rc = memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES,
-                                  pid, 0, &props, sizeof(props));
-    if (rc == 0) {
-        jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d active=%d active_attr=%u inactive=%d inactive_attr=%u state=%s",
-               (int)pid, (int)props.memlimit_active, (unsigned)props.memlimit_active_attr,
-               (int)props.memlimit_inactive, (unsigned)props.memlimit_inactive_attr, state_str);
-        return 0;
-    }
-    int err = (errno != 0) ? errno : -1;
-    char eb[128];
-    memp_fmt_errno(err, eb, sizeof(eb));
-    jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d state=%s errno=%s", (int)pid, state_str, eb);
-    return -1;
-}
-
-/* 微信内存限额每轮检查 */
-static void memp_diag_memlimit_round(memorystatus_priority_entry_t *list, int count) {
-    if (!list || count <= 0) return;
-
-    int found = 0;
-    int32_t cur = 0;
-    if (s_memp_wx_pid > 0) {
-        for (int i = 0; i < count; i++) {
-            if (list[i].pid == s_memp_wx_pid) {
-                found = 1;
-                cur = list[i].priority;
-                break;
-            }
-        }
-        if (!found) {
-            memp_diag_memlimit_check_missing();
-            s_memp_wx_pid = 0;
-            s_memp_wx_read_first = 0;
-            s_memp_wx_read_fg = 0;
-            s_memp_wx_cut_bg_done = 0;
-            s_memp_wx_bg_time = 0;
-            s_memp_wx_bg60_done = 0;
-            s_memp_wx_read_bg60 = 0;
-            s_memp_wx_last_fg = 0;
-        }
-    }
-    if (s_memp_wx_pid == 0) {
-        for (int i = 0; i < count; i++) {
-            pid_t pid = list[i].pid;
-            if (pid <= 0) continue;
-            char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-            if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
-            if (!memp_is_main_app_binary(path)) continue;
-            const char *bid = app_bid_for_path(path);
-            if (bid && strcmp(bid, "com.tencent.xin") == 0) {
-                s_memp_wx_pid = pid;
-                found = 1;
-                cur = list[i].priority;
-                break;
-            }
-        }
-    }
-    if (s_memp_wx_pid > 0 && found) {
-        int is_fg = (cur == BAND_FOREGROUND);
-        if (!s_memp_wx_read_first) {
-            s_memp_wx_read_first = 1;
-            if (memp_diag_read_memlimit(s_memp_wx_pid, is_fg ? "fg" : "bg") == 0 && is_fg) {
-                s_memp_wx_read_fg = 1;
-            }
-            s_memp_wx_last_fg = is_fg;
-        } else if (s_memp_wx_last_fg && !is_fg) {
-            s_memp_wx_bg_time = time(NULL);
-            if (!s_memp_wx_cut_bg_done) {
-                if (memp_diag_read_memlimit(s_memp_wx_pid, "bg") == 0) {
-                    s_memp_wx_cut_bg_done = 1;
-                }
-            }
-            s_memp_wx_last_fg = 0;
-        } else if (!s_memp_wx_last_fg && is_fg) {
-            if (!s_memp_wx_read_fg && memp_diag_read_memlimit(s_memp_wx_pid, "fg") == 0) {
-                s_memp_wx_read_fg = 1;
-            }
-            s_memp_wx_last_fg = 1;
-            s_memp_wx_bg_time = 0;
-        }
-
-        /* 如果微信已在后台、且距切后台时刻 >= 60 秒、且 60 秒读数还没取过，就再读一次 (state=bg60) */
-        if (!is_fg && s_memp_wx_bg_time > 0 && !s_memp_wx_bg60_done) {
-            time_t now = time(NULL);
-            if (now >= s_memp_wx_bg_time && (now - s_memp_wx_bg_time) >= 60) {
-                s_memp_wx_bg60_done = 1;
-                if (memp_diag_read_memlimit(s_memp_wx_pid, "bg60") == 0) {
-                    s_memp_wx_read_bg60 = 1;
-                }
-            }
-        }
-    }
-}
-
-/* 守护进程停止时检查是否有未闭合的读数 */
-static void memp_diag_memlimit_stop(void) {
-    memp_diag_memlimit_check_missing();
-}
-
 static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
-    /* 1. 每一轮开头检查观察槽（§八） */
-    memp_post_check();
+    /* 1. 每一轮开头检查观察槽与采样（§八、§三-A） */
+    memp_post_sample(list, count);
 
     /* 2. 重新加载配置（§四） */
     mempressure_load_config();
 
     /* 3. 检查 fatal 状态 */
     if (g_memp_state == MEMP_STATE_FATAL) return;
-
-    /* 微信内存限额只读诊断 (v0.7.1) */
-    memp_diag_memlimit_round(list, count);
 
     /* 4. §五-1a 第一件事：复位处理 (reset_pending) */
     if (g_memp_reset_pending == MEMP_RESET_PENDING_MARKER) {
@@ -2034,8 +2356,9 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         /* 条件 4：目标不在污染表里 */
         if (memp_is_tainted(pid, sec, usec)) continue;
 
-        /* 条件 5：该规则冷却已过 */
-        if (rule->last_warn_sec > 0 && now_ts.tv_sec - rule->last_warn_sec < g_memp_cooldown) continue;
+        /* 条件 5：该规则有效冷却已过 */
+        int32_t eff_cd = rule->eff_cd > 0 ? rule->eff_cd : (rule->cooldown > 0 ? rule->cooldown : g_memp_cooldown);
+        if (rule->last_warn_sec > 0 && now_ts.tv_sec - rule->last_warn_sec < eff_cd) continue;
 
         /* 同一轮有多个目标超过阈值时，取 footprint 最大的一个 */
         if (target_pid == 0 || fp_bytes > target_fp_bytes) {
@@ -2423,8 +2746,8 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         }
     }
 
-    /* 步骤 12：登记 post 观察槽（§八） */
-    memp_post_register(target_rule->frag, target_pid, target_sec, target_usec, warn_mono.tv_sec, fp_before_mb);
+    /* 步骤 12：登记 post 观察槽（§八）——当前门控确保 target_pid 处于 100 档（见 2275 行） */
+    memp_post_register(target_rule->frag, target_pid, target_sec, target_usec, warn_mono.tv_sec, fp_before_mb, 100);
 
     /* 步骤 13：记录冷却起点 */
     target_rule->last_warn_sec = warn_mono.tv_sec;
@@ -2612,7 +2935,6 @@ int main(void) {
          * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
     }
 
-    memp_diag_memlimit_stop();
     jp_log("STOP");
     unlink(PID_PATH);
     fprintf(stderr, "[JetPilot] 收到停止信号，退出\n");
