@@ -1558,6 +1558,9 @@ static pid_t s_memp_wx_pid = 0;
 static int s_memp_wx_read_first = 0;    /* 是否已完成首次读数 */
 static int s_memp_wx_read_fg = 0;       /* 是否已有前台读数 */
 static int s_memp_wx_cut_bg_done = 0;   /* 是否已有切后台复读 */
+static time_t s_memp_wx_bg_time = 0;    /* 微信从前台切到后台的时刻 */
+static int s_memp_wx_bg60_done = 0;     /* 是否已取过切后台 60 秒读数 */
+static int s_memp_wx_read_bg60 = 0;     /* 是否已有切后台 60 秒读数 */
 static int s_memp_wx_last_fg = 0;       /* 上一轮是否处于前台 */
 
 /* 检查并记录缺失的读数 */
@@ -1565,6 +1568,8 @@ static void memp_diag_memlimit_check_missing(void) {
     if (s_memp_wx_pid > 0) {
         if (s_memp_wx_read_fg && !s_memp_wx_cut_bg_done) {
             jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d missing=bg", (int)s_memp_wx_pid);
+        } else if (s_memp_wx_read_fg && s_memp_wx_cut_bg_done && !s_memp_wx_read_bg60) {
+            jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d missing=bg60", (int)s_memp_wx_pid);
         } else if (!s_memp_wx_read_fg && s_memp_wx_read_first) {
             jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d missing=fg", (int)s_memp_wx_pid);
         }
@@ -1610,6 +1615,9 @@ static void memp_diag_memlimit_round(memorystatus_priority_entry_t *list, int co
             s_memp_wx_read_first = 0;
             s_memp_wx_read_fg = 0;
             s_memp_wx_cut_bg_done = 0;
+            s_memp_wx_bg_time = 0;
+            s_memp_wx_bg60_done = 0;
+            s_memp_wx_read_bg60 = 0;
             s_memp_wx_last_fg = 0;
         }
     }
@@ -1637,9 +1645,12 @@ static void memp_diag_memlimit_round(memorystatus_priority_entry_t *list, int co
                 s_memp_wx_read_fg = 1;
             }
             s_memp_wx_last_fg = is_fg;
-        } else if (s_memp_wx_last_fg && !is_fg && !s_memp_wx_cut_bg_done) {
-            if (memp_diag_read_memlimit(s_memp_wx_pid, "bg") == 0) {
-                s_memp_wx_cut_bg_done = 1;
+        } else if (s_memp_wx_last_fg && !is_fg) {
+            s_memp_wx_bg_time = time(NULL);
+            if (!s_memp_wx_cut_bg_done) {
+                if (memp_diag_read_memlimit(s_memp_wx_pid, "bg") == 0) {
+                    s_memp_wx_cut_bg_done = 1;
+                }
             }
             s_memp_wx_last_fg = 0;
         } else if (!s_memp_wx_last_fg && is_fg) {
@@ -1647,6 +1658,18 @@ static void memp_diag_memlimit_round(memorystatus_priority_entry_t *list, int co
                 s_memp_wx_read_fg = 1;
             }
             s_memp_wx_last_fg = 1;
+            s_memp_wx_bg_time = 0;
+        }
+
+        /* 如果微信已在后台、且距切后台时刻 >= 60 秒、且 60 秒读数还没取过，就再读一次 (state=bg60) */
+        if (!is_fg && s_memp_wx_bg_time > 0 && !s_memp_wx_bg60_done) {
+            time_t now = time(NULL);
+            if (now >= s_memp_wx_bg_time && (now - s_memp_wx_bg_time) >= 60) {
+                s_memp_wx_bg60_done = 1;
+                if (memp_diag_read_memlimit(s_memp_wx_pid, "bg60") == 0) {
+                    s_memp_wx_read_bg60 = 1;
+                }
+            }
         }
     }
 }
