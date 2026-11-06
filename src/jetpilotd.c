@@ -131,6 +131,8 @@ extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buf
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
 #define MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES  2
+#define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES  8
+#define MEMORYSTATUS_MEMLIMIT_ATTR_FATAL          0x1
 
 /* iOS 16+ 档位参考值 */
 #define BAND_IDLE        0
@@ -151,6 +153,13 @@ typedef struct memorystatus_priority_properties {
     uint64_t user_data;
 } memorystatus_priority_properties_t;
 
+typedef struct memorystatus_memlimit_properties {
+    int32_t  memlimit_active;        /* 前台限额 MB */
+    uint32_t memlimit_active_attr;   /* 前台属性 (0x1=FATAL) */
+    int32_t  memlimit_inactive;      /* 后台限额 MB */
+    uint32_t memlimit_inactive_attr; /* 后台属性 (0x1=FATAL) */
+} memorystatus_memlimit_properties_t;
+
 extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
                                 void *buffer, size_t buffersize);
 
@@ -160,7 +169,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define FLAG_PATH   CONFIG_DIR "/running.flag"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define PID_PATH    CONFIG_DIR "/daemon.pid"
-#define JP_VERSION   "0.7.0"
+#define JP_VERSION   "0.7.1"
 #define LOG_PATH     CONFIG_DIR "/daemon.log"
 #define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
 #define LOG_MAX_BYTES (256 * 1024)
@@ -1544,6 +1553,109 @@ static int mempressure_load_config(void) {
     return file_absent ? -1 : 0;
 }
 
+/* ---- 微信内存限额只读诊断 (v0.7.1) ---- */
+static pid_t s_memp_wx_pid = 0;
+static int s_memp_wx_read_first = 0;    /* 是否已完成首次读数 */
+static int s_memp_wx_read_fg = 0;       /* 是否已有前台读数 */
+static int s_memp_wx_cut_bg_done = 0;   /* 是否已有切后台复读 */
+static int s_memp_wx_last_fg = 0;       /* 上一轮是否处于前台 */
+
+/* 检查并记录缺失的读数 */
+static void memp_diag_memlimit_check_missing(void) {
+    if (s_memp_wx_pid > 0) {
+        if (s_memp_wx_read_fg && !s_memp_wx_cut_bg_done) {
+            jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d missing=bg", (int)s_memp_wx_pid);
+        } else if (!s_memp_wx_read_fg && s_memp_wx_read_first) {
+            jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d missing=fg", (int)s_memp_wx_pid);
+        }
+    }
+}
+
+/* 读取微信内存限额并打印日志 (只读，不调用 SET) */
+static int memp_diag_read_memlimit(pid_t pid, const char *state_str) {
+    memorystatus_memlimit_properties_t props;
+    memset(&props, 0, sizeof(props));
+    int rc = memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES,
+                                  pid, 0, &props, sizeof(props));
+    if (rc == 0) {
+        jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d active=%d active_attr=%u inactive=%d inactive_attr=%u state=%s",
+               (int)pid, (int)props.memlimit_active, (unsigned)props.memlimit_active_attr,
+               (int)props.memlimit_inactive, (unsigned)props.memlimit_inactive_attr, state_str);
+        return 0;
+    }
+    int err = (errno != 0) ? errno : -1;
+    char eb[128];
+    memp_fmt_errno(err, eb, sizeof(eb));
+    jp_log("MEMP memlimit app=bid:com.tencent.xin pid=%d state=%s errno=%s", (int)pid, state_str, eb);
+    return -1;
+}
+
+/* 微信内存限额每轮检查 */
+static void memp_diag_memlimit_round(memorystatus_priority_entry_t *list, int count) {
+    if (!list || count <= 0) return;
+
+    int found = 0;
+    int32_t cur = 0;
+    if (s_memp_wx_pid > 0) {
+        for (int i = 0; i < count; i++) {
+            if (list[i].pid == s_memp_wx_pid) {
+                found = 1;
+                cur = list[i].priority;
+                break;
+            }
+        }
+        if (!found) {
+            memp_diag_memlimit_check_missing();
+            s_memp_wx_pid = 0;
+            s_memp_wx_read_first = 0;
+            s_memp_wx_read_fg = 0;
+            s_memp_wx_cut_bg_done = 0;
+            s_memp_wx_last_fg = 0;
+        }
+    }
+    if (s_memp_wx_pid == 0) {
+        for (int i = 0; i < count; i++) {
+            pid_t pid = list[i].pid;
+            if (pid <= 0) continue;
+            char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+            if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
+            if (!memp_is_main_app_binary(path)) continue;
+            const char *bid = app_bid_for_path(path);
+            if (bid && strcmp(bid, "com.tencent.xin") == 0) {
+                s_memp_wx_pid = pid;
+                found = 1;
+                cur = list[i].priority;
+                break;
+            }
+        }
+    }
+    if (s_memp_wx_pid > 0 && found) {
+        int is_fg = (cur == BAND_FOREGROUND);
+        if (!s_memp_wx_read_first) {
+            s_memp_wx_read_first = 1;
+            if (memp_diag_read_memlimit(s_memp_wx_pid, is_fg ? "fg" : "bg") == 0 && is_fg) {
+                s_memp_wx_read_fg = 1;
+            }
+            s_memp_wx_last_fg = is_fg;
+        } else if (s_memp_wx_last_fg && !is_fg && !s_memp_wx_cut_bg_done) {
+            if (memp_diag_read_memlimit(s_memp_wx_pid, "bg") == 0) {
+                s_memp_wx_cut_bg_done = 1;
+            }
+            s_memp_wx_last_fg = 0;
+        } else if (!s_memp_wx_last_fg && is_fg) {
+            if (!s_memp_wx_read_fg && memp_diag_read_memlimit(s_memp_wx_pid, "fg") == 0) {
+                s_memp_wx_read_fg = 1;
+            }
+            s_memp_wx_last_fg = 1;
+        }
+    }
+}
+
+/* 守护进程停止时检查是否有未闭合的读数 */
+static void memp_diag_memlimit_stop(void) {
+    memp_diag_memlimit_check_missing();
+}
+
 static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
     /* 1. 每一轮开头检查观察槽（§八） */
     memp_post_check();
@@ -1553,6 +1665,9 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
 
     /* 3. 检查 fatal 状态 */
     if (g_memp_state == MEMP_STATE_FATAL) return;
+
+    /* 微信内存限额只读诊断 (v0.7.1) */
+    memp_diag_memlimit_round(list, count);
 
     /* 4. §五-1a 第一件事：复位处理 (reset_pending) */
     if (g_memp_reset_pending == MEMP_RESET_PENDING_MARKER) {
@@ -2474,6 +2589,7 @@ int main(void) {
          * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
     }
 
+    memp_diag_memlimit_stop();
     jp_log("STOP");
     unlink(PID_PATH);
     fprintf(stderr, "[JetPilot] 收到停止信号，退出\n");
