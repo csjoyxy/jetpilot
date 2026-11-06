@@ -35,6 +35,7 @@
 /* iOS SDK 没有 libproc.h，手动声明 proc_* 函数与 proc_bsdinfo */
 #define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -844,6 +845,7 @@ typedef struct {
     pid_t    pid;
     uint64_t tvsec;
     uint64_t tvusec;
+    int      is_sys; /* 是否为 B 类系统/非保护让位进程 (1=B类, 0=A类) */
 } memp_yielded_entry_t;
 
 /* 格式化 errno: 0 -> 0(-)，非0 -> <n>(<strerror>) */
@@ -854,6 +856,36 @@ static void memp_fmt_errno(int err, char *buf, size_t sz) {
         const char *s = strerror(err);
         snprintf(buf, sz, "%d(%s)", err, s ? s : "unknown");
     }
+}
+
+/* 获取并清洗进程名：最多 16 字节，读不到写 "?"，其中的 ','、':'、空格替换为 '_' */
+static void memp_get_proc_name(pid_t pid, char *out, size_t sz) {
+    if (!out || sz == 0) return;
+    char raw[64] = {0};
+    int ret = proc_name((int)pid, raw, sizeof(raw));
+    if (ret <= 0 || raw[0] == '\0') {
+        snprintf(out, sz, "?");
+        return;
+    }
+    raw[sizeof(raw) - 1] = '\0';
+    if (strlen(raw) > 16) {
+        raw[16] = '\0';
+    }
+    for (char *p = raw; *p; p++) {
+        if (*p == ',' || *p == ':' || *p == ' ') {
+            *p = '_';
+        }
+    }
+    snprintf(out, sz, "%s", raw);
+}
+
+/* 统计让位记录中 B 类进程数量 */
+static int memp_count_yielded_sys(const memp_yielded_entry_t *yielded, int nyielded) {
+    int cnt = 0;
+    for (int i = 0; i < nyielded; i++) {
+        if (yielded[i].is_sys) cnt++;
+    }
+    return cnt;
 }
 
 /* 设档封装：内部使用 MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES 与 set_priority() 一致，
@@ -1262,6 +1294,12 @@ static void memp_restore_yielded(memp_yielded_entry_t *yielded, int nyielded,
             char eb[128];
             memp_fmt_errno(err, eb, sizeof(eb));
             jp_log("MEMP restore_fail pid=%d errno=%s", (int)yielded[i].pid, eb);
+            if (yielded[i].is_sys) {
+                char pname[32];
+                memp_get_proc_name(yielded[i].pid, pname, sizeof(pname));
+                jp_log("MEMP yield_sys_fail pid=%d name=%s step=restore errno=%s",
+                       (int)yielded[i].pid, pname, eb);
+            }
         }
     }
     if (ok_out) *ok_out = ok;
@@ -1279,13 +1317,15 @@ static void memp_format_comp(memorystatus_priority_entry_t *list, int count, pid
         if (list[i].priority == 90 || list[i].priority == 100) {
             uint64_t fp_bytes = 0;
             int rerr = memp_get_phys_footprint(list[i].pid, &fp_bytes);
+            char pname[32];
+            memp_get_proc_name(list[i].pid, pname, sizeof(pname));
             char item[64];
             if (rerr == 0) {
-                snprintf(item, sizeof(item), "%s%d:%d:%.1f", first ? "" : ",",
-                         (int)list[i].pid, (int)list[i].priority, (double)fp_bytes / (1024.0 * 1024.0));
+                snprintf(item, sizeof(item), "%s%d:%d:%.1f:%s", first ? "" : ",",
+                         (int)list[i].pid, (int)list[i].priority, (double)fp_bytes / (1024.0 * 1024.0), pname);
             } else {
-                snprintf(item, sizeof(item), "%s%d:%d:NA", first ? "" : ",",
-                         (int)list[i].pid, (int)list[i].priority);
+                snprintf(item, sizeof(item), "%s%d:%d:NA:%s", first ? "" : ",",
+                         (int)list[i].pid, (int)list[i].priority, pname);
             }
             first = 0;
             size_t ilen = strlen(item);
@@ -1303,7 +1343,7 @@ static void memp_format_comp(memorystatus_priority_entry_t *list, int count, pid
 }
 
 static void memp_log_skip(memp_rule_t *rule, pid_t pid, double fp_mb, int thr_mb,
-                          const char *reason, int yielded, int err, const char *comp_str,
+                          const char *reason, int yielded, int yielded_sys, int err, const char *comp_str,
                           int ok, int moved, int gone, int rfail) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1322,8 +1362,8 @@ static void memp_log_skip(memp_rule_t *rule, pid_t pid, double fp_mb, int thr_mb
         ok = moved = gone = rfail = 0;
     }
 
-    jp_log("MEMP skip app=%s pid=%d fp=%.1f thr=%d reason=%s yielded=%d errno=%s comp=%s restored=ok:%d,moved:%d,gone:%d,rfail:%d",
-           rule ? rule->frag : "-", (int)pid, fp_mb, thr_mb, reason, yielded, eb,
+    jp_log("MEMP skip app=%s pid=%d fp=%.1f thr=%d reason=%s yielded=%d yielded_sys=%d errno=%s comp=%s restored=ok:%d,moved:%d,gone:%d,rfail:%d",
+           rule ? rule->frag : "-", (int)pid, fp_mb, thr_mb, reason, yielded, yielded_sys, eb,
            (comp_str && comp_str[0]) ? comp_str : "-", ok, moved, gone, rfail);
 }
 
@@ -1881,19 +1921,20 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
             memp_enter_unsupported("level", lerr);
         } else {
             memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                          "level_unread", 0, 0, "-", 0, 0, 0, 0);
+                          "level_unread", 0, 0, 0, "-", 0, 0, 0, 0);
         }
         return;
     }
     if (lvl != 1) {
         memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      "real_pressure", 0, 0, "-", 0, 0, 0, 0);
+                      "real_pressure", 0, 0, 0, "-", 0, 0, 0, 0);
         return;
     }
 
-    /* 条件 7 & §五-2 步骤 2：让位（§三-3） */
+    /* 条件 7 & §五-2 步骤 2：让位（§三-3 / 勘误 3） */
     memp_yielded_entry_t yield_candidates[MEMP_MAX_YIELD + 1];
     int k = 0;
+    pid_t self_pid = getpid();
     for (int i = 0; i < count; i++) {
         pid_t pid = list[i].pid;
         int32_t cur = list[i].priority;
@@ -1901,26 +1942,45 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
 
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
-        if (!strstr(path, "/var/containers/Bundle/Application/")) continue;
 
-        const char *app_bid = app_bid_for_path(path);
-        int32_t prot_target = 0;
-        const char *frag = NULL;
-        if (path_matches(path, app_bid, g_protect, g_nprotect, &prot_target, &frag)) {
-            if (prot_target == 90) {
-                if (k < MEMP_MAX_YIELD) {
-                    yield_candidates[k].pid = pid;
-                    k++;
-                } else {
-                    k++; /* 溢出标记 */
+        /* 判定是否为 A 类（受保护且目标档位为 90 的用户 App） */
+        int is_a = 0;
+        if (strstr(path, "/var/containers/Bundle/Application/")) {
+            const char *app_bid = app_bid_for_path(path);
+            int32_t prot_target = 0;
+            const char *frag = NULL;
+            if (path_matches(path, app_bid, g_protect, g_nprotect, &prot_target, &frag)) {
+                if (prot_target == 90) {
+                    is_a = 1;
                 }
             }
+        }
+
+        int is_sys = 0;
+        if (is_a) {
+            is_sys = 0;
+        } else if (pid != self_pid) {
+            /* B 类：非 T、非 A 类、非 daemon 自己的其他所有 90 档进程 */
+            is_sys = 1;
+        } else {
+            /* daemon 自身排除在 B 类之外 */
+            continue;
+        }
+
+        if (k < MEMP_MAX_YIELD) {
+            yield_candidates[k].pid = pid;
+            yield_candidates[k].is_sys = is_sys;
+            yield_candidates[k].tvsec = 0;
+            yield_candidates[k].tvusec = 0;
+            k++;
+        } else {
+            k++; /* 溢出标记 */
         }
     }
 
     if (k > MEMP_MAX_YIELD) {
         memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      "yield_full", 0, 0, "-", 0, 0, 0, 0);
+                      "yield_full", 0, 0, 0, "-", 0, 0, 0, 0);
         return;
     }
 
@@ -1930,7 +1990,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
                                         &yield_candidates[i].tvsec,
                                         &yield_candidates[i].tvusec) != 0) {
             memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                          "yield_nostart", 0, 0, "-", 0, 0, 0, 0);
+                          "yield_nostart", 0, 0, 0, "-", 0, 0, 0, 0);
             return;
         }
     }
@@ -1947,6 +2007,14 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         } else {
             yield_failed = 1;
             yield_fail_err = err;
+            if (yield_candidates[i].is_sys) {
+                char pname[32];
+                memp_get_proc_name(yield_candidates[i].pid, pname, sizeof(pname));
+                char eb[128];
+                memp_fmt_errno(err, eb, sizeof(eb));
+                jp_log("MEMP yield_sys_fail pid=%d name=%s step=down errno=%s",
+                       (int)yield_candidates[i].pid, pname, eb);
+            }
             break;
         }
     }
@@ -1954,8 +2022,9 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
     if (yield_failed) {
         int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
         memp_restore_yielded(yielded, nyielded, list, count, &r_ok, &r_moved, &r_gone, &r_rfail);
+        int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
         memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      "yield_fail", nyielded, yield_fail_err, "-", r_ok, r_moved, r_gone, r_rfail);
+                      "yield_fail", nyielded, nyielded_sys, yield_fail_err, "-", r_ok, r_moved, r_gone, r_rfail);
         return;
     }
 
@@ -2010,8 +2079,9 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         memp_restore_yielded(yielded, nyielded, gate_list, gate_count, &r_ok, &r_moved, &r_gone, &r_rfail);
         char comp_buf[256] = "-";
         if (gate_list) memp_format_comp(gate_list, gate_count, target_pid, comp_buf, sizeof(comp_buf));
+        int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
         memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      gate_reason, nyielded, 0, comp_buf, r_ok, r_moved, r_gone, r_rfail);
+                      gate_reason, nyielded, nyielded_sys, 0, comp_buf, r_ok, r_moved, r_gone, r_rfail);
         if (gate_list) free(gate_list);
         return;
     }
@@ -2038,8 +2108,9 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         memp_restore_yielded(yielded, nyielded, gate_list, gate_count, &r_ok, &r_moved, &r_gone, &r_rfail);
         char comp_buf[256] = "-";
         if (gate_list) memp_format_comp(gate_list, gate_count, target_pid, comp_buf, sizeof(comp_buf));
+        int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
         memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      "marker_fail", nyielded, marker_err, comp_buf, r_ok, r_moved, r_gone, r_rfail);
+                      "marker_fail", nyielded, nyielded_sys, marker_err, comp_buf, r_ok, r_moved, r_gone, r_rfail);
         if (gate_list) free(gate_list);
         return;
     }
@@ -2089,11 +2160,12 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
     }
     const char *recheck_str = recheck_same ? "same" : "changed";
 
+    int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
     char web[128];
     memp_fmt_errno(warn_err, web, sizeof(web));
-    jp_log("MEMP warn app=%s pid=%d fp_before=%.1f thr=%d yielded=%d fg_others=%d gate_ms=%ld ret=%d errno=%s recheck=%s",
+    jp_log("MEMP warn app=%s pid=%d fp_before=%.1f thr=%d yielded=%d yielded_sys=%d fg_others=%d gate_ms=%ld ret=%d errno=%s recheck=%s",
            target_rule->frag, (int)target_pid, fp_before_mb, target_rule->thr_mb,
-           nyielded, fg_others, gate_ms, warn_rc, web, recheck_str);
+           nyielded, nyielded_sys, fg_others, gate_ms, warn_rc, web, recheck_str);
 
     if (gate_list) free(gate_list);
     if (recheck_list) free(recheck_list);
@@ -2153,9 +2225,9 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
 
     char neb[128];
     memp_fmt_errno(normal_err, neb, sizeof(neb));
-    jp_log("MEMP normal app=%s pid=%d fp_after5=%s band_now=%s stuck=%d early_stop=%d ret=%d errno=%s yielded=%d restored=ok:%d,moved:%d,gone:%d,rfail:%d",
+    jp_log("MEMP normal app=%s pid=%d fp_after5=%s band_now=%s stuck=%d early_stop=%d ret=%d errno=%s yielded=%d yielded_sys=%d restored=ok:%d,moved:%d,gone:%d,rfail:%d",
            target_rule->frag, (int)target_pid, fp_after5_buf, band_now_buf, stuck, early_stop,
-           normal_rc, neb, nyielded, r_ok, r_moved, r_gone, r_rfail);
+           normal_rc, neb, nyielded, nyielded_sys, r_ok, r_moved, r_gone, r_rfail);
 
     if (step9_list) free(step9_list);
 
