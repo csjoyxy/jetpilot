@@ -784,11 +784,12 @@ typedef struct {
 static memp_taint_entry_t g_memp_taint[MEMP_MAX_TAINT];
 static int g_memp_ntaint = 0;
 
-/* 修复限频：每个 pid 上次尝试修复的时间（60 秒最多一次） */
+/* 修复限频：每个 pid 上次尝试修复的时间（60 秒最多一次）与连续失败计数 */
 #define MEMP_MAX_REPAIR_SEEN 16
 typedef struct {
     pid_t  pid;
     time_t last_repair_sec;
+    int    fail_count;
 } memp_repair_seen_t;
 static memp_repair_seen_t g_memp_repair_seen[MEMP_MAX_REPAIR_SEEN];
 static int g_memp_nrepair_seen = 0;
@@ -890,11 +891,13 @@ static int memp_get_phys_footprint(pid_t pid, uint64_t *fp_bytes_out) {
     return errno != 0 ? errno : -1;
 }
 
-/* 检查是否为主 App 二进制 (路径以 /var/containers/Bundle/Application/ 开头且所在目录以 .app 结尾) */
+/* 检查是否为主 App 二进制 (路径以 /private/var/containers/Bundle/Application/ 或 /var/containers/Bundle/Application/ 开头且所在目录以 .app 结尾) */
 static int memp_is_main_app_binary(const char *path) {
     if (!path) return 0;
-    static const char k[] = "/var/containers/Bundle/Application/";
-    if (strncmp(path, k, sizeof(k) - 1) != 0) return 0;
+    static const char k1[] = "/private/var/containers/Bundle/Application/";
+    static const char k2[] = "/var/containers/Bundle/Application/";
+    if (strncmp(path, k1, sizeof(k1) - 1) != 0 &&
+        strncmp(path, k2, sizeof(k2) - 1) != 0) return 0;
     const char *slash = strrchr(path, '/');
     if (!slash || slash - path < 4) return 0;
     return (strncmp(slash - 4, ".app", 4) == 0);
@@ -1630,24 +1633,24 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
     }
 
     if (repair_pid > 0) {
-        /* 更新该 pid 的修复限频计时 */
-        int found_seen = 0;
+        /* 更新该 pid 的修复限频计时与条目指针 */
+        memp_repair_seen_t *seen_entry = NULL;
         for (int r = 0; r < g_memp_nrepair_seen; r++) {
             if (g_memp_repair_seen[r].pid == repair_pid) {
-                g_memp_repair_seen[r].last_repair_sec = now_ts.tv_sec;
-                found_seen = 1;
+                seen_entry = &g_memp_repair_seen[r];
+                seen_entry->last_repair_sec = now_ts.tv_sec;
                 break;
             }
         }
-        if (!found_seen) {
+        if (!seen_entry) {
             if (g_memp_nrepair_seen < MEMP_MAX_REPAIR_SEEN) {
-                g_memp_repair_seen[g_memp_nrepair_seen].pid = repair_pid;
-                g_memp_repair_seen[g_memp_nrepair_seen].last_repair_sec = now_ts.tv_sec;
-                g_memp_nrepair_seen++;
+                seen_entry = &g_memp_repair_seen[g_memp_nrepair_seen++];
             } else {
-                g_memp_repair_seen[0].pid = repair_pid;
-                g_memp_repair_seen[0].last_repair_sec = now_ts.tv_sec;
+                seen_entry = &g_memp_repair_seen[0];
             }
+            seen_entry->pid = repair_pid;
+            seen_entry->last_repair_sec = now_ts.tv_sec;
+            seen_entry->fail_count = 0;
         }
 
         /* 检查真实级别 */
@@ -1752,12 +1755,14 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         memp_fmt_errno(err, eb, sizeof(eb));
 
         if (rc == 0 && after_is_100 && !after_comp_larger) {
+            if (seen_entry) seen_entry->fail_count = 0;
             memp_taint_remove(repair_pid);
             jp_log("MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=ok",
                    repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb);
         } else {
-            jp_log("MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=retry",
-                   repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb);
+            int n = seen_entry ? ++seen_entry->fail_count : 1;
+            jp_log("MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=retry n=%d",
+                   repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb, n);
         }
         return; /* 修复已执行 sysctl，本轮结束 */
     }
@@ -1775,6 +1780,14 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
 
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
+
+        /* 一次性诊断：记录首个档位 100 且路径包含 /containers/Bundle/Application/ 的进程主二进制判定结果 */
+        static int fg_first_logged = 0;
+        if (!fg_first_logged && cur == 100 && strstr(path, "/containers/Bundle/Application/") != NULL) {
+            fg_first_logged = 1;
+            jp_log("MEMP fg_first pid=%d main=%d path=%s", (int)pid, memp_is_main_app_binary(path), path);
+        }
+
         if (!memp_is_main_app_binary(path)) continue;
 
         const char *app_bid = app_bid_for_path(path);
