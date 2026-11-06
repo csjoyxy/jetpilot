@@ -1941,11 +1941,11 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         if (pid <= 0 || pid == target_pid || cur != 90) continue;
 
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-        if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
+        int have_path = (proc_pidpath(pid, path, sizeof(path)) > 0);
 
         /* 判定是否为 A 类（受保护且目标档位为 90 的用户 App） */
         int is_a = 0;
-        if (strstr(path, "/var/containers/Bundle/Application/")) {
+        if (have_path && strstr(path, "/var/containers/Bundle/Application/")) {
             const char *app_bid = app_bid_for_path(path);
             int32_t prot_target = 0;
             const char *frag = NULL;
