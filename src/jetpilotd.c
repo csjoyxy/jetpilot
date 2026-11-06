@@ -32,7 +32,7 @@
 #include <time.h>
 #include <errno.h>
 #include <stdarg.h>
-/* iOS SDK 没有 libproc.h，手动声明 */
+/* iOS SDK 没有 libproc.h，手动声明 proc_* 函数与 proc_bsdinfo */
 #define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #include <sys/sysctl.h>
@@ -42,7 +42,90 @@ extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #include <notify.h>   /* 锁屏状态：com.apple.springboard.lockstate（libSystem 自带） */
 #include <sys/select.h>
 #include <sys/time.h>
+#include <sys/resource.h>
+#include <dispatch/dispatch.h>
 #include <CoreFoundation/CoreFoundation.h>
+
+/* kern.memorypressure_manual_trigger 相关定义
+ * TEST_LOW_MEMORY_TRIGGER_ONE 来自 xnu-8796.101.5 kern_memorystatus_notify.c */
+#define TEST_LOW_MEMORY_TRIGGER_ONE 1
+
+/* rusage_info_v4 与 proc_pid_rusage 原型声明
+ * struct rusage_info_v4 来自 <sys/resource.h>，iOS SDK 无 libproc.h 手动声明原型 */
+#ifndef RUSAGE_INFO_V4
+#define RUSAGE_INFO_V4 4
+typedef void *rusage_info_t;
+struct rusage_info_v4 {
+    uint8_t  ri_uuid[16];
+    uint64_t ri_user_time;
+    uint64_t ri_system_time;
+    uint64_t ri_pkg_idle_wkups;
+    uint64_t ri_interrupt_wkups;
+    uint64_t ri_pageins;
+    uint64_t ri_wired_size;
+    uint64_t ri_resident_size;
+    uint64_t ri_phys_footprint;
+    uint64_t ri_proc_start_abstime;
+    uint64_t ri_proc_exit_abstime;
+    uint64_t ri_child_user_time;
+    uint64_t ri_child_system_time;
+    uint64_t ri_child_pkg_idle_wkups;
+    uint64_t ri_child_interrupt_wkups;
+    uint64_t ri_child_pageins;
+    uint64_t ri_child_elapsed_abstime;
+    uint64_t ri_diskio_bytesread;
+    uint64_t ri_diskio_byteswritten;
+    uint64_t ri_cpu_time_qos_default;
+    uint64_t ri_cpu_time_qos_maintenance;
+    uint64_t ri_cpu_time_qos_background;
+    uint64_t ri_cpu_time_qos_utility;
+    uint64_t ri_cpu_time_qos_legacy;
+    uint64_t ri_cpu_time_qos_user_initiated;
+    uint64_t ri_cpu_time_qos_user_interactive;
+    uint64_t ri_billed_system_time;
+    uint64_t ri_serviced_system_time;
+    uint64_t ri_logical_writes;
+    uint64_t ri_lifetime_max_phys_footprint;
+    uint64_t ri_instructions;
+    uint64_t ri_cycles;
+    uint64_t ri_billed_energy;
+    uint64_t ri_serviced_energy;
+    uint64_t ri_interval_max_phys_footprint;
+    uint64_t ri_runnable_time;
+};
+#endif
+extern int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);
+
+/* struct proc_bsdinfo 与 proc_pidinfo 原型声明
+ * 用于读取进程启动时间 pbi_start_tvsec / pbi_start_tvusec (xnu-8796.101.5 bsd/sys/proc_info.h) */
+#ifndef _SYS_PROC_INFO_H
+#define PROC_PIDTBSDINFO 3
+struct proc_bsdinfo {
+    uint32_t  pbi_flags;
+    uint32_t  pbi_status;
+    uint32_t  pbi_xstatus;
+    uint32_t  pbi_pid;
+    uint32_t  pbi_ppid;
+    uid_t     pbi_uid;
+    gid_t     pbi_gid;
+    uid_t     pbi_ruid;
+    gid_t     pbi_rgid;
+    uid_t     pbi_svuid;
+    gid_t     pbi_svgid;
+    uint32_t  rfu_1;
+    char      pbi_comm[16];
+    char      pbi_name[32];
+    uint32_t  pbi_nfiles;
+    uint32_t  pbi_pgid;
+    uint32_t  pbi_pjobc;
+    uint32_t  e_tdev;
+    uint32_t  e_tpgid;
+    int32_t   pbi_nice;
+    uint64_t  pbi_start_tvsec;
+    uint64_t  pbi_start_tvusec;
+};
+#endif
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
@@ -76,7 +159,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define FLAG_PATH   CONFIG_DIR "/running.flag"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define PID_PATH    CONFIG_DIR "/daemon.pid"
-#define JP_VERSION   "0.6.0"
+#define JP_VERSION   "0.7.0"
 #define LOG_PATH     CONFIG_DIR "/daemon.log"
 #define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
 #define LOG_MAX_BYTES (256 * 1024)
@@ -610,6 +693,1520 @@ static int wait_lock_change(int secs) {
     return 0;
 }
 
+/* =========================================================================
+ * 前台 App 内存压力触发模块 (v0.7.0)
+ * ========================================================================= */
+
+#define MEMP_CONFIG_PATH   CONFIG_DIR "/mempressure.txt"
+#define MEMP_PENDING_PATH  CONFIG_DIR "/mempressure_pending"
+#define MEMP_STATE_PATH    CONFIG_DIR "/mempressure_state.txt"
+#define MEMP_TAINT_PATH    CONFIG_DIR "/mempressure_taint.txt"
+#define MEMP_FATAL_PATH    CONFIG_DIR "/mempressure_fatal"
+
+#define MEMP_MAX_RULES     32
+#define MEMP_MAX_TAINT     8
+#define MEMP_MAX_YIELD     32
+#define MEMP_DEFAULT_COOLDOWN 600
+#define MEMP_MIN_COOLDOWN     60
+#define MEMP_MAX_COOLDOWN     86400
+#define MEMP_MIN_THR_MB       100
+#define MEMP_DEFAULT_THR_MB   600
+
+typedef enum {
+    MEMP_STATE_OFF = 0,
+    MEMP_STATE_ON,
+    MEMP_STATE_DISABLED,
+    MEMP_STATE_UNSUPPORTED,
+    MEMP_STATE_FATAL
+} memp_state_t;
+
+typedef enum {
+    MEMP_RESET_PENDING_NONE = 0,
+    MEMP_RESET_PENDING_NORMAL,
+    MEMP_RESET_PENDING_MARKER
+} memp_reset_pending_t;
+
+typedef struct {
+    char    frag[256];
+    int32_t thr_mb;       /* 阈值 MB (100 .. memcap) */
+    int     is_bid;       /* 1 = bid: 开头, 0 = 路径片段 */
+    time_t  last_warn_sec;/* CLOCK_MONOTONIC 秒，冷却起点 */
+    time_t  last_skip_sec;/* 上次输出 skip 日志的 CLOCK_MONOTONIC 秒 (限频 60s) */
+} memp_rule_t;
+
+static memp_rule_t g_memp_rules[MEMP_MAX_RULES];
+static int g_nmemp_rules = 0;
+static int g_memp_cooldown = MEMP_DEFAULT_COOLDOWN;
+static int g_memp_cfg_file_absent = 1;
+static int g_memp_cfg_first_load = 1;
+
+static uint64_t g_memp_memcap = 2048;
+static int g_memp_memcap_fallback = 0;
+
+static memp_state_t g_memp_state = MEMP_STATE_OFF;
+static memp_reset_pending_t g_memp_reset_pending = MEMP_RESET_PENDING_NONE;
+static int g_memp_fails = 0;
+static int g_memp_last_errno = 0;
+static char g_memp_fatal_reason[32] = "";
+static char g_memp_unsupported_reason[32] = "";
+
+static int g_memp_reset_retry_count = 0;
+static time_t g_memp_last_reset_retry_time = 0;
+static struct timespec g_memp_warn_monotonic = {0, 0};
+static int g_memp_reset_overdue_logged = 0;
+
+static int g_memp_marker_rm_fail_count = 0;
+static time_t g_memp_last_marker_rm_fail_time = 0;
+
+static int g_memp_level_first_logged = 0;
+
+/* 观察槽（§八） */
+typedef struct {
+    int      valid;
+    char     frag[256];
+    pid_t    pid;
+    uint64_t start_tvsec;
+    uint64_t start_tvusec;
+    time_t   warn_mono_sec;
+    double   fp_before_mb;
+} memp_post_slot_t;
+
+static memp_post_slot_t g_memp_post = {0};
+
+/* 污染表（§五-6） */
+typedef struct {
+    pid_t    pid;
+    uint64_t tvsec;
+    uint64_t tvusec;
+    char     frag[256];
+} memp_taint_entry_t;
+
+static memp_taint_entry_t g_memp_taint[MEMP_MAX_TAINT];
+static int g_memp_ntaint = 0;
+
+/* 修复限频：每个 pid 上次尝试修复的时间（60 秒最多一次） */
+#define MEMP_MAX_REPAIR_SEEN 16
+typedef struct {
+    pid_t  pid;
+    time_t last_repair_sec;
+} memp_repair_seen_t;
+static memp_repair_seen_t g_memp_repair_seen[MEMP_MAX_REPAIR_SEEN];
+static int g_memp_nrepair_seen = 0;
+
+/* 目标识别初次记录（§九 target） */
+#define MEMP_MAX_SEEN_TARGETS 64
+static pid_t g_memp_seen_targets[MEMP_MAX_SEEN_TARGETS];
+static int g_memp_nseen_targets = 0;
+
+/* rusage 失败限频：同一 pid 每 60 秒最多一行 */
+#define MEMP_MAX_RUSAGE_FAIL_SEEN 16
+typedef struct {
+    pid_t  pid;
+    time_t last_fail_sec;
+} memp_rusage_fail_seen_t;
+static memp_rusage_fail_seen_t g_memp_rusage_fail_seen[MEMP_MAX_RUSAGE_FAIL_SEEN];
+static int g_memp_nrusage_fail_seen = 0;
+
+/* 修复跳过限频：同一 pid 每 60 秒最多一行 */
+#define MEMP_MAX_REPAIR_SKIP_SEEN 16
+typedef struct {
+    pid_t  pid;
+    time_t last_fail_sec;
+} memp_repair_skip_seen_t;
+static memp_repair_skip_seen_t g_memp_repair_skip_seen[MEMP_MAX_REPAIR_SKIP_SEEN];
+static int g_memp_nrepair_skip_seen = 0;
+
+static void memp_log_repair_skip_fp_fail(pid_t pid, time_t now_sec) {
+    for (int i = 0; i < g_memp_nrepair_skip_seen; i++) {
+        if (g_memp_repair_skip_seen[i].pid == pid) {
+            if (now_sec - g_memp_repair_skip_seen[i].last_fail_sec < 60) {
+                return;
+            }
+            g_memp_repair_skip_seen[i].last_fail_sec = now_sec;
+            jp_log("MEMP repair_skip reason=fp_fail pid=%d", (int)pid);
+            return;
+        }
+    }
+    int idx = 0;
+    if (g_memp_nrepair_skip_seen < MEMP_MAX_REPAIR_SKIP_SEEN) {
+        idx = g_memp_nrepair_skip_seen++;
+    } else {
+        idx = 0;
+    }
+    g_memp_repair_skip_seen[idx].pid = pid;
+    g_memp_repair_skip_seen[idx].last_fail_sec = now_sec;
+    jp_log("MEMP repair_skip reason=fp_fail pid=%d", (int)pid);
+}
+
+/* 让位记录项 */
+typedef struct {
+    pid_t    pid;
+    uint64_t tvsec;
+    uint64_t tvusec;
+} memp_yielded_entry_t;
+
+/* 格式化 errno: 0 -> 0(-)，非0 -> <n>(<strerror>) */
+static void memp_fmt_errno(int err, char *buf, size_t sz) {
+    if (err == 0) {
+        snprintf(buf, sz, "0(-)");
+    } else {
+        const char *s = strerror(err);
+        snprintf(buf, sz, "%d(%s)", err, s ? s : "unknown");
+    }
+}
+
+/* 设档封装：内部使用 MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES 与 set_priority() 一致，
+ * 但不更新 g_set_fail_total、g_last_err_* 等全局错误统计 */
+static int mp_set_band(pid_t pid, int32_t band) {
+    memorystatus_priority_properties_t props = { band, 0 };
+    int rc = memorystatus_control(MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES,
+                                  pid, 0, &props, sizeof(props));
+    if (rc != 0) return errno != 0 ? errno : -1;
+    return 0;
+}
+
+/* 获取进程启动时间 (秒与微秒) */
+static int memp_get_process_start_time(pid_t pid, uint64_t *sec_out, uint64_t *usec_out) {
+    struct proc_bsdinfo bi;
+    memset(&bi, 0, sizeof(bi));
+    int ret = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi));
+    if (ret == (int)sizeof(bi)) {
+        if (sec_out) *sec_out = bi.pbi_start_tvsec;
+        if (usec_out) *usec_out = bi.pbi_start_tvusec;
+        return 0;
+    }
+    return -1;
+}
+
+/* 读取进程物理内存 footprint (字节) */
+static int memp_get_phys_footprint(pid_t pid, uint64_t *fp_bytes_out) {
+    struct rusage_info_v4 ri;
+    memset(&ri, 0, sizeof(ri));
+    int rc = proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&ri);
+    if (rc == 0) {
+        if (fp_bytes_out) *fp_bytes_out = ri.ri_phys_footprint;
+        return 0;
+    }
+    return errno != 0 ? errno : -1;
+}
+
+/* 检查是否为主 App 二进制 (路径以 /var/containers/Bundle/Application/ 开头且所在目录以 .app 结尾) */
+static int memp_is_main_app_binary(const char *path) {
+    if (!path) return 0;
+    static const char k[] = "/var/containers/Bundle/Application/";
+    if (strncmp(path, k, sizeof(k) - 1) != 0) return 0;
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash - path < 4) return 0;
+    return (strncmp(slash - 4, ".app", 4) == 0);
+}
+
+/* 读取真实压力级别 */
+static int memp_read_level(int *level_out, int *err_out) {
+    int lvl = 0;
+    size_t sz = sizeof(lvl);
+    int rc = sysctlbyname("kern.memorystatus_vm_pressure_level", &lvl, &sz, NULL, 0);
+    int err = (rc != 0) ? errno : 0;
+    if (!g_memp_level_first_logged) {
+        g_memp_level_first_logged = 1;
+        char eb[128];
+        memp_fmt_errno(err, eb, sizeof(eb));
+        if (rc == 0) {
+            jp_log("MEMP level_first val=%d errno=%s", lvl, eb);
+        } else {
+            jp_log("MEMP level_first val=NA errno=%s", eb);
+        }
+    }
+    if (err_out) *err_out = err;
+    if (rc == 0 && level_out) *level_out = lvl;
+    return rc;
+}
+
+/* 规则匹配：按文件顺序逐条比，取第一条匹配的规则 */
+static memp_rule_t *memp_match_rule(const char *path, const char *app_bid) {
+    for (int i = 0; i < g_nmemp_rules; i++) {
+        if (g_memp_rules[i].is_bid) {
+            if (app_bid && strcmp(app_bid, g_memp_rules[i].frag + 4) == 0) {
+                return &g_memp_rules[i];
+            }
+        } else {
+            if (strstr(path, g_memp_rules[i].frag)) {
+                return &g_memp_rules[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+static void memp_enter_fatal(const char *reason) {
+    g_memp_state = MEMP_STATE_FATAL;
+    strncpy(g_memp_fatal_reason, reason, sizeof(g_memp_fatal_reason) - 1);
+    g_memp_fatal_reason[sizeof(g_memp_fatal_reason) - 1] = '\0';
+    FILE *f = fopen(MEMP_FATAL_PATH, "w");
+    if (f) {
+        fprintf(f, "reason=%s\n", reason);
+        fflush(f);
+        fsync(fileno(f));
+        fclose(f);
+    }
+    jp_log("MEMP fatal reason=%s", reason);
+}
+
+static void memp_enter_unsupported(const char *reason, int err) {
+    g_memp_state = MEMP_STATE_UNSUPPORTED;
+    strncpy(g_memp_unsupported_reason, reason, sizeof(g_memp_unsupported_reason) - 1);
+    g_memp_unsupported_reason[sizeof(g_memp_unsupported_reason) - 1] = '\0';
+    g_memp_last_errno = err;
+    char eb[128];
+    memp_fmt_errno(err, eb, sizeof(eb));
+    jp_log("MEMP unsupported reason=%s errno=%s", reason, eb);
+}
+
+static void memp_enter_reset_pending_normal(int retry_count, struct timespec warn_mono) {
+    g_memp_reset_pending = MEMP_RESET_PENDING_NORMAL;
+    g_memp_reset_retry_count = retry_count;
+    g_memp_warn_monotonic = warn_mono;
+    g_memp_last_reset_retry_time = 0;
+    g_memp_reset_overdue_logged = 0;
+}
+
+static void memp_taint_save(void) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_TAINT_PATH);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    for (int i = 0; i < g_memp_ntaint; i++) {
+        fprintf(f, "%d %llu %llu %s\n", (int)g_memp_taint[i].pid,
+                (unsigned long long)g_memp_taint[i].tvsec,
+                (unsigned long long)g_memp_taint[i].tvusec,
+                g_memp_taint[i].frag);
+    }
+    fflush(f);
+    int serr = fsync(fileno(f));
+    int ferr = ferror(f);
+    fclose(f);
+    if (ferr || serr != 0) {
+        unlink(tmp);
+        return;
+    }
+    rename(tmp, MEMP_TAINT_PATH);
+}
+
+static void memp_taint_remove(pid_t pid) {
+    for (int i = 0; i < g_memp_ntaint; i++) {
+        if (g_memp_taint[i].pid == pid) {
+            for (int j = i; j < g_memp_ntaint - 1; j++) {
+                g_memp_taint[j] = g_memp_taint[j + 1];
+            }
+            g_memp_ntaint--;
+            memp_taint_save();
+            return;
+        }
+    }
+}
+
+static void memp_taint_add(pid_t pid, uint64_t tvsec, uint64_t tvusec, const char *frag, const char *reason) {
+    for (int i = 0; i < g_memp_ntaint; i++) {
+        if (g_memp_taint[i].pid == pid && g_memp_taint[i].tvsec == tvsec && g_memp_taint[i].tvusec == tvusec) {
+            return; /* 已在污染表 */
+        }
+    }
+    if (g_memp_ntaint >= MEMP_MAX_TAINT) {
+        pid_t dropped_pid = g_memp_taint[0].pid;
+        jp_log("MEMP taint_drop pid=%d", (int)dropped_pid);
+        for (int i = 0; i < MEMP_MAX_TAINT - 1; i++) {
+            g_memp_taint[i] = g_memp_taint[i + 1];
+        }
+        g_memp_ntaint = MEMP_MAX_TAINT - 1;
+    }
+    memp_taint_entry_t *e = &g_memp_taint[g_memp_ntaint++];
+    e->pid = pid;
+    e->tvsec = tvsec;
+    e->tvusec = tvusec;
+    strncpy(e->frag, frag ? frag : "", sizeof(e->frag) - 1);
+    e->frag[sizeof(e->frag) - 1] = '\0';
+    jp_log("MEMP taint app=%s pid=%d reason=%s", e->frag, (int)pid, reason);
+    memp_taint_save();
+}
+
+static int memp_is_tainted(pid_t pid, uint64_t tvsec, uint64_t tvusec) {
+    for (int i = 0; i < g_memp_ntaint; i++) {
+        if (g_memp_taint[i].pid == pid) {
+            if (g_memp_taint[i].tvsec == tvsec && g_memp_taint[i].tvusec == tvusec) {
+                return 1;
+            }
+            /* 身份不符：进程已变，自动清理 */
+            memp_taint_remove(pid);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static void memp_taint_load(void) {
+    g_memp_ntaint = 0;
+    FILE *f = fopen(MEMP_TAINT_PATH, "r");
+    if (!f) {
+        if (errno != ENOENT) {
+            char eb[128];
+            memp_fmt_errno(errno, eb, sizeof(eb));
+            jp_log("MEMP taint_load_fail line=- errno=%s", eb);
+        }
+        return;
+    }
+    char line[512];
+    int line_no = 0;
+    int needs_resave = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line_no++;
+        int pid = 0;
+        unsigned long long tvsec = 0, tvusec = 0;
+        char frag[256] = {0};
+        if (sscanf(line, "%d %llu %llu %255s", &pid, &tvsec, &tvusec, frag) != 4) {
+            char eb[128];
+            memp_fmt_errno(0, eb, sizeof(eb));
+            jp_log("MEMP taint_load_fail line=%d errno=%s", line_no, eb);
+            needs_resave = 1;
+            continue;
+        }
+        uint64_t cur_sec = 0, cur_usec = 0;
+        if (memp_get_process_start_time((pid_t)pid, &cur_sec, &cur_usec) == 0 &&
+            cur_sec == tvsec && cur_usec == tvusec) {
+            if (g_memp_ntaint < MEMP_MAX_TAINT) {
+                g_memp_taint[g_memp_ntaint].pid = (pid_t)pid;
+                g_memp_taint[g_memp_ntaint].tvsec = tvsec;
+                g_memp_taint[g_memp_ntaint].tvusec = tvusec;
+                strncpy(g_memp_taint[g_memp_ntaint].frag, frag, sizeof(g_memp_taint[g_memp_ntaint].frag) - 1);
+                g_memp_taint[g_memp_ntaint].frag[sizeof(g_memp_taint[g_memp_ntaint].frag) - 1] = '\0';
+                g_memp_ntaint++;
+            } else {
+                needs_resave = 1;
+            }
+        } else {
+            /* 进程已退出或重启过，丢弃 */
+            needs_resave = 1;
+        }
+    }
+    fclose(f);
+    if (needs_resave) {
+        memp_taint_save();
+    }
+}
+
+static void mempressure_init_memcap(void) {
+    uint64_t memsize = 0;
+    size_t len = sizeof(memsize);
+    int rc = sysctlbyname("hw.memsize", &memsize, &len, NULL, 0);
+    int err = errno;
+    if (rc != 0 || len != sizeof(memsize)) {
+        g_memp_memcap = 2048;
+        g_memp_memcap_fallback = 1;
+        char eb[128];
+        memp_fmt_errno(err, eb, sizeof(eb));
+        jp_log("MEMP memsize_fail errno=%s", eb);
+        return;
+    }
+    uint64_t mb = memsize / (1024ULL * 1024ULL);
+    uint64_t half = mb / 2;
+    if (half < 200) {
+        g_memp_memcap = 2048;
+        g_memp_memcap_fallback = 1;
+        jp_log("MEMP memsize_small bytes=%llu", (unsigned long long)memsize);
+        return;
+    }
+    g_memp_memcap = half;
+    g_memp_memcap_fallback = 0;
+}
+
+static void memp_check_fatal_persist(void) {
+    if (access(MEMP_FATAL_PATH, F_OK) != 0) return;
+    FILE *f = fopen(MEMP_FATAL_PATH, "r");
+    if (!f) return;
+    char line[128] = {0};
+    char reason[32] = "einval";
+    if (fgets(line, sizeof(line), f)) {
+        sscanf(line, "reason=%31s", reason);
+    }
+    fclose(f);
+    g_memp_state = MEMP_STATE_FATAL;
+    strncpy(g_memp_fatal_reason, reason, sizeof(g_memp_fatal_reason) - 1);
+    g_memp_fatal_reason[sizeof(g_memp_fatal_reason) - 1] = '\0';
+    jp_log("MEMP fatal_persist reason=%s", reason);
+}
+
+static void memp_check_boot_reset(void) {
+    if (access(MEMP_PENDING_PATH, F_OK) != 0) return;
+    FILE *f = fopen(MEMP_PENDING_PATH, "r");
+    if (!f) return;
+    int pid = 0;
+    unsigned long long tvsec = 0, tvusec = 0;
+    char frag[256] = {0};
+    int n = fscanf(f, "%d %llu %llu %255s", &pid, &tvsec, &tvusec, frag);
+    fclose(f);
+    if (n < 4) {
+        unlink(MEMP_PENDING_PATH);
+        return;
+    }
+
+    int v = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
+    int rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &v, sizeof(int));
+    int err = (rc != 0) ? errno : 0;
+    char eb[128];
+    memp_fmt_errno(err, eb, sizeof(eb));
+    jp_log("MEMP boot_reset ret=%d errno=%s", rc, eb);
+
+    if (rc == 0) {
+        unlink(MEMP_PENDING_PATH);
+        memp_taint_add((pid_t)pid, tvsec, tvusec, frag, "boot");
+    } else if (err == EINVAL) {
+        memp_enter_fatal("einval");
+    } else if (err == ENOENT || err == EPERM) {
+        unlink(MEMP_PENDING_PATH);
+        memp_enter_unsupported("trigger", err);
+    } else {
+        memp_taint_add((pid_t)pid, tvsec, tvusec, frag, "boot");
+        struct timespec mono;
+        clock_gettime(CLOCK_MONOTONIC, &mono);
+        memp_enter_reset_pending_normal(0, mono);
+    }
+}
+
+static void mempressure_init(void) {
+    mempressure_init_memcap();
+    memp_check_fatal_persist();
+    if (g_memp_state != MEMP_STATE_FATAL) {
+        memp_taint_load();
+        memp_check_boot_reset();
+    }
+}
+
+static void mempressure_write_state(void) {
+    const char *state_str = "off";
+    const char *reason_str = "-";
+
+    if (g_memp_state == MEMP_STATE_FATAL) {
+        state_str = "fatal";
+        reason_str = g_memp_fatal_reason[0] ? g_memp_fatal_reason : "einval";
+    } else if (g_memp_state == MEMP_STATE_UNSUPPORTED) {
+        state_str = "unsupported";
+        reason_str = g_memp_unsupported_reason[0] ? g_memp_unsupported_reason : "trigger";
+    } else if (g_memp_reset_pending == MEMP_RESET_PENDING_NORMAL) {
+        state_str = "reset_pending_normal";
+    } else if (g_memp_reset_pending == MEMP_RESET_PENDING_MARKER) {
+        state_str = "reset_pending_marker";
+    } else if (g_memp_state == MEMP_STATE_DISABLED) {
+        state_str = "disabled";
+    } else if (g_nmemp_rules == 0 || g_memp_cfg_file_absent) {
+        state_str = "off";
+    } else {
+        state_str = "on";
+    }
+
+    char line[256];
+    snprintf(line, sizeof(line), "state=%s fails=%d last_errno=%d reason=%s tainted=%d\n",
+             state_str, g_memp_fails, g_memp_last_errno, reason_str, g_memp_ntaint);
+
+    static char s_last_line[256] = "";
+    if (strcmp(line, s_last_line) == 0) return; /* 内容无变化不写 */
+
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_STATE_PATH);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fputs(line, f);
+    fflush(f);
+    int werr = ferror(f);
+    fclose(f);
+    if (werr) { unlink(tmp); return; }
+    if (rename(tmp, MEMP_STATE_PATH) == 0) {
+        strncpy(s_last_line, line, sizeof(s_last_line) - 1);
+        s_last_line[sizeof(s_last_line) - 1] = '\0';
+    } else {
+        unlink(tmp);
+    }
+}
+
+static void memp_restore_yielded(memp_yielded_entry_t *yielded, int nyielded,
+                                 memorystatus_priority_entry_t *latest_list, int nlatest,
+                                 int *ok_out, int *moved_out, int *gone_out, int *rfail_out) {
+    int ok = 0, moved = 0, gone = 0, rfail = 0;
+    for (int i = 0; i < nyielded; i++) {
+        uint64_t cur_sec = 0, cur_usec = 0;
+        if (memp_get_process_start_time(yielded[i].pid, &cur_sec, &cur_usec) != 0 ||
+            cur_sec != yielded[i].tvsec || cur_usec != yielded[i].tvusec) {
+            gone++;
+            continue;
+        }
+        int cur_band = -1;
+        int found = 0;
+        if (latest_list) {
+            for (int j = 0; j < nlatest; j++) {
+                if (latest_list[j].pid == yielded[i].pid) {
+                    cur_band = latest_list[j].priority;
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        if (!found || cur_band != 80) {
+            moved++;
+            continue;
+        }
+        int err = mp_set_band(yielded[i].pid, 90);
+        if (err == 0) {
+            ok++;
+        } else {
+            rfail++;
+            char eb[128];
+            memp_fmt_errno(err, eb, sizeof(eb));
+            jp_log("MEMP restore_fail pid=%d errno=%s", (int)yielded[i].pid, eb);
+        }
+    }
+    if (ok_out) *ok_out = ok;
+    if (moved_out) *moved_out = moved;
+    if (gone_out) *gone_out = gone;
+    if (rfail_out) *rfail_out = rfail;
+}
+
+static void memp_format_comp(memorystatus_priority_entry_t *list, int count, pid_t target_pid, char *buf, size_t sz) {
+    buf[0] = '\0';
+    size_t len = 0;
+    int first = 1;
+    for (int i = 0; i < count; i++) {
+        if (list[i].pid <= 0 || list[i].pid == target_pid) continue;
+        if (list[i].priority == 90 || list[i].priority == 100) {
+            uint64_t fp_bytes = 0;
+            int rerr = memp_get_phys_footprint(list[i].pid, &fp_bytes);
+            char item[64];
+            if (rerr == 0) {
+                snprintf(item, sizeof(item), "%s%d:%d:%.1f", first ? "" : ",",
+                         (int)list[i].pid, (int)list[i].priority, (double)fp_bytes / (1024.0 * 1024.0));
+            } else {
+                snprintf(item, sizeof(item), "%s%d:%d:NA", first ? "" : ",",
+                         (int)list[i].pid, (int)list[i].priority);
+            }
+            first = 0;
+            size_t ilen = strlen(item);
+            if (len + ilen < sz - 1) {
+                strcat(buf, item);
+                len += ilen;
+            } else {
+                break;
+            }
+        }
+    }
+    if (first) {
+        snprintf(buf, sz, "-");
+    }
+}
+
+static void memp_log_skip(memp_rule_t *rule, pid_t pid, double fp_mb, int thr_mb,
+                          const char *reason, int yielded, int err, const char *comp_str,
+                          int ok, int moved, int gone, int rfail) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (rule && rule->last_skip_sec > 0 && now.tv_sec - rule->last_skip_sec < 60) {
+        return; /* 同一规则每 60 秒最多一行 */
+    }
+    if (rule) {
+        rule->last_skip_sec = now.tv_sec;
+    }
+
+    char eb[128];
+    if (strcmp(reason, "yield_fail") == 0 || strcmp(reason, "marker_fail") == 0) {
+        memp_fmt_errno(err, eb, sizeof(eb));
+    } else {
+        snprintf(eb, sizeof(eb), "0(-)");
+        ok = moved = gone = rfail = 0;
+    }
+
+    jp_log("MEMP skip app=%s pid=%d fp=%.1f thr=%d reason=%s yielded=%d errno=%s comp=%s restored=ok:%d,moved:%d,gone:%d,rfail:%d",
+           rule ? rule->frag : "-", (int)pid, fp_mb, thr_mb, reason, yielded, eb,
+           (comp_str && comp_str[0]) ? comp_str : "-", ok, moved, gone, rfail);
+}
+
+static void memp_post_check(void) {
+    if (!g_memp_post.valid) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - g_memp_post.warn_mono_sec < 30) return;
+
+    long dt = (long)(now.tv_sec - g_memp_post.warn_mono_sec);
+    char fp_post30_buf[64] = "gone";
+
+    uint64_t cur_sec = 0, cur_usec = 0;
+    if (memp_get_process_start_time(g_memp_post.pid, &cur_sec, &cur_usec) == 0 &&
+        cur_sec == g_memp_post.start_tvsec && cur_usec == g_memp_post.start_tvusec) {
+        uint64_t fp_bytes = 0;
+        int rerr = memp_get_phys_footprint(g_memp_post.pid, &fp_bytes);
+        if (rerr == 0) {
+            snprintf(fp_post30_buf, sizeof(fp_post30_buf), "%.1f", (double)fp_bytes / (1024.0 * 1024.0));
+        } else {
+            snprintf(fp_post30_buf, sizeof(fp_post30_buf), "NA:%d", rerr);
+        }
+    }
+
+    jp_log("MEMP post app=%s pid=%d fp_before=%.1f fp_post30=%s dt=%ld",
+           g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb, fp_post30_buf, dt);
+    g_memp_post.valid = 0;
+}
+
+static void memp_post_register(const char *frag, pid_t pid, uint64_t tvsec, uint64_t tvusec, time_t warn_sec, double fp_before_mb) {
+    if (g_memp_post.valid) {
+        long dt = (long)(warn_sec - g_memp_post.warn_mono_sec);
+        jp_log("MEMP post app=%s pid=%d fp_before=%.1f fp_post30=dropped dt=%ld",
+               g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb, dt);
+    }
+    g_memp_post.valid = 1;
+    strncpy(g_memp_post.frag, frag ? frag : "", sizeof(g_memp_post.frag) - 1);
+    g_memp_post.frag[sizeof(g_memp_post.frag) - 1] = '\0';
+    g_memp_post.pid = pid;
+    g_memp_post.start_tvsec = tvsec;
+    g_memp_post.start_tvusec = tvusec;
+    g_memp_post.warn_mono_sec = warn_sec;
+    g_memp_post.fp_before_mb = fp_before_mb;
+}
+
+static int mempressure_load_config(void) {
+    FILE *f = fopen(MEMP_CONFIG_PATH, "r");
+    int file_absent = (f == NULL);
+    int new_cooldown = MEMP_DEFAULT_COOLDOWN;
+    memp_rule_t parsed_rules[MEMP_MAX_RULES];
+    int nparsed = 0;
+
+    if (f) {
+        char line[512];
+        int line_no = 0;
+        while (fgets(line, sizeof(line), f)) {
+            line_no++;
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#' || *p == '\n' || *p == '\0') continue;
+
+            /* 去除末尾换行 */
+            char raw_text[512];
+            strncpy(raw_text, p, sizeof(raw_text) - 1);
+            raw_text[sizeof(raw_text) - 1] = '\0';
+            char *nl = strchr(raw_text, '\n');
+            if (nl) *nl = '\0';
+            char *cr = strchr(raw_text, '\r');
+            if (cr) *cr = '\0';
+
+            char tok1[256] = {0}, tok2[256] = {0}, tok3[256] = {0};
+            int ntokens = sscanf(p, "%255s %255s %255s", tok1, tok2, tok3);
+            if (ntokens <= 0) continue;
+
+            if (strcmp(tok1, "cooldown") == 0) {
+                if (ntokens != 2) {
+                    jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    continue;
+                }
+                char *endp = NULL;
+                long cd = strtol(tok2, &endp, 10);
+                if (!endp || *endp != '\0' || cd < MEMP_MIN_COOLDOWN || cd > MEMP_MAX_COOLDOWN) {
+                    jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    continue;
+                }
+                new_cooldown = (int)cd;
+            } else {
+                /* 规则行 */
+                if (ntokens > 2) {
+                    jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    continue;
+                }
+                if (nparsed >= MEMP_MAX_RULES) {
+                    jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    continue;
+                }
+                /* 检查片段重复 */
+                int duplicate = 0;
+                for (int i = 0; i < nparsed; i++) {
+                    if (strcmp(parsed_rules[i].frag, tok1) == 0) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (duplicate) {
+                    jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    continue;
+                }
+                int thr = MEMP_DEFAULT_THR_MB;
+                if (ntokens == 2) {
+                    char *endp = NULL;
+                    long val = strtol(tok2, &endp, 10);
+                    if (!endp || *endp != '\0' || val < MEMP_MIN_THR_MB || (uint64_t)val > g_memp_memcap) {
+                        jp_log("MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                        continue;
+                    }
+                    thr = (int)val;
+                }
+                memp_rule_t *r = &parsed_rules[nparsed++];
+                strncpy(r->frag, tok1, sizeof(r->frag) - 1);
+                r->frag[sizeof(r->frag) - 1] = '\0';
+                r->thr_mb = thr;
+                r->is_bid = (strncmp(tok1, "bid:", 4) == 0);
+                r->last_warn_sec = 0;
+                r->last_skip_sec = 0;
+            }
+        }
+        fclose(f);
+    }
+
+    /* 检查配置是否有变 */
+    int changed = 0;
+    if (g_memp_cfg_first_load) {
+        changed = 1;
+        g_memp_cfg_first_load = 0;
+    } else if (file_absent != g_memp_cfg_file_absent) {
+        changed = 1;
+    } else if (new_cooldown != g_memp_cooldown) {
+        changed = 1;
+    } else if (nparsed != g_nmemp_rules) {
+        changed = 1;
+    } else {
+        for (int i = 0; i < nparsed; i++) {
+            if (strcmp(parsed_rules[i].frag, g_memp_rules[i].frag) != 0 ||
+                parsed_rules[i].thr_mb != g_memp_rules[i].thr_mb) {
+                changed = 1;
+                break;
+            }
+        }
+    }
+
+    if (changed) {
+        char cap_str[64];
+        if (g_memp_memcap_fallback) {
+            snprintf(cap_str, sizeof(cap_str), "2048(fallback)");
+        } else {
+            snprintf(cap_str, sizeof(cap_str), "%llu", (unsigned long long)g_memp_memcap);
+        }
+        jp_log("MEMP cfg rules=%d cooldown=%d file=%s memcap=%s",
+               nparsed, new_cooldown, file_absent ? "absent" : "ok", cap_str);
+
+        /* 继承相同片段的冷却状态 */
+        for (int i = 0; i < nparsed; i++) {
+            for (int j = 0; j < g_nmemp_rules; j++) {
+                if (strcmp(parsed_rules[i].frag, g_memp_rules[j].frag) == 0) {
+                    parsed_rules[i].last_warn_sec = g_memp_rules[j].last_warn_sec;
+                    parsed_rules[i].last_skip_sec = g_memp_rules[j].last_skip_sec;
+                    break;
+                }
+            }
+        }
+        memcpy(g_memp_rules, parsed_rules, sizeof(memp_rule_t) * nparsed);
+        g_nmemp_rules = nparsed;
+        g_memp_cooldown = new_cooldown;
+        g_memp_cfg_file_absent = file_absent;
+    }
+
+    return file_absent ? -1 : 0;
+}
+
+static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
+    /* 1. 每一轮开头检查观察槽（§八） */
+    memp_post_check();
+
+    /* 2. 重新加载配置（§四） */
+    mempressure_load_config();
+
+    /* 3. 检查 fatal 状态 */
+    if (g_memp_state == MEMP_STATE_FATAL) return;
+
+    /* 4. §五-1a 第一件事：复位处理 (reset_pending) */
+    if (g_memp_reset_pending == MEMP_RESET_PENDING_MARKER) {
+        if (unlink(MEMP_PENDING_PATH) == 0 || errno == ENOENT) {
+            g_memp_reset_pending = MEMP_RESET_PENDING_NONE;
+            g_memp_marker_rm_fail_count = 0;
+        } else {
+            int err = errno;
+            g_memp_marker_rm_fail_count++;
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            if (g_memp_last_marker_rm_fail_time == 0 || now.tv_sec - g_memp_last_marker_rm_fail_time >= 60) {
+                g_memp_last_marker_rm_fail_time = now.tv_sec;
+                char eb[128];
+                memp_fmt_errno(err, eb, sizeof(eb));
+                jp_log("MEMP marker_rm_fail n=%d errno=%s", g_memp_marker_rm_fail_count, eb);
+            }
+        }
+        return;
+    }
+
+    if (g_memp_reset_pending == MEMP_RESET_PENDING_NORMAL) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        long secs_since_warn = (long)(now.tv_sec - g_memp_warn_monotonic.tv_sec);
+        if (secs_since_warn >= 600 && !g_memp_reset_overdue_logged) {
+            g_memp_reset_overdue_logged = 1;
+            jp_log("MEMP reset_overdue secs=%ld", secs_since_warn);
+        }
+        g_memp_reset_retry_count++;
+        int v = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
+        int rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &v, sizeof(int));
+        int err = (rc != 0) ? errno : 0;
+        if (rc == 0) {
+            if (unlink(MEMP_PENDING_PATH) == 0 || errno == ENOENT) {
+                g_memp_reset_pending = MEMP_RESET_PENDING_NONE;
+                g_memp_reset_retry_count = 0;
+            } else {
+                g_memp_reset_pending = MEMP_RESET_PENDING_MARKER;
+                g_memp_marker_rm_fail_count = 1;
+                g_memp_last_marker_rm_fail_time = now.tv_sec;
+                char eb[128];
+                memp_fmt_errno(errno, eb, sizeof(eb));
+                jp_log("MEMP marker_rm_fail n=1 errno=%s", eb);
+            }
+        } else if (err == EINVAL) {
+            memp_enter_fatal("einval");
+        } else if (err == ENOENT || err == EPERM) {
+            memp_enter_fatal("unreachable");
+        } else {
+            if (g_memp_last_reset_retry_time == 0 || now.tv_sec - g_memp_last_reset_retry_time >= 60) {
+                g_memp_last_reset_retry_time = now.tv_sec;
+                char eb[128];
+                memp_fmt_errno(err, eb, sizeof(eb));
+                jp_log("MEMP reset_retry n=%d ret=%d errno=%s", g_memp_reset_retry_count, rc, eb);
+            }
+        }
+        return;
+    }
+
+    /* 检查停用与配置有效性 */
+    if (g_memp_state == MEMP_STATE_UNSUPPORTED || g_memp_state == MEMP_STATE_DISABLED) return;
+    if (g_nmemp_rules == 0 || g_memp_cfg_file_absent) return;
+    if (g_locked) return;
+    if (!list || count <= 0) return;
+
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+
+    /* 5. §五-1a 第二件事：修复（§五-6） */
+    pid_t repair_pid = 0;
+    uint64_t repair_max_fp = 0;
+    memp_rule_t *repair_rule = NULL;
+    int repair_fp_fail_skipped = 0;
+
+    for (int i = 0; i < count; i++) {
+        pid_t pid = list[i].pid;
+        int32_t cur = list[i].priority;
+        if (pid <= 0 || cur != 100) continue;
+
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
+        if (!memp_is_main_app_binary(path)) continue;
+
+        const char *app_bid = app_bid_for_path(path);
+        memp_rule_t *rule = memp_match_rule(path, app_bid);
+        if (!rule) continue;
+
+        uint64_t sec = 0, usec = 0;
+        if (memp_get_process_start_time(pid, &sec, &usec) != 0) continue;
+        if (!memp_is_tainted(pid, sec, usec)) continue;
+
+        /* 修复限频：同一进程每 60 秒最多一次 */
+        int recent_repair = 0;
+        for (int r = 0; r < g_memp_nrepair_seen; r++) {
+            if (g_memp_repair_seen[r].pid == pid) {
+                if (now_ts.tv_sec - g_memp_repair_seen[r].last_repair_sec < 60) {
+                    recent_repair = 1;
+                }
+                break;
+            }
+        }
+        if (recent_repair) continue;
+
+        uint64_t fp = 0;
+        if (memp_get_phys_footprint(pid, &fp) != 0) {
+            memp_log_repair_skip_fp_fail(pid, now_ts.tv_sec);
+            repair_fp_fail_skipped = 1;
+            continue;
+        }
+        if (repair_pid == 0 || fp > repair_max_fp) {
+            repair_pid = pid;
+            repair_max_fp = fp;
+            repair_rule = rule;
+        }
+    }
+
+    if (repair_fp_fail_skipped) {
+        return;
+    }
+
+    if (repair_pid > 0) {
+        /* 更新该 pid 的修复限频计时 */
+        int found_seen = 0;
+        for (int r = 0; r < g_memp_nrepair_seen; r++) {
+            if (g_memp_repair_seen[r].pid == repair_pid) {
+                g_memp_repair_seen[r].last_repair_sec = now_ts.tv_sec;
+                found_seen = 1;
+                break;
+            }
+        }
+        if (!found_seen) {
+            if (g_memp_nrepair_seen < MEMP_MAX_REPAIR_SEEN) {
+                g_memp_repair_seen[g_memp_nrepair_seen].pid = repair_pid;
+                g_memp_repair_seen[g_memp_nrepair_seen].last_repair_sec = now_ts.tv_sec;
+                g_memp_nrepair_seen++;
+            } else {
+                g_memp_repair_seen[0].pid = repair_pid;
+                g_memp_repair_seen[0].last_repair_sec = now_ts.tv_sec;
+            }
+        }
+
+        /* 检查真实级别 */
+        int lvl = 0, lerr = 0;
+        int lrc = memp_read_level(&lvl, &lerr);
+        if (lrc != 0) {
+            if (lerr == ENOENT || lerr == EPERM) {
+                memp_enter_unsupported("level", lerr);
+            }
+            return;
+        }
+        if (lvl != 1) return; /* 非 Normal，跳过修复 */
+
+        /* 修复第 1 步：取表确认 T 仍是 100 且无其他 100 档进程 footprint >= T */
+        int rcount1 = 0;
+        memorystatus_priority_entry_t *rlist1 = get_list(&rcount1);
+        int t_is_100 = 0;
+        int comp_has_larger = 0;
+        if (rlist1) {
+            for (int i = 0; i < rcount1; i++) {
+                if (rlist1[i].pid == repair_pid && rlist1[i].priority == 100) {
+                    t_is_100 = 1;
+                    break;
+                }
+            }
+            if (t_is_100) {
+                for (int i = 0; i < rcount1; i++) {
+                    if (rlist1[i].pid <= 0 || rlist1[i].pid == repair_pid) continue;
+                    if (rlist1[i].priority == 100) {
+                        uint64_t cfp = 0;
+                        if (memp_get_phys_footprint(rlist1[i].pid, &cfp) != 0 || cfp >= repair_max_fp) {
+                            comp_has_larger = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        char comp_buf[256] = "-";
+        if (rlist1) {
+            memp_format_comp(rlist1, rcount1, repair_pid, comp_buf, sizeof(comp_buf));
+        }
+
+        if (!t_is_100 || comp_has_larger) {
+            jp_log("MEMP repair app=%s pid=%d band_before=100 band_after=%d comp=%s ret=0 errno=0(-) result=skip",
+                   repair_rule ? repair_rule->frag : "-", (int)repair_pid, t_is_100 ? 100 : 0, comp_buf);
+            if (rlist1) free(rlist1);
+            return;
+        }
+        if (rlist1) free(rlist1);
+
+        /* 修复第 2 步：写一次 NORMAL */
+        int v = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
+        int rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &v, sizeof(int));
+        int err = (rc != 0) ? errno : 0;
+        if (err == EINVAL) {
+            memp_enter_fatal("einval");
+            return;
+        }
+        if (err == ENOENT || err == EPERM) {
+            const char *reason = (err == ENOENT) ? "repair_enoent" : "repair_eperm";
+            memp_enter_unsupported(reason, err);
+            return;
+        }
+
+        /* 修复第 3 步：立即复核 */
+        int rcount2 = 0;
+        memorystatus_priority_entry_t *rlist2 = get_list(&rcount2);
+        int after_is_100 = 0;
+        int after_comp_larger = 0;
+        char band_after_str[32] = "gone";
+        if (rlist2) {
+            for (int i = 0; i < rcount2; i++) {
+                if (rlist2[i].pid == repair_pid) {
+                    snprintf(band_after_str, sizeof(band_after_str), "%d", (int)rlist2[i].priority);
+                    if (rlist2[i].priority == 100) after_is_100 = 1;
+                    break;
+                }
+            }
+            if (after_is_100) {
+                for (int i = 0; i < rcount2; i++) {
+                    if (rlist2[i].pid <= 0 || rlist2[i].pid == repair_pid) continue;
+                    if (rlist2[i].priority == 100) {
+                        uint64_t cfp = 0;
+                        if (memp_get_phys_footprint(rlist2[i].pid, &cfp) != 0 || cfp >= repair_max_fp) {
+                            after_comp_larger = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        char comp_buf2[256] = "-";
+        if (rlist2) {
+            memp_format_comp(rlist2, rcount2, repair_pid, comp_buf2, sizeof(comp_buf2));
+            free(rlist2);
+        }
+
+        char eb[128];
+        memp_fmt_errno(err, eb, sizeof(eb));
+
+        if (rc == 0 && after_is_100 && !after_comp_larger) {
+            memp_taint_remove(repair_pid);
+            jp_log("MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=ok",
+                   repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb);
+        } else {
+            jp_log("MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=retry",
+                   repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb);
+        }
+        return; /* 修复已执行 sysctl，本轮结束 */
+    }
+
+    /* 6. §五-1a 第三件事：触发（§五-1） */
+    pid_t target_pid = 0;
+    uint64_t target_sec = 0, target_usec = 0;
+    uint64_t target_fp_bytes = 0;
+    memp_rule_t *target_rule = NULL;
+
+    for (int i = 0; i < count; i++) {
+        pid_t pid = list[i].pid;
+        int32_t cur = list[i].priority;
+        if (pid <= 0 || cur != 100) continue;
+
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
+        if (!memp_is_main_app_binary(path)) continue;
+
+        const char *app_bid = app_bid_for_path(path);
+        memp_rule_t *rule = memp_match_rule(path, app_bid);
+        if (!rule) continue;
+
+        uint64_t fp_bytes = 0;
+        int rerr = memp_get_phys_footprint(pid, &fp_bytes);
+        if (rerr != 0) {
+            if (rerr != ESRCH) {
+                int recent_fail = 0;
+                for (int fidx = 0; fidx < g_memp_nrusage_fail_seen; fidx++) {
+                    if (g_memp_rusage_fail_seen[fidx].pid == pid) {
+                        if (now_ts.tv_sec - g_memp_rusage_fail_seen[fidx].last_fail_sec < 60) {
+                            recent_fail = 1;
+                        }
+                        break;
+                    }
+                }
+                if (!recent_fail) {
+                    int fidx = 0;
+                    for (; fidx < g_memp_nrusage_fail_seen; fidx++) {
+                        if (g_memp_rusage_fail_seen[fidx].pid == pid) break;
+                    }
+                    if (fidx >= g_memp_nrusage_fail_seen) {
+                        if (g_memp_nrusage_fail_seen < MEMP_MAX_RUSAGE_FAIL_SEEN) {
+                            fidx = g_memp_nrusage_fail_seen++;
+                        } else {
+                            fidx = 0;
+                        }
+                    }
+                    g_memp_rusage_fail_seen[fidx].pid = pid;
+                    g_memp_rusage_fail_seen[fidx].last_fail_sec = now_ts.tv_sec;
+                    char eb[128];
+                    memp_fmt_errno(rerr, eb, sizeof(eb));
+                    jp_log("MEMP rusage_fail pid=%d errno=%s", (int)pid, eb);
+                }
+            }
+            continue;
+        }
+
+        uint64_t thr_bytes = (uint64_t)rule->thr_mb * 1024ULL * 1024ULL;
+        if (fp_bytes <= thr_bytes) continue;
+
+        /* 初次认作目标日志（§九 target） */
+        int seen_target = 0;
+        for (int s = 0; s < g_memp_nseen_targets; s++) {
+            if (g_memp_seen_targets[s] == pid) {
+                seen_target = 1;
+                break;
+            }
+        }
+        if (!seen_target) {
+            if (g_memp_nseen_targets < MEMP_MAX_SEEN_TARGETS) {
+                g_memp_seen_targets[g_memp_nseen_targets++] = pid;
+            } else {
+                g_memp_seen_targets[0] = pid;
+            }
+            jp_log("MEMP target app=%s pid=%d rule=%s path=%s",
+                   rule->frag, (int)pid, rule->frag, path);
+        }
+
+        uint64_t sec = 0, usec = 0;
+        if (memp_get_process_start_time(pid, &sec, &usec) != 0) continue;
+
+        /* 条件 4：目标不在污染表里 */
+        if (memp_is_tainted(pid, sec, usec)) continue;
+
+        /* 条件 5：该规则冷却已过 */
+        if (rule->last_warn_sec > 0 && now_ts.tv_sec - rule->last_warn_sec < g_memp_cooldown) continue;
+
+        /* 同一轮有多个目标超过阈值时，取 footprint 最大的一个 */
+        if (target_pid == 0 || fp_bytes > target_fp_bytes) {
+            target_pid = pid;
+            target_sec = sec;
+            target_usec = usec;
+            target_fp_bytes = fp_bytes;
+            target_rule = rule;
+        }
+    }
+
+    if (target_pid == 0) return;
+
+    double fp_before_mb = (double)target_fp_bytes / (1024.0 * 1024.0);
+
+    /* 条件 6：读真实压力级别 */
+    int lvl = 0, lerr = 0;
+    int lrc = memp_read_level(&lvl, &lerr);
+    if (lrc != 0) {
+        if (lerr == ENOENT || lerr == EPERM) {
+            memp_enter_unsupported("level", lerr);
+        } else {
+            memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
+                          "level_unread", 0, 0, "-", 0, 0, 0, 0);
+        }
+        return;
+    }
+    if (lvl != 1) {
+        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
+                      "real_pressure", 0, 0, "-", 0, 0, 0, 0);
+        return;
+    }
+
+    /* 条件 7 & §五-2 步骤 2：让位（§三-3） */
+    memp_yielded_entry_t yield_candidates[MEMP_MAX_YIELD + 1];
+    int k = 0;
+    for (int i = 0; i < count; i++) {
+        pid_t pid = list[i].pid;
+        int32_t cur = list[i].priority;
+        if (pid <= 0 || pid == target_pid || cur != 90) continue;
+
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
+        if (!strstr(path, "/var/containers/Bundle/Application/")) continue;
+
+        const char *app_bid = app_bid_for_path(path);
+        int32_t prot_target = 0;
+        const char *frag = NULL;
+        if (path_matches(path, app_bid, g_protect, g_nprotect, &prot_target, &frag)) {
+            if (prot_target == 90) {
+                if (k < MEMP_MAX_YIELD) {
+                    yield_candidates[k].pid = pid;
+                    k++;
+                } else {
+                    k++; /* 溢出标记 */
+                }
+            }
+        }
+    }
+
+    if (k > MEMP_MAX_YIELD) {
+        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
+                      "yield_full", 0, 0, "-", 0, 0, 0, 0);
+        return;
+    }
+
+    /* 逐个读启动时间 */
+    for (int i = 0; i < k; i++) {
+        if (memp_get_process_start_time(yield_candidates[i].pid,
+                                        &yield_candidates[i].tvsec,
+                                        &yield_candidates[i].tvusec) != 0) {
+            memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
+                          "yield_nostart", 0, 0, "-", 0, 0, 0, 0);
+            return;
+        }
+    }
+
+    /* 逐个设为 80 */
+    memp_yielded_entry_t yielded[MEMP_MAX_YIELD];
+    int nyielded = 0;
+    int yield_failed = 0;
+    int yield_fail_err = 0;
+    for (int i = 0; i < k; i++) {
+        int err = mp_set_band(yield_candidates[i].pid, 80);
+        if (err == 0) {
+            yielded[nyielded++] = yield_candidates[i];
+        } else {
+            yield_failed = 1;
+            yield_fail_err = err;
+            break;
+        }
+    }
+
+    if (yield_failed) {
+        int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
+        memp_restore_yielded(yielded, nyielded, list, count, &r_ok, &r_moved, &r_gone, &r_rfail);
+        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
+                      "yield_fail", nyielded, yield_fail_err, "-", r_ok, r_moved, r_gone, r_rfail);
+        return;
+    }
+
+    /* 条件 7 & §五-2 步骤 3：门控（§三-4） */
+    struct timespec gate_start;
+    clock_gettime(CLOCK_MONOTONIC, &gate_start);
+    int gate_count = 0;
+    memorystatus_priority_entry_t *gate_list = get_list(&gate_count);
+
+    const char *gate_reason = NULL;
+    int fg_others = 0;
+    if (!gate_list) {
+        gate_reason = "comp_unread";
+    } else {
+        int t_found_in_100 = 0;
+        for (int i = 0; i < gate_count; i++) {
+            if (gate_list[i].pid == target_pid) {
+                if (gate_list[i].priority == 100) t_found_in_100 = 1;
+                break;
+            }
+        }
+        if (!t_found_in_100) {
+            gate_reason = "fg_lost";
+        } else {
+            for (int i = 0; i < gate_count; i++) {
+                pid_t cpid = gate_list[i].pid;
+                int32_t cband = gate_list[i].priority;
+                if (cpid <= 0 || cpid == target_pid) continue;
+
+                if (cband == 90) {
+                    gate_reason = "comp90";
+                    break;
+                }
+                if (cband == 100) {
+                    fg_others++;
+                    uint64_t cfp = 0;
+                    if (memp_get_phys_footprint(cpid, &cfp) != 0) {
+                        gate_reason = "comp_unread";
+                        break;
+                    }
+                    if (cfp >= target_fp_bytes) {
+                        gate_reason = "comp100";
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (gate_reason != NULL) {
+        int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
+        memp_restore_yielded(yielded, nyielded, gate_list, gate_count, &r_ok, &r_moved, &r_gone, &r_rfail);
+        char comp_buf[256] = "-";
+        if (gate_list) memp_format_comp(gate_list, gate_count, target_pid, comp_buf, sizeof(comp_buf));
+        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
+                      gate_reason, nyielded, 0, comp_buf, r_ok, r_moved, r_gone, r_rfail);
+        if (gate_list) free(gate_list);
+        return;
+    }
+
+    /* 门控通过！执行触发序列 (§五-2 步骤 4–14) */
+    /* 步骤 4：写崩溃标记 */
+    char marker_line[512];
+    snprintf(marker_line, sizeof(marker_line), "%d %llu %llu %s\n",
+             (int)target_pid, (unsigned long long)target_sec, (unsigned long long)target_usec, target_rule->frag);
+    FILE *mf = fopen(MEMP_PENDING_PATH, "w");
+    int marker_err = 0;
+    if (!mf) {
+        marker_err = errno != 0 ? errno : -1;
+    } else {
+        fputs(marker_line, mf);
+        fflush(mf);
+        if (ferror(mf) || fsync(fileno(mf)) != 0) marker_err = errno != 0 ? errno : -1;
+        fclose(mf);
+    }
+
+    if (marker_err != 0) {
+        unlink(MEMP_PENDING_PATH);
+        int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
+        memp_restore_yielded(yielded, nyielded, gate_list, gate_count, &r_ok, &r_moved, &r_gone, &r_rfail);
+        char comp_buf[256] = "-";
+        if (gate_list) memp_format_comp(gate_list, gate_count, target_pid, comp_buf, sizeof(comp_buf));
+        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
+                      "marker_fail", nyielded, marker_err, comp_buf, r_ok, r_moved, r_gone, r_rfail);
+        if (gate_list) free(gate_list);
+        return;
+    }
+
+    /* 步骤 5：写 WARN */
+    int wv = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_WARN;
+    int warn_rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &wv, sizeof(int));
+    int warn_err = (warn_rc != 0) ? errno : 0;
+    struct timespec warn_mono;
+    clock_gettime(CLOCK_MONOTONIC, &warn_mono);
+
+    /* 步骤 6：立即复核快照，得到 recheck */
+    int recheck_count = 0;
+    memorystatus_priority_entry_t *recheck_list = get_list(&recheck_count);
+    long gate_ms = (warn_mono.tv_sec - gate_start.tv_sec) * 1000 +
+                   (warn_mono.tv_nsec - gate_start.tv_nsec) / 1000000;
+    if (gate_ms < 0) gate_ms = 0;
+
+    int recheck_same = 1;
+    if (!recheck_list || !gate_list) {
+        recheck_same = 0;
+    } else {
+        /* 比对 90/100 pid 集合 */
+        int g90_100[128], ng = 0;
+        int r90_100[128], nr = 0;
+        for (int i = 0; i < gate_count && ng < 128; i++) {
+            if (gate_list[i].priority == 90 || gate_list[i].priority == 100) {
+                g90_100[ng++] = gate_list[i].pid;
+            }
+        }
+        for (int i = 0; i < recheck_count && nr < 128; i++) {
+            if (recheck_list[i].priority == 90 || recheck_list[i].priority == 100) {
+                r90_100[nr++] = recheck_list[i].pid;
+            }
+        }
+        if (ng != nr) {
+            recheck_same = 0;
+        } else {
+            for (int i = 0; i < ng; i++) {
+                int found = 0;
+                for (int j = 0; j < nr; j++) {
+                    if (g90_100[i] == r90_100[j]) { found = 1; break; }
+                }
+                if (!found) { recheck_same = 0; break; }
+            }
+        }
+    }
+    const char *recheck_str = recheck_same ? "same" : "changed";
+
+    char web[128];
+    memp_fmt_errno(warn_err, web, sizeof(web));
+    jp_log("MEMP warn app=%s pid=%d fp_before=%.1f thr=%d yielded=%d fg_others=%d gate_ms=%ld ret=%d errno=%s recheck=%s",
+           target_rule->frag, (int)target_pid, fp_before_mb, target_rule->thr_mb,
+           nyielded, fg_others, gate_ms, warn_rc, web, recheck_str);
+
+    if (gate_list) free(gate_list);
+    if (recheck_list) free(recheck_list);
+
+    /* 步骤 7：等待 5 秒 */
+    int early_stop = 0;
+    for (int s = 0; s < 5; s++) {
+        sleep(1);
+        if (should_stop()) {
+            early_stop = 1;
+            break;
+        }
+    }
+
+    /* 步骤 8：读 fp_after5 */
+    char fp_after5_buf[64] = "gone";
+    uint64_t cur_tsec = 0, cur_tusec = 0;
+    if (memp_get_process_start_time(target_pid, &cur_tsec, &cur_tusec) == 0 &&
+        cur_tsec == target_sec && cur_tusec == target_usec) {
+        uint64_t afp = 0;
+        int rerr = memp_get_phys_footprint(target_pid, &afp);
+        if (rerr == 0) {
+            snprintf(fp_after5_buf, sizeof(fp_after5_buf), "%.1f", (double)afp / (1024.0 * 1024.0));
+        } else {
+            snprintf(fp_after5_buf, sizeof(fp_after5_buf), "NA:%d", rerr);
+        }
+    }
+
+    /* 步骤 9：取档位表得到 band_now，紧接着写 NORMAL */
+    int step9_count = 0;
+    memorystatus_priority_entry_t *step9_list = get_list(&step9_count);
+    int band_now = -1;
+    int found_in_step9 = 0;
+    if (step9_list) {
+        for (int i = 0; i < step9_count; i++) {
+            if (step9_list[i].pid == target_pid) {
+                band_now = step9_list[i].priority;
+                found_in_step9 = 1;
+                break;
+            }
+        }
+    }
+
+    char band_now_buf[32] = "gone";
+    if (found_in_step9) {
+        snprintf(band_now_buf, sizeof(band_now_buf), "%d", band_now);
+    }
+    int stuck = (found_in_step9 && band_now == 100) ? 0 : 1;
+
+    int nv = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
+    int normal_rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &nv, sizeof(int));
+    int normal_err = (normal_rc != 0) ? errno : 0;
+
+    /* 步骤 10：还原让位 */
+    int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
+    memp_restore_yielded(yielded, nyielded, step9_list, step9_count, &r_ok, &r_moved, &r_gone, &r_rfail);
+
+    char neb[128];
+    memp_fmt_errno(normal_err, neb, sizeof(neb));
+    jp_log("MEMP normal app=%s pid=%d fp_after5=%s band_now=%s stuck=%d early_stop=%d ret=%d errno=%s yielded=%d restored=ok:%d,moved:%d,gone:%d,rfail:%d",
+           target_rule->frag, (int)target_pid, fp_after5_buf, band_now_buf, stuck, early_stop,
+           normal_rc, neb, nyielded, r_ok, r_moved, r_gone, r_rfail);
+
+    if (step9_list) free(step9_list);
+
+    /* 步骤 11：错误分类与污染记入 */
+    if (stuck == 1) {
+        memp_taint_add(target_pid, target_sec, target_usec, target_rule->frag, "stuck");
+    }
+    if (normal_rc == -1) {
+        memp_taint_add(target_pid, target_sec, target_usec, target_rule->frag, "normal_fail");
+    }
+    if (strcmp(recheck_str, "changed") == 0) {
+        memp_taint_add(target_pid, target_sec, target_usec, target_rule->frag, "recheck");
+    }
+
+    if (normal_rc == 0) {
+        if (unlink(MEMP_PENDING_PATH) != 0 && errno != ENOENT) {
+            g_memp_reset_pending = MEMP_RESET_PENDING_MARKER;
+            g_memp_marker_rm_fail_count = 1;
+            g_memp_last_marker_rm_fail_time = 0;
+            char meb[128];
+            memp_fmt_errno(errno, meb, sizeof(meb));
+            jp_log("MEMP marker_rm_fail n=1 errno=%s", meb);
+        }
+        g_memp_fails = 0;
+    } else {
+        g_memp_last_errno = normal_err;
+        if (normal_err == EINVAL) {
+            memp_enter_fatal("einval");
+        } else if (warn_rc == 0 || warn_err == EINVAL) {
+            /* WARN 进了测试态 */
+            if (normal_err == ENOENT || normal_err == EPERM) {
+                memp_enter_fatal("unreachable");
+            } else {
+                memp_enter_reset_pending_normal(1, warn_mono);
+                char reb[128];
+                memp_fmt_errno(normal_err, reb, sizeof(reb));
+                jp_log("MEMP reset_retry n=1 ret=%d errno=%s", normal_rc, reb);
+            }
+        } else {
+            /* WARN 没进测试态 */
+            unlink(MEMP_PENDING_PATH);
+            if (warn_err == ENOENT || warn_err == EPERM) {
+                memp_enter_unsupported("trigger", warn_err);
+            }
+        }
+
+        if (warn_rc != 0 || normal_rc != 0) {
+            g_memp_fails++;
+            if (g_memp_fails >= 3 && g_memp_state != MEMP_STATE_UNSUPPORTED && g_memp_state != MEMP_STATE_FATAL) {
+                g_memp_state = MEMP_STATE_DISABLED;
+                char deb[128];
+                memp_fmt_errno(g_memp_last_errno, deb, sizeof(deb));
+                jp_log("MEMP disabled fails=3 last_errno=%s", deb);
+            }
+        }
+    }
+
+    /* 步骤 12：登记 post 观察槽（§八） */
+    memp_post_register(target_rule->frag, target_pid, target_sec, target_usec, warn_mono.tv_sec, fp_before_mb);
+
+    /* 步骤 13：记录冷却起点 */
+    target_rule->last_warn_sec = warn_mono.tv_sec;
+}
+
 int main(void) {
     if (geteuid() != 0) {
         fprintf(stderr, "[JetPilot] 必须以 root 运行\n");
@@ -635,6 +2232,7 @@ int main(void) {
     load_old_targets();  /* 启动时导入旧 status.txt 记录供首轮认领 */
     jp_log("%-6s v%s pid=%d old_records=%d locked=%d",
            "START", JP_VERSION, (int)getpid(), g_nold_targets, g_locked);
+    mempressure_init();  /* 前台 App 内存压力触发初始化 (v0.7.0) */
 
     while (!should_stop()) {
         if (load_config() != 0) { sleep(5); continue; }
@@ -766,12 +2364,16 @@ int main(void) {
                 /* 本轮没走 SKIP：清掉该 pid 的去重项，去重只对连续 SKIP 生效 */
                 if (!skip_this_round) skip_dedup_clear(pid);
             }
+            mempressure_round(list, count);
             free(list);
             applied_prune();
             g_nold_targets = 0;  /* 首轮结束，清空旧记录 */
+        } else {
+            mempressure_round(NULL, 0);
         }
 
         write_status(protected_now, demoted_now, plist, nplist);
+        mempressure_write_state();
 
         if (g_locked) {
             /* 刚锁屏的前两轮用 10 秒间隔，盖住系统降档的窗口；之后 60 秒 */

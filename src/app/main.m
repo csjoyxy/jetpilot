@@ -1,5 +1,5 @@
 /*
- * JetPilot v0.6.0 — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetPilot v0.7.0 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
