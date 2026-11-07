@@ -1,5 +1,5 @@
 /*
- * JetPilot v0.7.2 — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetPilot v0.7.3 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
@@ -805,19 +805,21 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
     }
 
     NSMutableArray<NSString *> *outputLines = [NSMutableArray array];
+    NSMutableArray<JPMemPressureLine *> *outputOwners = [NSMutableArray array];
     for (JPMemPressureLine *l in self.lines) {
+        NSString *out = nil;
         if (l.type == JPMemPressureLineTypeGlobalCooldown) {
             if (self.globalCooldown != self.originalGlobalCooldown || l.isDirty || l.rawText == nil) {
-                [outputLines addObject:[NSString stringWithFormat:@"cooldown %ld", (long)self.globalCooldown]];
+                out = [NSString stringWithFormat:@"cooldown %ld", (long)self.globalCooldown];
             } else {
-                [outputLines addObject:l.rawText];
+                out = l.rawText;
             }
         } else if (l.type == JPMemPressureLineTypeComment || l.type == JPMemPressureLineTypeUnknown) {
-            [outputLines addObject:l.rawText ?: @""];
+            out = l.rawText ?: @"";
         } else if (l.rule) {
             JPMemPressureRule *r = l.rule;
             if (!r.isDirty && !l.isDirty && l.rawText != nil) {
-                [outputLines addObject:l.rawText];
+                out = l.rawText;
             } else {
                 NSMutableString *rLine = [NSMutableString string];
                 if (!r.isEnabled) [rLine appendString:@"#off "];
@@ -829,8 +831,12 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
                 if (r.extraTokensStr.length > 0) {
                     [rLine appendFormat:@" %@", r.extraTokensStr];
                 }
-                [outputLines addObject:rLine];
+                out = rLine;
             }
+        }
+        if (out) {
+            [outputLines addObject:out];
+            [outputOwners addObject:l];
         }
     }
 
@@ -843,7 +849,9 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
     BOOL ok = [outStr writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
     if (ok) {
         self.originalGlobalCooldown = self.globalCooldown;
-        for (JPMemPressureLine *l in self.lines) {
+        for (NSUInteger i = 0; i < outputOwners.count; i++) {
+            JPMemPressureLine *l = outputOwners[i];
+            l.rawText = outputLines[i];
             l.isDirty = NO;
             if (l.rule) l.rule.isDirty = NO;
         }
