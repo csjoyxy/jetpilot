@@ -33,6 +33,7 @@ static NSString *const kStatus     = @"/var/mobile/Library/JetPilot/status.txt";
 static NSString *const kPidFile    = @"/var/mobile/Library/JetPilot/daemon.pid";
 static NSString *const kLogFile    = @"/var/mobile/Library/JetPilot/daemon.log";
 static NSString *const kLogOldFile = @"/var/mobile/Library/JetPilot/daemon.log.1";
+static NSString *const kExportDir  = @"/var/mobile/Library/JetPilot/export";
 
 static NSString *const kMemPressureConfig    = @"/var/mobile/Library/JetPilot/mempressure.txt";
 static NSString *const kMemPressureConfigOff = @"/var/mobile/Library/JetPilot/mempressure.txt.off";
@@ -2168,8 +2169,18 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.tableView.hidden = noAppsAtAll;
 }
 
+- (void)jp_dismissThen:(void (^)(void))then {
+    self.searchController.active = NO;
+    UIViewController *presenter = self.navigationController.presentingViewController;
+    if (presenter) {
+        [presenter dismissViewControllerAnimated:YES completion:then];
+    } else {
+        [self dismissViewControllerAnimated:YES completion:then];
+    }
+}
+
 - (void)cancelTapped {
-    [self dismissViewControllerAnimated:YES completion:nil];
+    [self jp_dismissThen:nil];
 }
 
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
@@ -2260,25 +2271,33 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         if (self.onSelectApp) {
             self.onSelectApp([NSString stringWithFormat:@"bid:%@", bid], app.displayName);
         }
-        [self dismissViewControllerAnimated:YES completion:nil];
+        [self jp_dismissThen:nil];
         return;
     }
 
     if (bid && bid.length > 0) {
-        if (self.onSelectApp) {
-            self.onSelectApp([NSString stringWithFormat:@"bid:%@", bid], app.displayName);
-        }
-        [self dismissViewControllerAnimated:YES completion:nil];
+        NSString *frag = [NSString stringWithFormat:@"bid:%@", bid];
+        NSString *name = app.displayName;
+        void (^callback)(NSString *, NSString *) = self.onSelectApp;
+        [self jp_dismissThen:^{
+            if (callback) {
+                callback(frag, name);
+            }
+        }];
     } else {
         __weak typeof(self) weakSelf = self;
         UIAlertController *warn = [UIAlertController alertControllerWithTitle:@"提示"
                                                                       message:@"这个 App 读不到标识，按目录名匹配，可能会误伤同名 App"
                                                                preferredStyle:UIAlertControllerStyleAlert];
         [warn addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            if (weakSelf.onSelectApp) {
-                weakSelf.onSelectApp(app.pathFragment, app.displayName);
-            }
-            [weakSelf dismissViewControllerAnimated:YES completion:nil];
+            NSString *frag = app.pathFragment;
+            NSString *name = app.displayName;
+            void (^callback)(NSString *, NSString *) = weakSelf.onSelectApp;
+            [weakSelf jp_dismissThen:^{
+                if (callback) {
+                    callback(frag, name);
+                }
+            }];
         }]];
         [warn addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:warn animated:YES completion:nil];
@@ -2299,18 +2318,22 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
                                                                       message:[NSString stringWithFormat:@"该路径片段会同时命中多个 App：%@。确定要继续添加吗？", [matchedNames componentsJoinedByString:@"、"]]
                                                                preferredStyle:UIAlertControllerStyleAlert];
         [warn addAction:[UIAlertAction actionWithTitle:@"继续添加" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            if (weakSelf.onManualAdd) {
-                weakSelf.onManualAdd(text, type, band);
-            }
-            [weakSelf dismissViewControllerAnimated:YES completion:nil];
+            void (^callback)(NSString *, JPRuleType, NSInteger) = weakSelf.onManualAdd;
+            [weakSelf jp_dismissThen:^{
+                if (callback) {
+                    callback(text, type, band);
+                }
+            }];
         }]];
         [warn addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         [self presentViewController:warn animated:YES completion:nil];
     } else {
-        if (weakSelf.onManualAdd) {
-            weakSelf.onManualAdd(text, type, band);
-        }
-        [weakSelf dismissViewControllerAnimated:YES completion:nil];
+        void (^callback)(NSString *, JPRuleType, NSInteger) = self.onManualAdd;
+        [self jp_dismissThen:^{
+            if (callback) {
+                callback(text, type, band);
+            }
+        }];
     }
 }
 
@@ -2957,12 +2980,26 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             }
         }
 
-        // 清理 tmp/ 里旧的 JetPilot-logs-*.zip
-        NSString *tmpDir = NSTemporaryDirectory();
-        NSArray<NSString *> *existingTmp = [fm contentsOfDirectoryAtPath:tmpDir error:nil];
-        for (NSString *fn in existingTmp) {
+        // 检查并创建 export 目录
+        NSString *exportDir = kExportDir;
+        if (![fm fileExistsAtPath:exportDir]) {
+            [fm createDirectoryAtPath:exportDir withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+
+        // 清理 export/ 目录以及 tmp/ 里旧的 JetPilot-logs-*.zip，确保只保留最新 1 个
+        NSArray<NSString *> *existingExport = [fm contentsOfDirectoryAtPath:exportDir error:nil];
+        for (NSString *fn in existingExport) {
             if ([fn hasPrefix:@"JetPilot-logs-"] && [fn hasSuffix:@".zip"]) {
-                [fm removeItemAtPath:[tmpDir stringByAppendingPathComponent:fn] error:nil];
+                [fm removeItemAtPath:[exportDir stringByAppendingPathComponent:fn] error:nil];
+            }
+        }
+        NSString *tmpDir = NSTemporaryDirectory();
+        if (tmpDir) {
+            NSArray<NSString *> *existingTmp = [fm contentsOfDirectoryAtPath:tmpDir error:nil];
+            for (NSString *fn in existingTmp) {
+                if ([fn hasPrefix:@"JetPilot-logs-"] && [fn hasSuffix:@".zip"]) {
+                    [fm removeItemAtPath:[tmpDir stringByAppendingPathComponent:fn] error:nil];
+                }
             }
         }
 
@@ -2970,20 +3007,17 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         df.dateFormat = @"yyyyMMdd-HHmmss";
         NSString *dateStr = [df stringFromDate:[NSDate date]];
         NSString *zipFileName = [NSString stringWithFormat:@"JetPilot-logs-%@-v0.7.4.zip", dateStr];
-        NSString *zipPath = [tmpDir stringByAppendingPathComponent:zipFileName];
+        NSString *zipPath = [exportDir stringByAppendingPathComponent:zipFileName];
 
         NSData *zipData = JPCreateZipArchive(entries);
+        NSError *zipErr = nil;
         BOOL zipOk = NO;
         if (zipData.length > 0) {
-            zipOk = [zipData writeToFile:zipPath atomically:YES];
-        }
-
-        NSArray *activityItems = nil;
-        if (zipOk) {
-            activityItems = @[[NSURL fileURLWithPath:zipPath]];
-        } else if (fileURLs.count > 0) {
-            // 退一步分享多个 .txt 文件
-            activityItems = fileURLs;
+            zipOk = [zipData writeToFile:zipPath options:NSDataWritingAtomic error:&zipErr];
+        } else {
+            zipErr = [NSError errorWithDomain:@"JetPilotExportErrorDomain"
+                                         code:-1
+                                     userInfo:@{NSLocalizedDescriptionKey: @"未找到可导出的日志或配置文件数据"}];
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -2993,20 +3027,39 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             strongSelf.exportItem.customView = nil;
             strongSelf.exportItem.title = @"导出";
 
-            if (!activityItems || activityItems.count == 0) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"暂无日志"
-                                                                               message:@"未找到可导出的日志或配置文件。"
-                                                                        preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                [strongSelf presentViewController:alert animated:YES completion:nil];
-                return;
-            }
+            if (zipOk) {
+                // 分享成功时，分享项只有一个 zip
+                UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:zipPath]] applicationActivities:nil];
+                if (avc.popoverPresentationController) {
+                    avc.popoverPresentationController.barButtonItem = strongSelf.exportItem;
+                }
+                [strongSelf presentViewController:avc animated:YES completion:nil];
+            } else {
+                // 打包失败：不要悄悄退回零散文件，弹窗显示「打包失败：<错误描述>」，提供「改为分享单个文件」和「取消」两个选项，并把错误写进 App 侧日志或复制到剪贴板
+                NSString *errDesc = zipErr.localizedDescription ?: @"未知错误";
+                NSLog(@"[JetPilot] 打包失败: %@", zipErr);
+                [UIPasteboard generalPasteboard].string = [NSString stringWithFormat:@"打包失败：%@", errDesc];
 
-            UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:activityItems applicationActivities:nil];
-            if (avc.popoverPresentationController) {
-                avc.popoverPresentationController.barButtonItem = strongSelf.exportItem;
+                NSString *alertMsg = [NSString stringWithFormat:@"打包失败：%@\n\n（错误信息已复制到剪贴板）", errDesc];
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"打包失败"
+                                                                               message:alertMsg
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+
+                if (fileURLs.count > 0) {
+                    [alert addAction:[UIAlertAction actionWithTitle:@"改为分享单个文件"
+                                                              style:UIAlertActionStyleDefault
+                                                            handler:^(UIAlertAction * _Nonnull action) {
+                        UIActivityViewController *fallbackAvc = [[UIActivityViewController alloc] initWithActivityItems:fileURLs applicationActivities:nil];
+                        if (fallbackAvc.popoverPresentationController) {
+                            fallbackAvc.popoverPresentationController.barButtonItem = strongSelf.exportItem;
+                        }
+                        [strongSelf presentViewController:fallbackAvc animated:YES completion:nil];
+                    }]];
+                }
+                [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+                [strongSelf presentViewController:alert animated:YES completion:nil];
             }
-            [strongSelf presentViewController:avc animated:YES completion:nil];
         });
     });
 }
@@ -4301,7 +4354,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     // 必改 4-2: 守护进程未运行 / 版本过低时按规则卡片同等优先级直接提示，不轮询
     BOOL running = ([self daemonState] == JPDaemonStateRunning);
     if (!running) {
-        [self showAddResultAlert:@"已添加。守护进程没在运行，启动守护进程后才会保护。"];
+        NSString *actionDesc = (type == JPRuleTypeDemote) ? @"降级" : @"保护";
+        NSString *msg = [NSString stringWithFormat:@"已添加。守护进程没在运行，启动守护进程后才会%@。点卡片可以改档位。", actionDesc];
+        [self showAddResultAlert:msg];
         return;
     }
 
@@ -4316,7 +4371,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         NSInteger targetBand = (rule ? rule.targetBand : band);
         if (targetBand < 0) targetBand = 0;
         if (targetBand > 30) targetBand = 30;
-        NSString *msg = [NSString stringWithFormat:@"已添加。%@ 不在前台时会降到 %ld。", name, (long)targetBand];
+        NSString *msg = [NSString stringWithFormat:@"已添加。%@ 不在前台时会降到 %ld。点卡片可以改档位。", name, (long)targetBand];
         [self showAddResultAlert:msg];
         return;
     }
@@ -4339,10 +4394,10 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             [strongSelf refreshStatus];
             JPStatusInfo *currentSt = strongSelf.lastLoadedStatus ?: [JPStatusInfo loadCurrentStatus];
             if ([strongSelf status:currentSt hasMatchingAppForRule:rule]) {
-                NSString *msg = [NSString stringWithFormat:@"已添加，%@ 正在运行，已立即保护到 %ld。", name, (long)band];
+                NSString *msg = [NSString stringWithFormat:@"已添加，%@ 正在运行，已立即保护到 %ld。点卡片可以改档位。", name, (long)band];
                 [strongSelf showAddResultAlert:msg];
             } else {
-                NSString *msg = [NSString stringWithFormat:@"已添加。%@ 现在没运行，你打开它时会自动保护（不会替你打开）。", name];
+                NSString *msg = [NSString stringWithFormat:@"已添加。%@ 现在没运行，你打开它时会自动保护（不会替你打开）。点卡片可以改档位。", name];
                 [strongSelf showAddResultAlert:msg];
             }
             return;
@@ -4352,7 +4407,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         if (checksRemaining <= 0) {
             [t invalidate];
             [strongSelf refreshStatus];
-            NSString *msg = @"已添加，守护进程还没处理到这条规则，稍后在规则卡片上看状态";
+            NSString *msg = @"已添加，守护进程还没处理到这条规则，稍后在规则卡片上看状态。点卡片可以改档位。";
             [strongSelf showAddResultAlert:msg];
         }
     }];
@@ -4395,17 +4450,48 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             return;
         }
 
-        JPRule *r = [JPRule new];
-        r.type = JPRuleTypeProtect;
-        r.pathFragment = pathFragment;
-        r.targetBand = 50;
-        r.displayName = displayName;
-        [weakSelf evaluateRuleConflict:r];
-        [weakSelf.rules addObject:r];
-        [weakSelf rebuildRulesCards];
-        NSDate *t0 = [NSDate date];
-        [weakSelf saveConfig];
-        [weakSelf checkRuleRunStateAfterAdd:r appName:displayName targetBand:50 type:JPRuleTypeProtect saveTime:t0];
+        NSString *title = displayName.length > 0 ? displayName : pathFragment;
+        UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:title
+                                                                             message:nil
+                                                                      preferredStyle:UIAlertControllerStyleActionSheet];
+        [actionSheet addAction:[UIAlertAction actionWithTitle:@"保护（50 档）"
+                                                        style:UIAlertActionStyleDefault
+                                                      handler:^(UIAlertAction * _Nonnull action) {
+            JPRule *r = [JPRule new];
+            r.type = JPRuleTypeProtect;
+            r.pathFragment = pathFragment;
+            r.targetBand = 50;
+            r.displayName = displayName;
+            [weakSelf evaluateRuleConflict:r];
+            [weakSelf.rules addObject:r];
+            [weakSelf rebuildRulesCards];
+            NSDate *t0 = [NSDate date];
+            [weakSelf saveConfig];
+            [weakSelf checkRuleRunStateAfterAdd:r appName:displayName targetBand:50 type:JPRuleTypeProtect saveTime:t0];
+        }]];
+        [actionSheet addAction:[UIAlertAction actionWithTitle:@"降级（30 档）"
+                                                        style:UIAlertActionStyleDefault
+                                                      handler:^(UIAlertAction * _Nonnull action) {
+            JPRule *r = [JPRule new];
+            r.type = JPRuleTypeDemote;
+            r.pathFragment = pathFragment;
+            r.targetBand = 30;
+            r.displayName = displayName;
+            [weakSelf evaluateRuleConflict:r];
+            [weakSelf.rules addObject:r];
+            [weakSelf rebuildRulesCards];
+            NSDate *t0 = [NSDate date];
+            [weakSelf saveConfig];
+            [weakSelf checkRuleRunStateAfterAdd:r appName:displayName targetBand:30 type:JPRuleTypeDemote saveTime:t0];
+        }]];
+        [actionSheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+        if (actionSheet.popoverPresentationController) {
+            actionSheet.popoverPresentationController.sourceView = weakSelf.view;
+            actionSheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(weakSelf.view.bounds), CGRectGetMidY(weakSelf.view.bounds), 1, 1);
+            actionSheet.popoverPresentationController.permittedArrowDirections = 0;
+        }
+        [weakSelf presentViewController:actionSheet animated:YES completion:nil];
     };
 
     picker.onManualAdd = ^(NSString *pathFragment, JPRuleType type, NSInteger band) {
