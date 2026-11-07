@@ -1,5 +1,5 @@
 /*
- * JetPilot v0.7.3 — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetPilot v0.7.4 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
@@ -57,7 +57,7 @@ static time_t JPBootTime(void) {
 static NSString *DefaultConfig(void) {
     return @"# JetPilot 规则（iOS 16 档位：后台 30，前台 100）\n"
            @"# protect <路径片段> <档位，最高 95>\n"
-           @"# demote  <路径片段>   （不在前台时降到 30）\n"
+           @"# demote  <路径片段> [档位] （降到指定档位，默认 30）\n"
            @"protect Reynard.app/ 90\n";
 }
 
@@ -68,7 +68,11 @@ static NSString *BandDescription(NSInteger band) {
     if (band >= 60) return [NSString stringWithFormat:@"%ld · 中优先级后台", (long)band];
     if (band >= 40) return [NSString stringWithFormat:@"%ld · 低优先级后台", (long)band];
     if (band > 30)  return [NSString stringWithFormat:@"%ld · 普通后台", (long)band];
-    return @"30 · 系统默认后台";
+    if (band == 30) return @"30 · 系统默认后台";
+    if (band >= 20) return [NSString stringWithFormat:@"%ld · 次级后台", (long)band];
+    if (band >= 10) return [NSString stringWithFormat:@"%ld · 极低后台", (long)band];
+    if (band > 0)   return [NSString stringWithFormat:@"%ld · 濒危后台", (long)band];
+    return @"0 · 最先被杀";
 }
 
 static NSString *FormatShortTimestamp(NSString *raw) {
@@ -933,19 +937,28 @@ static BOOL FragmentMatchesProcessName(NSString *frag, NSString *procName) {
 
 static NSString *ResolveDisplayNameHelper(NSString *frag, NSArray<JPInstalledApp *> *apps) {
     if (!frag || frag.length == 0) return @"";
+    NSString *resolved = nil;
     if ([frag hasPrefix:@"bid:"]) {
         NSString *targetBid = [frag substringFromIndex:4];
         for (JPInstalledApp *app in apps) {
             if (app.bundleId.length > 0 && [app.bundleId isEqualToString:targetBid]) {
-                return app.displayName;
+                resolved = app.displayName;
+                break;
             }
         }
-        return frag;
-    }
-    for (JPInstalledApp *app in apps) {
-        if ([frag containsString:app.bundleName] || [app.bundleName containsString:frag]) {
-            return app.displayName;
+    } else {
+        for (JPInstalledApp *app in apps) {
+            if ([frag containsString:app.bundleName] || [app.bundleName containsString:frag]) {
+                resolved = app.displayName;
+                break;
+            }
         }
+    }
+    if (resolved.length > 0) {
+        if ([frag containsString:@"PushBundle"]) {
+            return [NSString stringWithFormat:@"%@（网页 App 推送）", resolved];
+        }
+        return resolved;
     }
     return frag;
 }
@@ -1946,7 +1959,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         self.bandLabel.text = [NSString stringWithFormat:@"%ld", (long)self.rule.targetBand];
         self.bandLabel.textColor = UIColor.systemBlueColor;
     } else {
-        self.bandLabel.text = @"30";
+        NSInteger band = self.rule.targetBand;
+        if (band < 0) band = 0;
+        if (band > 30) band = 30;
+        self.bandLabel.text = [NSString stringWithFormat:@"%ld", (long)band];
         self.bandLabel.textColor = UIColor.systemOrangeColor;
     }
 
@@ -1982,7 +1998,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     }
 
     if (self.rule.type == JPRuleTypeDemote) {
-        self.statusLabel.text = @"不在前台时降到 30";
+        NSInteger band = self.rule.targetBand;
+        if (band < 0) band = 0;
+        if (band > 30) band = 30;
+        self.statusLabel.text = [NSString stringWithFormat:@"不在前台时降到 %ld", (long)band];
         self.statusLabel.textColor = UIColor.secondaryLabelColor;
         return;
     }
@@ -2316,7 +2335,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         [weakSelf promptManualAddWithText:text type:JPRuleTypeProtect band:50];
     }]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"添加为降级 (30 档)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+    [alert addAction:[UIAlertAction actionWithTitle:@"添加为降级" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *text = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (text.length == 0) return;
         if (![text containsString:@"/"] && ![text hasSuffix:@".app"]) {
@@ -2570,8 +2589,150 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
 #pragma mark - Controllers: Log View Controller
 
+static uint32_t JPComputeCRC32(const uint8_t *data, size_t length) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (int k = 0; k < 8; k++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & (-(int)(crc & 1)));
+        }
+    }
+    return ~crc;
+}
+
+static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
+    NSMutableData *zipData = [NSMutableData data];
+    NSMutableData *cdData = [NSMutableData data];
+
+    NSCalendar *cal = [NSCalendar currentCalendar];
+    NSDateComponents *comp = [cal components:(NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay |
+                                              NSCalendarUnitHour | NSCalendarUnitMinute | NSCalendarUnitSecond)
+                                    fromDate:[NSDate date]];
+    NSInteger y = comp.year;
+    NSInteger m = comp.month;
+    NSInteger d = comp.day;
+    NSInteger h = comp.hour;
+    NSInteger min = comp.minute;
+    NSInteger s = comp.second;
+    if (y < 1980) y = 1980;
+    if (m < 1) m = 1;
+    if (m > 12) m = 12;
+    if (d < 1) d = 1;
+    if (d > 31) d = 31;
+    uint16_t dosDate = (uint16_t)((((y - 1980) & 0x7F) << 9) | ((m & 0x0F) << 5) | (d & 0x1F));
+    uint16_t dosTime = (uint16_t)(((h & 0x1F) << 11) | ((min & 0x3F) << 5) | ((s / 2) & 0x1F));
+
+    for (NSDictionary *entry in entries) {
+        NSString *name = entry[@"name"];
+        NSData *data = entry[@"data"] ?: [NSData data];
+        NSData *nameData = [name dataUsingEncoding:NSUTF8StringEncoding];
+
+        uint32_t offset = (uint32_t)zipData.length;
+        uint32_t crc = JPComputeCRC32(data.bytes, data.length);
+        uint32_t size = (uint32_t)data.length;
+        uint16_t nameLen = (uint16_t)nameData.length;
+
+        // Local file header: 30 bytes
+        uint8_t localHeader[30] = {0};
+        localHeader[0] = 0x50; localHeader[1] = 0x4b; localHeader[2] = 0x03; localHeader[3] = 0x04;
+        localHeader[4] = 20;   localHeader[5] = 0;
+        localHeader[6] = 0;    localHeader[7] = 0;
+        localHeader[8] = 0;    localHeader[9] = 0;
+        localHeader[10] = (uint8_t)(dosTime & 0xFF);
+        localHeader[11] = (uint8_t)((dosTime >> 8) & 0xFF);
+        localHeader[12] = (uint8_t)(dosDate & 0xFF);
+        localHeader[13] = (uint8_t)((dosDate >> 8) & 0xFF);
+        localHeader[14] = (uint8_t)(crc & 0xFF);
+        localHeader[15] = (uint8_t)((crc >> 8) & 0xFF);
+        localHeader[16] = (uint8_t)((crc >> 16) & 0xFF);
+        localHeader[17] = (uint8_t)((crc >> 24) & 0xFF);
+        localHeader[18] = (uint8_t)(size & 0xFF);
+        localHeader[19] = (uint8_t)((size >> 8) & 0xFF);
+        localHeader[20] = (uint8_t)((size >> 16) & 0xFF);
+        localHeader[21] = (uint8_t)((size >> 24) & 0xFF);
+        localHeader[22] = (uint8_t)(size & 0xFF);
+        localHeader[23] = (uint8_t)((size >> 8) & 0xFF);
+        localHeader[24] = (uint8_t)((size >> 16) & 0xFF);
+        localHeader[25] = (uint8_t)((size >> 24) & 0xFF);
+        localHeader[26] = (uint8_t)(nameLen & 0xFF);
+        localHeader[27] = (uint8_t)((nameLen >> 8) & 0xFF);
+        localHeader[28] = 0;   localHeader[29] = 0;
+
+        [zipData appendBytes:localHeader length:30];
+        [zipData appendData:nameData];
+        [zipData appendData:data];
+
+        // Central directory header: 46 bytes
+        uint8_t cdHeader[46] = {0};
+        cdHeader[0] = 0x50; cdHeader[1] = 0x4b; cdHeader[2] = 0x01; cdHeader[3] = 0x02;
+        cdHeader[4] = 20;   cdHeader[5] = 0;
+        cdHeader[6] = 20;   cdHeader[7] = 0;
+        cdHeader[8] = 0;    cdHeader[9] = 0;
+        cdHeader[10] = 0;   cdHeader[11] = 0;
+        cdHeader[12] = (uint8_t)(dosTime & 0xFF);
+        cdHeader[13] = (uint8_t)((dosTime >> 8) & 0xFF);
+        cdHeader[14] = (uint8_t)(dosDate & 0xFF);
+        cdHeader[15] = (uint8_t)((dosDate >> 8) & 0xFF);
+        cdHeader[16] = (uint8_t)(crc & 0xFF);
+        cdHeader[17] = (uint8_t)((crc >> 8) & 0xFF);
+        cdHeader[18] = (uint8_t)((crc >> 16) & 0xFF);
+        cdHeader[19] = (uint8_t)((crc >> 24) & 0xFF);
+        cdHeader[20] = (uint8_t)(size & 0xFF);
+        cdHeader[21] = (uint8_t)((size >> 8) & 0xFF);
+        cdHeader[22] = (uint8_t)((size >> 16) & 0xFF);
+        cdHeader[23] = (uint8_t)((size >> 24) & 0xFF);
+        cdHeader[24] = (uint8_t)(size & 0xFF);
+        cdHeader[25] = (uint8_t)((size >> 8) & 0xFF);
+        cdHeader[26] = (uint8_t)((size >> 16) & 0xFF);
+        cdHeader[27] = (uint8_t)((size >> 24) & 0xFF);
+        cdHeader[28] = (uint8_t)(nameLen & 0xFF);
+        cdHeader[29] = (uint8_t)((nameLen >> 8) & 0xFF);
+        cdHeader[30] = 0;   cdHeader[31] = 0;
+        cdHeader[32] = 0;   cdHeader[33] = 0;
+        cdHeader[34] = 0;   cdHeader[35] = 0;
+        cdHeader[36] = 0;   cdHeader[37] = 0;
+        cdHeader[38] = 0;   cdHeader[39] = 0; cdHeader[40] = 0; cdHeader[41] = 0;
+        cdHeader[42] = (uint8_t)(offset & 0xFF);
+        cdHeader[43] = (uint8_t)((offset >> 8) & 0xFF);
+        cdHeader[44] = (uint8_t)((offset >> 16) & 0xFF);
+        cdHeader[45] = (uint8_t)((offset >> 24) & 0xFF);
+
+        [cdData appendBytes:cdHeader length:46];
+        [cdData appendData:nameData];
+    }
+
+    uint32_t cdOffset = (uint32_t)zipData.length;
+    uint32_t cdSize = (uint32_t)cdData.length;
+    uint16_t totalEntries = (uint16_t)entries.count;
+
+    [zipData appendData:cdData];
+
+    // End of Central Directory record: 22 bytes
+    uint8_t eocd[22] = {0};
+    eocd[0] = 0x50; eocd[1] = 0x4b; eocd[2] = 0x05; eocd[3] = 0x06;
+    eocd[4] = 0; eocd[5] = 0;
+    eocd[6] = 0; eocd[7] = 0;
+    eocd[8] = (uint8_t)(totalEntries & 0xFF);
+    eocd[9] = (uint8_t)((totalEntries >> 8) & 0xFF);
+    eocd[10] = (uint8_t)(totalEntries & 0xFF);
+    eocd[11] = (uint8_t)((totalEntries >> 8) & 0xFF);
+    eocd[12] = (uint8_t)(cdSize & 0xFF);
+    eocd[13] = (uint8_t)((cdSize >> 8) & 0xFF);
+    eocd[14] = (uint8_t)((cdSize >> 16) & 0xFF);
+    eocd[15] = (uint8_t)((cdSize >> 24) & 0xFF);
+    eocd[16] = (uint8_t)(cdOffset & 0xFF);
+    eocd[17] = (uint8_t)((cdOffset >> 8) & 0xFF);
+    eocd[18] = (uint8_t)((cdOffset >> 16) & 0xFF);
+    eocd[19] = (uint8_t)((cdOffset >> 24) & 0xFF);
+    eocd[20] = 0; eocd[21] = 0;
+
+    [zipData appendBytes:eocd length:22];
+    return zipData;
+}
+
 @interface JPLogViewController : UIViewController
 @property (nonatomic, strong) UITextView *textView;
+@property (nonatomic, strong) UIBarButtonItem *exportItem;
 @property (nonatomic, strong) UIBarButtonItem *clearItem;
 @end
 
@@ -2582,6 +2743,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.title = @"调试日志";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
 
+    self.exportItem = [[UIBarButtonItem alloc] initWithTitle:@"导出"
+                                                       style:UIBarButtonItemStylePlain
+                                                      target:self
+                                                      action:@selector(exportLogs)];
     UIBarButtonItem *copyBtn = [[UIBarButtonItem alloc] initWithTitle:@"复制"
                                                                 style:UIBarButtonItemStylePlain
                                                                target:self
@@ -2590,7 +2755,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
                                                       style:UIBarButtonItemStylePlain
                                                      target:self
                                                      action:@selector(confirmClearLog)];
-    self.navigationItem.rightBarButtonItems = @[copyBtn, self.clearItem];
+    self.navigationItem.rightBarButtonItems = @[self.exportItem, copyBtn, self.clearItem];
 
     self.textView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.textView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2739,6 +2904,113 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [self loadLog];
 }
 
+- (void)exportLogs {
+    if (self.presentedViewController) return;
+
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    [spinner startAnimating];
+    self.exportItem.customView = spinner;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
+        NSMutableArray<NSURL *> *fileURLs = [NSMutableArray array];
+
+        // 1. daemon.log (拼接 daemon.log.1 和 daemon.log)
+        NSMutableData *logData = [NSMutableData data];
+        if ([fm fileExistsAtPath:kLogFile]) {
+            [fileURLs addObject:[NSURL fileURLWithPath:kLogFile]];
+        }
+        if ([fm fileExistsAtPath:kLogOldFile]) {
+            [fileURLs addObject:[NSURL fileURLWithPath:kLogOldFile]];
+        }
+        if ([fm fileExistsAtPath:kLogOldFile]) {
+            NSData *oldD = [NSData dataWithContentsOfFile:kLogOldFile];
+            if (oldD) [logData appendData:oldD];
+        }
+        if ([fm fileExistsAtPath:kLogFile]) {
+            NSData *curD = [NSData dataWithContentsOfFile:kLogFile];
+            if (curD) [logData appendData:curD];
+        }
+        if (logData.length > 0) {
+            [entries addObject:@{@"name": @"daemon.log", @"data": logData}];
+        }
+
+        // 2. 附带文件：mempressure.txt、mempressure_floor.txt、config.txt、status.txt
+        NSArray<NSArray<NSString *> *> *attachFiles = @[
+            @[kMemPressureConfig, @"mempressure.txt"],
+            @[kMemPressureFloor,  @"mempressure_floor.txt"],
+            @[kConfig,            @"config.txt"],
+            @[kStatus,            @"status.txt"]
+        ];
+
+        for (NSArray<NSString *> *pair in attachFiles) {
+            NSString *filePath = pair[0];
+            NSString *entryName = pair[1];
+            if ([fm fileExistsAtPath:filePath]) {
+                NSData *d = [NSData dataWithContentsOfFile:filePath];
+                if (d) {
+                    [entries addObject:@{@"name": entryName, @"data": d}];
+                    [fileURLs addObject:[NSURL fileURLWithPath:filePath]];
+                }
+            }
+        }
+
+        // 清理 tmp/ 里旧的 JetPilot-logs-*.zip
+        NSString *tmpDir = NSTemporaryDirectory();
+        NSArray<NSString *> *existingTmp = [fm contentsOfDirectoryAtPath:tmpDir error:nil];
+        for (NSString *fn in existingTmp) {
+            if ([fn hasPrefix:@"JetPilot-logs-"] && [fn hasSuffix:@".zip"]) {
+                [fm removeItemAtPath:[tmpDir stringByAppendingPathComponent:fn] error:nil];
+            }
+        }
+
+        NSDateFormatter *df = [NSDateFormatter new];
+        df.dateFormat = @"yyyyMMdd-HHmmss";
+        NSString *dateStr = [df stringFromDate:[NSDate date]];
+        NSString *zipFileName = [NSString stringWithFormat:@"JetPilot-logs-%@-v0.7.4.zip", dateStr];
+        NSString *zipPath = [tmpDir stringByAppendingPathComponent:zipFileName];
+
+        NSData *zipData = JPCreateZipArchive(entries);
+        BOOL zipOk = NO;
+        if (zipData.length > 0) {
+            zipOk = [zipData writeToFile:zipPath atomically:YES];
+        }
+
+        NSArray *activityItems = nil;
+        if (zipOk) {
+            activityItems = @[[NSURL fileURLWithPath:zipPath]];
+        } else if (fileURLs.count > 0) {
+            // 退一步分享多个 .txt 文件
+            activityItems = fileURLs;
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
+            strongSelf.exportItem.customView = nil;
+            strongSelf.exportItem.title = @"导出";
+
+            if (!activityItems || activityItems.count == 0) {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"暂无日志"
+                                                                               message:@"未找到可导出的日志或配置文件。"
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [strongSelf presentViewController:alert animated:YES completion:nil];
+                return;
+            }
+
+            UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:activityItems applicationActivities:nil];
+            if (avc.popoverPresentationController) {
+                avc.popoverPresentationController.barButtonItem = strongSelf.exportItem;
+            }
+            [strongSelf presentViewController:avc animated:YES completion:nil];
+        });
+    });
+}
+
 @end
 
 #pragma mark - Controllers: Rule Edit
@@ -2759,6 +3031,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, copy) NSString *currentFrag;
 @property (nonatomic, copy) NSString *currentDisplayName;
 @property (nonatomic, strong) UILabel *sliderValLabel;
+@property (nonatomic, strong) UISlider *slider;
 @property (nonatomic, strong) UILabel *auxTipLabel;
 @end
 
@@ -2770,8 +3043,13 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
 
     self.currentBand = self.rule.targetBand;
-    if (self.currentBand < 30) self.currentBand = 30;
-    if (self.currentBand > 95) self.currentBand = 95;
+    if (self.rule.type == JPRuleTypeProtect) {
+        if (self.currentBand < 30) self.currentBand = 30;
+        if (self.currentBand > 95) self.currentBand = 95;
+    } else {
+        if (self.currentBand < 0) self.currentBand = 0;
+        if (self.currentBand > 30) self.currentBand = 30;
+    }
     self.currentFrag = self.rule.pathFragment ?: @"";
     self.currentDisplayName = self.rule.displayName ?: @"";
 
@@ -2851,19 +3129,48 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 #pragma mark - Table View
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return (self.rule.type == JPRuleTypeProtect) ? 3 : 2;
+    return 3;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0) return 3;
-    if (self.rule.type == JPRuleTypeProtect && section == 1) return 1;
+    if (section == 1) return 1;
     return 1;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     if (section == 0) return @"应用信息";
-    if (self.rule.type == JPRuleTypeProtect && section == 1) return @"目标保护档位（步进 5）";
+    if (section == 1) {
+        return (self.rule.type == JPRuleTypeProtect) ? @"目标保护档位（步进 1）" : @"目标降级档位（步进 1）";
+    }
     return nil;
+}
+
+- (void)updateBandDisplay {
+    self.sliderValLabel.text = BandDescription(self.currentBand);
+    if (self.rule.type == JPRuleTypeProtect) {
+        self.auxTipLabel.text = @"90 是系统前台辅助档。内存释放触发时，这些 App 会被临时让到 80 约 5 秒。";
+        self.auxTipLabel.hidden = (self.currentBand < 90);
+    } else {
+        self.auxTipLabel.text = @"0 档最先被杀。靠推送唤醒的 App（如微信）会被系统反复拉高，再被压回 0，不建议用。";
+        self.auxTipLabel.hidden = (self.currentBand != 0);
+    }
+}
+
+- (void)bandMinusTapped {
+    self.currentBand -= 1;
+    NSInteger minBand = (self.rule.type == JPRuleTypeProtect) ? 30 : 0;
+    if (self.currentBand < minBand) self.currentBand = minBand;
+    self.slider.value = (float)self.currentBand;
+    [self updateBandDisplay];
+}
+
+- (void)bandPlusTapped {
+    self.currentBand += 1;
+    NSInteger maxBand = (self.rule.type == JPRuleTypeProtect) ? 95 : 30;
+    if (self.currentBand > maxBand) self.currentBand = maxBand;
+    self.slider.value = (float)self.currentBand;
+    [self updateBandDisplay];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -2888,7 +3195,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
             return cell;
         }
-    } else if (self.rule.type == JPRuleTypeProtect && indexPath.section == 1) {
+    } else if (indexPath.section == 1) {
         UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
 
@@ -2896,37 +3203,61 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         self.sliderValLabel.translatesAutoresizingMaskIntoConstraints = NO;
         self.sliderValLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         self.sliderValLabel.textColor = UIColor.systemBlueColor;
-        self.sliderValLabel.text = BandDescription(self.currentBand);
+        self.sliderValLabel.textAlignment = NSTextAlignmentCenter;
 
-        UISlider *slider = [UISlider new];
-        slider.translatesAutoresizingMaskIntoConstraints = NO;
-        slider.minimumValue = 30.0f;
-        slider.maximumValue = 95.0f;
-        slider.value = (float)self.currentBand;
-        [slider addTarget:self action:@selector(sliderMoved:) forControlEvents:UIControlEventValueChanged];
+        self.slider = [UISlider new];
+        self.slider.translatesAutoresizingMaskIntoConstraints = NO;
+        self.slider.minimumValue = (self.rule.type == JPRuleTypeProtect) ? 30.0f : 0.0f;
+        self.slider.maximumValue = (self.rule.type == JPRuleTypeProtect) ? 95.0f : 30.0f;
+        self.slider.value = (float)self.currentBand;
+        [self.slider addTarget:self action:@selector(sliderMoved:) forControlEvents:UIControlEventValueChanged];
 
         self.auxTipLabel = [UILabel new];
         self.auxTipLabel.translatesAutoresizingMaskIntoConstraints = NO;
         self.auxTipLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
         self.auxTipLabel.textColor = UIColor.systemOrangeColor;
         self.auxTipLabel.numberOfLines = 0;
-        self.auxTipLabel.text = @"90 是系统前台辅助档。内存释放触发时，这些 App 会被临时让到 80 约 5 秒。";
-        self.auxTipLabel.hidden = (self.currentBand < 90);
 
+        [self updateBandDisplay];
+
+        UIButton *minusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        minusBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        [minusBtn setTitle:@"-1" forState:UIControlStateNormal];
+        minusBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+        [minusBtn addTarget:self action:@selector(bandMinusTapped) forControlEvents:UIControlEventTouchUpInside];
+
+        UIButton *plusBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        plusBtn.translatesAutoresizingMaskIntoConstraints = NO;
+        [plusBtn setTitle:@"+1" forState:UIControlStateNormal];
+        plusBtn.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+        [plusBtn addTarget:self action:@selector(bandPlusTapped) forControlEvents:UIControlEventTouchUpInside];
+
+        [cell.contentView addSubview:minusBtn];
         [cell.contentView addSubview:self.sliderValLabel];
-        [cell.contentView addSubview:slider];
+        [cell.contentView addSubview:plusBtn];
+        [cell.contentView addSubview:self.slider];
         [cell.contentView addSubview:self.auxTipLabel];
 
         [NSLayoutConstraint activateConstraints:@[
-            [self.sliderValLabel.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:12],
-            [self.sliderValLabel.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
-            [self.sliderValLabel.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+            [minusBtn.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+            [minusBtn.topAnchor constraintEqualToAnchor:cell.contentView.topAnchor constant:10],
+            [minusBtn.widthAnchor constraintEqualToConstant:44],
+            [minusBtn.heightAnchor constraintEqualToConstant:32],
 
-            [slider.topAnchor constraintEqualToAnchor:self.sliderValLabel.bottomAnchor constant:10],
-            [slider.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
-            [slider.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+            [plusBtn.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+            [plusBtn.centerYAnchor constraintEqualToAnchor:minusBtn.centerYAnchor],
+            [plusBtn.widthAnchor constraintEqualToConstant:44],
+            [plusBtn.heightAnchor constraintEqualToConstant:32],
 
-            [self.auxTipLabel.topAnchor constraintEqualToAnchor:slider.bottomAnchor constant:8],
+            [self.sliderValLabel.centerYAnchor constraintEqualToAnchor:minusBtn.centerYAnchor],
+            [self.sliderValLabel.leadingAnchor constraintEqualToAnchor:minusBtn.trailingAnchor constant:8],
+            [self.sliderValLabel.trailingAnchor constraintEqualToAnchor:plusBtn.leadingAnchor constant:-8],
+
+            [self.slider.topAnchor constraintEqualToAnchor:minusBtn.bottomAnchor constant:8],
+            [self.slider.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
+            [self.slider.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
+
+            [self.auxTipLabel.topAnchor constraintEqualToAnchor:self.slider.bottomAnchor constant:8],
             [self.auxTipLabel.leadingAnchor constraintEqualToAnchor:cell.contentView.leadingAnchor constant:16],
             [self.auxTipLabel.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-16],
             [self.auxTipLabel.bottomAnchor constraintEqualToAnchor:cell.contentView.bottomAnchor constant:-12]
@@ -2942,20 +3273,20 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)sliderMoved:(UISlider *)slider {
-    NSInteger stepped = (NSInteger)lroundf(slider.value / 5.0f) * 5;
-    if (stepped < 30) stepped = 30;
-    if (stepped > 95) stepped = 95;
+    NSInteger stepped = (NSInteger)lroundf(slider.value);
+    NSInteger minBand = (self.rule.type == JPRuleTypeProtect) ? 30 : 0;
+    NSInteger maxBand = (self.rule.type == JPRuleTypeProtect) ? 95 : 30;
+    if (stepped < minBand) stepped = minBand;
+    if (stepped > maxBand) stepped = maxBand;
     self.currentBand = stepped;
-    self.sliderValLabel.text = BandDescription(stepped);
-    self.auxTipLabel.hidden = (stepped < 90);
+    [self updateBandDisplay];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == 0 && indexPath.row == 2) {
         [self reselectApp];
-    } else if ((self.rule.type == JPRuleTypeProtect && indexPath.section == 2) ||
-               (self.rule.type != JPRuleTypeProtect && indexPath.section == 1)) {
+    } else if (indexPath.section == 2) {
         [self confirmDelete];
     }
 }
@@ -3443,10 +3774,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
             [self evaluateRuleConflict:r];
             [self.rules addObject:r];
         } else if ([verb isEqualToString:@"demote"]) {
+            NSInteger band = 30;
+            if (cleanTokens.count >= 3) {
+                band = [cleanTokens[2] integerValue];
+            }
+            if (band < 0) band = 0;
+            if (band > 30) band = 30;
+
             JPRule *r = [JPRule new];
             r.type = JPRuleTypeDemote;
             r.pathFragment = frag;
-            r.targetBand = 30;
+            r.targetBand = band;
             r.displayName = [self resolveDisplayNameForFragment:frag];
             [self evaluateRuleConflict:r];
             [self.rules addObject:r];
@@ -3458,7 +3796,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     NSMutableString *outStr = [NSMutableString string];
     [outStr appendString:@"# JetPilot 规则（iOS 16 档位：后台 30，前台 100）\n"];
     [outStr appendString:@"# protect <路径片段> <档位，最高 95>\n"];
-    [outStr appendString:@"# demote  <路径片段>   （不在前台时降到 30）\n"];
+    [outStr appendString:@"# demote  <路径片段> [档位] （降到指定档位，默认 30）\n"];
 
     for (JPRule *r in self.rules) {
         if (r.type == JPRuleTypeProtect) {
@@ -3467,7 +3805,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
             if (band > 95) band = 95;
             [outStr appendFormat:@"protect %@ %ld\n", r.pathFragment, (long)band];
         } else if (r.type == JPRuleTypeDemote) {
-            [outStr appendFormat:@"demote %@\n", r.pathFragment];
+            NSInteger band = r.targetBand;
+            if (band < 0) band = 0;
+            if (band > 30) band = 30;
+            [outStr appendFormat:@"demote %@ %ld\n", r.pathFragment, (long)band];
         }
     }
 
@@ -3723,7 +4064,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         }
 
         if (demoteRules.count > 0) {
-            UILabel *demoteHeader = [self createSectionHeader:@"降级规则（不在前台时降到 30）"];
+            UILabel *demoteHeader = [self createSectionHeader:@"降级规则"];
             [self.rulesStackView addArrangedSubview:demoteHeader];
             for (JPRule *rule in demoteRules) {
                 JPRuleCardView *card = [[JPRuleCardView alloc] initWithRule:rule delegate:self installedApps:self.installedApps];
@@ -3972,7 +4313,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     // 必改 4-3: 降级规则固定提示，不轮询（status.txt 仅记录保护规则）
     if (type == JPRuleTypeDemote) {
-        NSString *msg = [NSString stringWithFormat:@"已添加。%@ 不在前台时会降到 30。", name];
+        NSInteger targetBand = (rule ? rule.targetBand : band);
+        if (targetBand < 0) targetBand = 0;
+        if (targetBand > 30) targetBand = 30;
+        NSString *msg = [NSString stringWithFormat:@"已添加。%@ 不在前台时会降到 %ld。", name, (long)targetBand];
         [self showAddResultAlert:msg];
         return;
     }
@@ -4622,7 +4966,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
             UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
             cell.textLabel.text = @"底线记录";
             if (self.floor && self.floor.median > 0) {
-                cell.detailTextLabel.text = [NSString stringWithFormat:@"中位数 %.1f MB (有效样本 %ld 个)", self.floor.median, (long)self.floor.sampleCount];
+                cell.detailTextLabel.text = [NSString stringWithFormat:@"底线 %.1f MB (有效样本 %ld 个)", self.floor.median, (long)self.floor.sampleCount];
             } else {
                 cell.detailTextLabel.text = @"还没有记录，触发几次后会显示";
             }
@@ -5501,6 +5845,14 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
         [weakSelf saveConfig];
         [weakSelf rebuildRulesCards];
+
+        if ([pathFragment containsString:@"PushBundle"]) {
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                           message:@"PushBundle 类进程不会到前台，内存释放规则无效。"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:alert animated:YES completion:nil];
+        }
     };
 
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];

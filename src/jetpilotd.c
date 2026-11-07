@@ -161,7 +161,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define FLAG_PATH   CONFIG_DIR "/running.flag"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define PID_PATH    CONFIG_DIR "/daemon.pid"
-#define JP_VERSION   "0.7.3"
+#define JP_VERSION   "0.7.4"
 #define LOG_PATH     CONFIG_DIR "/daemon.log"
 #define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
 #define LOG_MAX_BYTES (256 * 1024)
@@ -227,10 +227,73 @@ static void skip_dedup_clear(pid_t pid) {
     }
 }
 
+#define MAX_DEMOTE_DEDUP 64
+typedef struct {
+    pid_t   pid;
+    int32_t cur;
+    int32_t target;
+    time_t  last_log_time;
+    int     suppressed_count;
+} demote_dedup_t;
+
+static demote_dedup_t g_demote_dedup[MAX_DEMOTE_DEDUP];
+static int g_demote_dedup_count = 0;
+static int g_demote_dedup_head = 0;
+
+static void demote_dedup_clear(pid_t pid) {
+    for (int i = 0; i < g_demote_dedup_count; i++) {
+        if (g_demote_dedup[i].pid == pid) {
+            g_demote_dedup_count--;
+            g_demote_dedup[i] = g_demote_dedup[g_demote_dedup_count];
+            return;
+        }
+    }
+}
+
+static void demote_log_success(pid_t pid, const char *path, const char *frag, int32_t cur, int32_t target) {
+    time_t now = time(NULL);
+    for (int i = 0; i < g_demote_dedup_count; i++) {
+        if (g_demote_dedup[i].pid == pid) {
+            if (g_demote_dedup[i].cur == cur && g_demote_dedup[i].target == target) {
+                g_demote_dedup[i].suppressed_count++;
+                if (now - g_demote_dedup[i].last_log_time >= 600) {
+                    jp_log("%-6s pid=%d %s %s %d->%d ×%d (10min)",
+                           "DEMOTE", (int)pid, proc_label_log(path), frag, (int)cur, (int)target,
+                           g_demote_dedup[i].suppressed_count);
+                    g_demote_dedup[i].last_log_time = now;
+                    g_demote_dedup[i].suppressed_count = 0;
+                }
+                return;
+            }
+            g_demote_dedup[i].cur = cur;
+            g_demote_dedup[i].target = target;
+            g_demote_dedup[i].last_log_time = now;
+            g_demote_dedup[i].suppressed_count = 0;
+            jp_log("%-6s pid=%d %s %s %d->%d ok",
+                   "DEMOTE", (int)pid, proc_label_log(path), frag, (int)cur, (int)target);
+            return;
+        }
+    }
+    demote_dedup_t *entry = NULL;
+    if (g_demote_dedup_count < MAX_DEMOTE_DEDUP) {
+        entry = &g_demote_dedup[g_demote_dedup_count++];
+    } else {
+        entry = &g_demote_dedup[g_demote_dedup_head];
+        g_demote_dedup_head = (g_demote_dedup_head + 1) % MAX_DEMOTE_DEDUP;
+    }
+    entry->pid = pid;
+    entry->cur = cur;
+    entry->target = target;
+    entry->last_log_time = now;
+    entry->suppressed_count = 0;
+    jp_log("%-6s pid=%d %s %s %d->%d ok",
+           "DEMOTE", (int)pid, proc_label_log(path), frag, (int)cur, (int)target);
+}
+
 #define MAX_RULES 32
 typedef struct {
     char    frag[256];
-    int32_t target;   /* protect 用；demote 规则 target = -1 */
+    int32_t target;   /* 目标档位：protect 为 30–95，demote 为 0–30 */
     int     is_bid;   /* 1 = 按 Bundle ID 匹配；0 = 按路径片段匹配 */
 } rule_t;
 
@@ -361,17 +424,22 @@ static void applied_prune(void) {
         if (g_applied[i].seen) {
             g_applied[i].seen = 0;
             g_applied[j++] = g_applied[i];
+        } else {
+            demote_dedup_clear(g_applied[i].pid);
         }
     }
     g_napplied = j;
 }
 
 static void applied_remove(pid_t pid) {
-    for (int i = 0; i < g_napplied; i++)
+    for (int i = 0; i < g_napplied; i++) {
         if (g_applied[i].pid == pid) {
             g_applied[i] = g_applied[--g_napplied];
+            demote_dedup_clear(pid);
             return;
         }
+    }
+    demote_dedup_clear(pid);
 }
 
 #define MAX_OLD_TARGETS 64
@@ -472,8 +540,11 @@ static int load_config(void) {
             if (is_bid) g_has_bid_rules = 1;
             g_nprotect++;
         } else if (strcmp(verb, "demote") == 0 && g_ndemote < MAX_RULES) {
+            if (n < 3) band = BAND_BACKGROUND;                    /* 默认 30 */
+            if (band < BAND_IDLE) band = BAND_IDLE;               /* 夹到 0–30 */
+            if (band > BAND_BACKGROUND) band = BAND_BACKGROUND;
             strncpy(g_demote[g_ndemote].frag, frag, 255);
-            g_demote[g_ndemote].target = -1;
+            g_demote[g_ndemote].target = band;
             g_demote[g_ndemote].is_bid = is_bid;
             if (is_bid) g_has_bid_rules = 1;
             g_ndemote++;
@@ -1416,15 +1487,14 @@ static void memp_floor_format_median(const double *samples, int nsamp, char *buf
             }
         }
     }
-    double med = 0.0;
-    if (nsamp == 3) {
-        med = sorted[1];
-    } else if (nsamp == 4) {
-        med = round(((sorted[1] + sorted[2]) / 2.0) * 10.0) / 10.0;
-    } else if (nsamp == 5) {
-        med = sorted[2];
-    }
-    snprintf(buf, sz, "%.1f", med);
+    /* 函数名保留 memp_floor_format_median、文件格式保留 med= 以保持向后兼容。
+     * 当前实现含义已调整为「次小值」底线统计（增加单次极低异常防护）：
+     * 保持 nsamp < 3 判 NA；对 >=3 个样本，取次小值 sorted[1]（剔除单次异常低样本如重启/重建），
+     * 避免瞬态极低值长期钉死底线导致 backoff 失真。当正常低样本持续到来或异常样本滑出窗口后底线恢复。
+     * 注意：当有效样本数恰好为 3 时，sorted[1] 就是中位数，计算结果与原中位数逻辑完全一致。
+     */
+    double min_val = sorted[1];
+    snprintf(buf, sz, "%.1f", min_val);
 }
 
 static void memp_floor_get_median_str(const char *frag, char *buf, size_t sz) {
@@ -1457,6 +1527,7 @@ static void memp_floor_save(void) {
                 rem -= (size_t)n;
             }
         }
+        /* 兼容说明：key 保持 med= 不变，实际存储的是次小值底线 */
         fprintf(f, "%s t=%ld n=%d med=%s s=%s\n",
                 fe->frag, (long)fe->last_time, fe->nsamp, med_str, s_buf);
     }
@@ -2803,6 +2874,7 @@ int main(void) {
                 int32_t target = 0;
                 const char *frag = NULL;
                 const char *demote_frag = NULL;
+                int32_t demote_target = BAND_BACKGROUND;
                 int skip_this_round = 0;   /* 本轮是否走了 SKIP：非 SKIP 路径要清去重项 */
                 applied_t *prev = applied_find(pid);
                 if (prev) prev->seen = 1;
@@ -2876,35 +2948,40 @@ int main(void) {
                             }
                         }
                     }
-                } else if (path_matches(path, app_bid, g_demote, g_ndemote, NULL, &demote_frag)) {
-                    /* 只在非前台时降，且只降到 BACKGROUND，避免误杀正在用的 App */
-                    if (cur < BAND_FOREGROUND && cur > BAND_BACKGROUND) {
+                } else if (path_matches(path, app_bid, g_demote, g_ndemote, &demote_target, &demote_frag)) {
+                    /* 只在非前台且当前档位高于目标档位时降 */
+                    if (cur < BAND_FOREGROUND && cur > demote_target) {
                         demoted_now++;
-                        int rc = set_priority(pid, BAND_BACKGROUND);
+                        int rc = set_priority(pid, demote_target);
                         if (rc == 0) {
-                            jp_log("%-6s pid=%d %s %s %d->%d ok",
-                                   "DEMOTE", (int)pid, proc_label_log(path), demote_frag, (int)cur, BAND_BACKGROUND);
+                            applied_set(pid, demote_target);
+                            demote_log_success(pid, path, demote_frag, cur, demote_target);
                         } else {
                             /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
                             jp_log("%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
-                                   "DEMOTE", (int)pid, proc_label_log(path), demote_frag, (int)cur, BAND_BACKGROUND,
+                                   "DEMOTE", (int)pid, proc_label_log(path), demote_frag, (int)cur, (int)demote_target,
                                    g_last_err_no, strerror(g_last_err_no));
                         }
                     }
-                } else if (prev && prev->band == cur && cur > BAND_BACKGROUND &&
-                           cur < BAND_FOREGROUND) {
-                    /* 规则被删：把我们抬过的档位还回普通后台 */
-                    int rc = set_priority(pid, BAND_BACKGROUND);
-                    if (rc == 0) {
-                        applied_remove(pid);   /* 还回后不再是我们的档位 */
-                        prev = NULL;           /* 指针已失效 */
-                        jp_log("%-6s pid=%d %s %d->%d ok",
-                               "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND);
+                } else if (prev && prev->band == cur && cur < BAND_FOREGROUND) {
+                    if (cur > BAND_BACKGROUND) {
+                        /* 原逻辑：protect 抬过的档位还回普通后台 (30) */
+                        int rc = set_priority(pid, BAND_BACKGROUND);
+                        if (rc == 0) {
+                            applied_remove(pid);   /* 还回后不再是我们的档位，内含 demote_dedup_clear */
+                            prev = NULL;           /* 指针已失效 */
+                            jp_log("%-6s pid=%d %s %d->%d ok",
+                                   "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND);
+                        } else {
+                            /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
+                            jp_log("%-6s pid=%d %s %d->%d FAIL errno=%d %s",
+                                   "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND,
+                                   g_last_err_no, strerror(g_last_err_no));
+                        }
                     } else {
-                        /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
-                        jp_log("%-6s pid=%d %s %d->%d FAIL errno=%d %s",
-                               "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND,
-                               g_last_err_no, strerror(g_last_err_no));
+                        /* cur <= 30：demote 压过的，或已经是 30；不动档位，只把记录忘掉，交还系统 */
+                        applied_remove(pid);
+                        prev = NULL;
                     }
                 }
                 /* 本轮没走 SKIP：清掉该 pid 的去重项，去重只对连续 SKIP 生效 */
