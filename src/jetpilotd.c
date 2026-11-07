@@ -167,6 +167,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define LOG_MAX_BYTES (256 * 1024)
 
 static void jp_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static const char *proc_label_log(const char *path);  /* 前置声明：demote_log_success 在其定义前调用 */
 static void jp_log(const char *fmt, ...) {
     struct stat st;
     int existed = (stat(LOG_PATH, &st) == 0);
