@@ -1,5 +1,5 @@
 /*
- * JetPilot v0.7.4 — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetPilot v0.7.5 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
@@ -39,6 +39,157 @@ static NSString *const kMemPressureConfig    = @"/var/mobile/Library/JetPilot/me
 static NSString *const kMemPressureConfigOff = @"/var/mobile/Library/JetPilot/mempressure.txt.off";
 static NSString *const kMemPressureState     = @"/var/mobile/Library/JetPilot/mempressure_state.txt";
 static NSString *const kMemPressureFloor     = @"/var/mobile/Library/JetPilot/mempressure_floor.txt";
+
+static NSString *const kBandsReqPath    = @"/var/mobile/Library/JetPilot/bands.req";
+static NSString *const kBandsReqTmpPath = @"/var/mobile/Library/JetPilot/bands.req.tmp";
+static NSString *const kBandsPath       = @"/var/mobile/Library/JetPilot/bands.txt";
+
+@interface JPBandsProcess : NSObject
+@property (nonatomic, copy) NSString *bundleId;
+@property (nonatomic, copy) NSString *procLabel;
+@property (nonatomic, assign) pid_t pid;
+@property (nonatomic, assign) NSInteger curBand;
+@property (nonatomic, assign) BOOL isOurs;
+@property (nonatomic, assign) BOOL hasOrig;
+@property (nonatomic, assign) NSInteger origBand;
+@property (nonatomic, assign) BOOL hasFp;
+@property (nonatomic, assign) NSInteger fpMb;
+- (NSString *)bandDescription;
+@end
+
+@implementation JPBandsProcess
+- (NSString *)bandDescription {
+    if (self.isOurs) {
+        if (self.hasOrig) {
+            return [NSString stringWithFormat:@"原 %ld → 现 %ld", (long)self.origBand, (long)self.curBand];
+        } else {
+            return [NSString stringWithFormat:@"现 %ld（原档位未知，守护进程重启过）", (long)self.curBand];
+        }
+    } else {
+        if (self.curBand == 100) {
+            return @"前台 100";
+        } else {
+            return [NSString stringWithFormat:@"后台 %ld", (long)self.curBand];
+        }
+    }
+}
+@end
+
+@interface JPBandsSnapshot : NSObject
+@property (nonatomic, copy) NSString *reqToken;
+@property (nonatomic, copy) NSString *updatedTime;
+@property (nonatomic, copy) NSArray<JPBandsProcess *> *processes;
+@property (nonatomic, assign) BOOL timedOut;
++ (void)requestSnapshotWithCompletion:(void (^)(JPBandsSnapshot *snapshot))completion;
+- (JPBandsProcess *)bestProcessForBundleId:(NSString *)bundleId;
+@end
+
+@implementation JPBandsSnapshot
+
++ (JPBandsSnapshot *)parseSnapshotContent:(NSString *)content expectedToken:(NSString *)expectedToken {
+    if (!content || content.length == 0) return nil;
+    NSArray<NSString *> *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    if (lines.count < 2) return nil;
+    NSString *line0 = lines[0];
+    if (![line0 hasPrefix:@"req="]) return nil;
+    NSString *token = [line0 substringFromIndex:4];
+    if (![token isEqualToString:expectedToken]) return nil;
+
+    JPBandsSnapshot *snap = [JPBandsSnapshot new];
+    snap.reqToken = token;
+    NSString *line1 = lines[1];
+    if ([line1 hasPrefix:@"updated="]) {
+        snap.updatedTime = [line1 substringFromIndex:8];
+    }
+
+    NSMutableArray<JPBandsProcess *> *procs = [NSMutableArray array];
+    for (NSUInteger i = 2; i < lines.count; i++) {
+        NSString *line = lines[i];
+        if (line.length == 0) continue;
+        NSArray<NSString *> *parts = [line componentsSeparatedByString:@"|"];
+        if (parts.count < 7) continue;
+
+        JPBandsProcess *bp = [JPBandsProcess new];
+        bp.bundleId = parts[0];
+        bp.procLabel = parts[1];
+        bp.pid = (pid_t)[parts[2] intValue];
+        bp.curBand = [parts[3] integerValue];
+        bp.isOurs = ([parts[4] intValue] == 1);
+        if ([parts[5] isEqualToString:@"NA"]) {
+            bp.hasOrig = NO;
+        } else {
+            bp.hasOrig = YES;
+            bp.origBand = [parts[5] integerValue];
+        }
+        if ([parts[6] isEqualToString:@"NA"]) {
+            bp.hasFp = NO;
+        } else {
+            bp.hasFp = YES;
+            bp.fpMb = [parts[6] integerValue];
+        }
+        [procs addObject:bp];
+    }
+    snap.processes = [procs copy];
+    return snap;
+}
+
++ (void)requestSnapshotWithCompletion:(void (^)(JPBandsSnapshot *snapshot))completion {
+    NSString *token = [NSString stringWithFormat:@"%lld_%u",
+        (long long)([[NSDate date] timeIntervalSince1970] * 1000.0),
+        arc4random_uniform(100000)];
+
+    NSError *err = nil;
+    [token writeToFile:kBandsReqTmpPath atomically:YES encoding:NSUTF8StringEncoding error:&err];
+    if (err == nil) {
+        rename([kBandsReqTmpPath UTF8String], [kBandsReqPath UTF8String]);
+    }
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        int attempts = 0;
+        JPBandsSnapshot *result = nil;
+        while (attempts < 15) {
+            sleep(1);
+            attempts++;
+            NSString *content = [NSString stringWithContentsOfFile:kBandsPath encoding:NSUTF8StringEncoding error:nil];
+            if (content.length > 0) {
+                JPBandsSnapshot *snap = [self parseSnapshotContent:content expectedToken:token];
+                if (snap) {
+                    result = snap;
+                    break;
+                }
+            }
+        }
+        if (!result) {
+            unlink([kBandsReqPath UTF8String]);
+            unlink([kBandsReqTmpPath UTF8String]);
+            result = [JPBandsSnapshot new];
+            result.reqToken = token;
+            result.timedOut = YES;
+            result.processes = @[];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) completion(result);
+        });
+    });
+}
+
+- (JPBandsProcess *)bestProcessForBundleId:(NSString *)bundleId {
+    if (!bundleId || bundleId.length == 0 || self.processes.count == 0) return nil;
+    JPBandsProcess *firstMatch = nil;
+    for (JPBandsProcess *bp in self.processes) {
+        if ([bp.bundleId isEqualToString:bundleId]) {
+            if ([bp.procLabel isEqualToString:@"main"]) {
+                return bp;
+            }
+            if (!firstMatch) {
+                firstMatch = bp;
+            }
+        }
+    }
+    return firstMatch;
+}
+
+@end
 
 typedef NS_ENUM(NSInteger, JPDaemonState) {
     JPDaemonStateRunning,
@@ -139,6 +290,8 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) unsigned long reassertsTotal;
 @property (nonatomic, copy) NSArray<JPProtectedApp *> *protectedApps;
 @property (nonatomic, assign) BOOL hasProtectedAppLines;
+@property (nonatomic, copy) NSArray<JPProtectedApp *> *demotedApps;
+@property (nonatomic, assign) BOOL hasDemotedAppLines;
 @property (nonatomic, assign) BOOL bidSupport;      /* 守护进程是否支持 bid: 规则 */
 @property (nonatomic, assign) unsigned long setFailTotal;
 @property (nonatomic, assign) BOOL hasSetFailTotal;
@@ -150,13 +303,14 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) BOOL hasLastError;
 + (JPStatusInfo *)loadCurrentStatus;
 + (JPProtectedApp *)parseProtectedAppLine:(NSString *)line;
++ (JPProtectedApp *)parseProtectedAppLine:(NSString *)line prefix:(NSString *)prefix;
 @end
 
 @implementation JPStatusInfo
 
-+ (JPProtectedApp *)parseProtectedAppLine:(NSString *)line {
-    if (!line || ![line hasPrefix:@"protected_app="]) return nil;
-    NSString *raw = [line substringFromIndex:14];
++ (JPProtectedApp *)parseProtectedAppLine:(NSString *)line prefix:(NSString *)prefix {
+    if (!line || !prefix || ![line hasPrefix:prefix]) return nil;
+    NSString *raw = [line substringFromIndex:prefix.length];
     NSArray<NSString *> *parts = [raw componentsSeparatedByString:@"|"];
     if (parts.count != 4) return nil;
 
@@ -195,11 +349,17 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     return app;
 }
 
++ (JPProtectedApp *)parseProtectedAppLine:(NSString *)line {
+    return [self parseProtectedAppLine:line prefix:@"protected_app="];
+}
+
 + (JPStatusInfo *)loadCurrentStatus {
     JPStatusInfo *st = [JPStatusInfo new];
     st.updated = @"";
     st.protectedApps = @[];
     st.hasProtectedAppLines = NO;
+    st.demotedApps = @[];
+    st.hasDemotedAppLines = NO;
     st.bidSupport = NO;
     st.setFailTotal = 0;
     st.hasSetFailTotal = NO;
@@ -213,6 +373,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     if (!raw || raw.length == 0) return st;
 
     NSMutableArray<JPProtectedApp *> *apps = [NSMutableArray array];
+    NSMutableArray<JPProtectedApp *> *demotedApps = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, NSString *> *labels = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSNumber *, NSString *> *bids = [NSMutableDictionary dictionary];
     NSArray<NSString *> *lines = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
@@ -233,12 +394,19 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             st.reassertsTotal = (unsigned long)[[line substringFromIndex:16] longLongValue];
         } else if ([line hasPrefix:@"protected_app="]) {
             st.hasProtectedAppLines = YES;
-            JPProtectedApp *app = [self parseProtectedAppLine:line];
+            JPProtectedApp *app = [self parseProtectedAppLine:line prefix:@"protected_app="];
             if (app) {
                 [apps addObject:app];
             }
-        } else if ([line hasPrefix:@"protected_proc="]) {
-            NSString *rest = [line substringFromIndex:15];
+        } else if ([line hasPrefix:@"demoted_app="]) {
+            st.hasDemotedAppLines = YES;
+            JPProtectedApp *app = [self parseProtectedAppLine:line prefix:@"demoted_app="];
+            if (app) {
+                [demotedApps addObject:app];
+            }
+        } else if ([line hasPrefix:@"protected_proc="] || [line hasPrefix:@"demoted_proc="]) {
+            NSString *prefix = [line hasPrefix:@"protected_proc="] ? @"protected_proc=" : @"demoted_proc=";
+            NSString *rest = [line substringFromIndex:prefix.length];
             NSArray<NSString *> *parts = [rest componentsSeparatedByString:@"|"];
             if (parts.count >= 2) {
                 int pidVal = [parts[0] intValue];
@@ -308,7 +476,12 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
         a.procLabel = labels[@(a.pid)];
         a.bundleId = bids[@(a.pid)];
     }
+    for (JPProtectedApp *a in demotedApps) {
+        a.procLabel = labels[@(a.pid)];
+        a.bundleId = bids[@(a.pid)];
+    }
     st.protectedApps = [apps copy];
+    st.demotedApps = [demotedApps copy];
     return st;
 }
 
@@ -1959,12 +2132,14 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     if (self.rule.type == JPRuleTypeProtect) {
         self.bandLabel.text = [NSString stringWithFormat:@"%ld", (long)self.rule.targetBand];
         self.bandLabel.textColor = UIColor.systemBlueColor;
+        self.pathLabel.text = self.rule.pathFragment;
     } else {
         NSInteger band = self.rule.targetBand;
         if (band < 0) band = 0;
         if (band > 30) band = 30;
         self.bandLabel.text = [NSString stringWithFormat:@"%ld", (long)band];
         self.bandLabel.textColor = UIColor.systemOrangeColor;
+        self.pathLabel.text = [NSString stringWithFormat:@"%@ · 不在前台时降到 %ld", self.rule.pathFragment, (long)band];
     }
 
     if (!installed) {
@@ -2002,8 +2177,43 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         NSInteger band = self.rule.targetBand;
         if (band < 0) band = 0;
         if (band > 30) band = 30;
-        self.statusLabel.text = [NSString stringWithFormat:@"不在前台时降到 %ld", (long)band];
-        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+
+        if (!status || !status.hasDemotedAppLines) {
+            self.statusLabel.text = [NSString stringWithFormat:@"不在前台时降到 %ld", (long)band];
+            self.statusLabel.textColor = UIColor.secondaryLabelColor;
+            return;
+        }
+
+        NSMutableArray<JPProtectedApp *> *matchedDemoted = [NSMutableArray array];
+        for (JPProtectedApp *pApp in status.demotedApps) {
+            if ([self.rule.pathFragment hasPrefix:@"bid:"]) {
+                NSString *bid = [self.rule.pathFragment substringFromIndex:4];
+                if ([pApp.bundleId isEqualToString:bid] || [pApp.pathFragment isEqualToString:self.rule.pathFragment]) {
+                    [matchedDemoted addObject:pApp];
+                }
+            } else {
+                if ([pApp.pathFragment isEqualToString:self.rule.pathFragment]) {
+                    [matchedDemoted addObject:pApp];
+                }
+            }
+        }
+
+        if (matchedDemoted.count == 1) {
+            JPProtectedApp *pApp = matchedDemoted.firstObject;
+            if (pApp.currentBand <= pApp.targetBand) {
+                self.statusLabel.text = [NSString stringWithFormat:@"运行中 · pid %d · 当前 %ld 档", pApp.pid, (long)pApp.currentBand];
+                self.statusLabel.textColor = UIColor.systemGreenColor;
+            } else {
+                self.statusLabel.text = [NSString stringWithFormat:@"运行中 · pid %d · 前台中，不降", pApp.pid];
+                self.statusLabel.textColor = UIColor.systemOrangeColor;
+            }
+        } else if (matchedDemoted.count > 1) {
+            self.statusLabel.text = [NSString stringWithFormat:@"运行中 · %lu 个进程", (unsigned long)matchedDemoted.count];
+            self.statusLabel.textColor = UIColor.systemGreenColor;
+        } else {
+            self.statusLabel.text = @"App 没在运行";
+            self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        }
         return;
     }
 
@@ -2057,6 +2267,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UISearchController *searchController;
 @property (nonatomic, strong) UIView *emptyView;
+@property (nonatomic, strong) JPBandsSnapshot *bandsSnapshot;
 @property (nonatomic, copy) void (^onSelectApp)(NSString *pathFragment, NSString *displayName);
 @property (nonatomic, copy) void (^onManualAdd)(NSString *pathFragment, JPRuleType type, NSInteger band);
 @end
@@ -2104,6 +2315,33 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     [self setupEmptyView];
     [self updateEmptyState];
+
+    __weak typeof(self) weakSelf = self;
+    [JPBandsSnapshot requestSnapshotWithCompletion:^(JPBandsSnapshot *snapshot) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.bandsSnapshot = snapshot;
+        [strongSelf updateFooterView];
+        [strongSelf.tableView reloadData];
+    }];
+    [self updateFooterView];
+}
+
+- (void)updateFooterView {
+    UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
+    footer.font = [UIFont systemFontOfSize:12];
+    footer.textColor = UIColor.secondaryLabelColor;
+    footer.textAlignment = NSTextAlignmentCenter;
+    footer.numberOfLines = 0;
+    if (self.bandsSnapshot.timedOut) {
+        footer.text = @"档位快照：守护进程未响应";
+        footer.textColor = UIColor.systemOrangeColor;
+    } else if (self.bandsSnapshot) {
+        footer.text = @"说明：原档位表示首次接管前的状态；守护进程重启后若原档位未知将提示。";
+    } else {
+        footer.text = @"正在获取进程档位快照…";
+    }
+    self.tableView.tableFooterView = footer;
 }
 
 - (void)setupEmptyView {
@@ -2239,14 +2477,29 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
     cell.textLabel.text = app.displayName;
 
+    JPBandsProcess *matchedProc = nil;
+    if (self.bandsSnapshot && app.bundleId.length > 0) {
+        matchedProc = [self.bandsSnapshot bestProcessForBundleId:app.bundleId];
+    }
+
+    NSString *procDesc = matchedProc ? [matchedProc bandDescription] : nil;
+
     BOOL added = [self isAppAlreadyAdded:app];
     if (added) {
-        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 已在规则中（点此编辑）", app.pathFragment];
+        if (procDesc) {
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 已在规则中（点此编辑）· %@", app.pathFragment, procDesc];
+        } else {
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 已在规则中（点此编辑）", app.pathFragment];
+        }
         cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     } else {
-        cell.detailTextLabel.text = app.pathFragment;
+        if (procDesc) {
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@", app.pathFragment, procDesc];
+        } else {
+            cell.detailTextLabel.text = app.pathFragment;
+        }
         cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
         cell.accessoryType = UITableViewCellAccessoryNone;
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -3006,7 +3259,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         NSDateFormatter *df = [NSDateFormatter new];
         df.dateFormat = @"yyyyMMdd-HHmmss";
         NSString *dateStr = [df stringFromDate:[NSDate date]];
-        NSString *zipFileName = [NSString stringWithFormat:@"JetPilot-logs-%@-v0.7.4.zip", dateStr];
+        NSString *zipFileName = [NSString stringWithFormat:@"JetPilot-logs-%@-v0.7.5.zip", dateStr];
         NSString *zipPath = [exportDir stringByAppendingPathComponent:zipFileName];
 
         NSData *zipData = JPCreateZipArchive(entries);
@@ -3086,6 +3339,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @property (nonatomic, strong) UILabel *sliderValLabel;
 @property (nonatomic, strong) UISlider *slider;
 @property (nonatomic, strong) UILabel *auxTipLabel;
+@property (nonatomic, strong) JPBandsSnapshot *bandsSnapshot;
 @end
 
 @implementation JPRuleEditViewController
@@ -3127,6 +3381,14 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
     ]];
+
+    __weak typeof(self) weakSelf = self;
+    [JPBandsSnapshot requestSnapshotWithCompletion:^(JPBandsSnapshot *snapshot) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.bandsSnapshot = snapshot;
+        [strongSelf.tableView reloadData];
+    }];
 }
 
 - (void)cancelTapped {
@@ -3186,7 +3448,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == 0) return 3;
+    if (section == 0) return 4;
     if (section == 1) return 1;
     return 1;
 }
@@ -3239,6 +3501,41 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             cell.textLabel.text = @"规则标识";
             cell.detailTextLabel.text = self.currentFrag;
             cell.detailTextLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            return cell;
+        } else if (indexPath.row == 2) {
+            UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+            cell.textLabel.text = @"当前档位";
+            NSString *desc = nil;
+            if (self.bandsSnapshot) {
+                if (self.bandsSnapshot.timedOut) {
+                    desc = @"守护进程未响应";
+                } else {
+                    NSString *targetBid = nil;
+                    if ([self.currentFrag hasPrefix:@"bid:"]) {
+                        targetBid = [self.currentFrag substringFromIndex:4];
+                    } else {
+                        for (JPInstalledApp *ia in self.installedApps) {
+                            if ([ia.pathFragment isEqualToString:self.currentFrag]) {
+                                targetBid = ia.bundleId;
+                                break;
+                            }
+                        }
+                    }
+                    JPBandsProcess *matchedProc = nil;
+                    if (targetBid.length > 0) {
+                        matchedProc = [self.bandsSnapshot bestProcessForBundleId:targetBid];
+                    }
+                    if (matchedProc) {
+                        desc = [matchedProc bandDescription];
+                    } else {
+                        desc = @"未运行";
+                    }
+                }
+            } else {
+                desc = @"获取中…";
+            }
+            cell.detailTextLabel.text = desc;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             return cell;
         } else {
@@ -3337,7 +3634,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    if (indexPath.section == 0 && indexPath.row == 2) {
+    if (indexPath.section == 0 && indexPath.row == 3) {
         [self reselectApp];
     } else if (indexPath.section == 2) {
         [self confirmDelete];
@@ -3352,6 +3649,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @interface MainViewController : UIViewController <JPRuleCardViewDelegate, JPRuleEditViewControllerDelegate>
 @property (nonatomic, strong) NSMutableArray<JPRule *> *rules;
 @property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
+@property (nonatomic, assign) NSInteger logLevel;
+@property (nonatomic, strong) NSMutableArray<NSString *> *configExtraLines;
+@property (nonatomic, strong) UISegmentedControl *logLevelSegment;
 
 @property (nonatomic, strong) UIScrollView *scrollView;
 @property (nonatomic, strong) UIStackView *contentStackView;
@@ -3546,6 +3846,11 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.addRuleCard = [self createAddRuleCard];
     [self.contentStackView addArrangedSubview:self.addRuleCard];
 
+    UILabel *settingsHeader = [self createSectionHeader:@"设置"];
+    [self.contentStackView addArrangedSubview:settingsHeader];
+    UIView *settingsCard = [self createSettingsCard];
+    [self.contentStackView addArrangedSubview:settingsCard];
+
     UILabel *aboutHeader = [self createSectionHeader:@"关于"];
     [self.contentStackView addArrangedSubview:aboutHeader];
     UIView *aboutCard = [self createAboutCard];
@@ -3617,6 +3922,68 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [card addGestureRecognizer:tap];
     card.userInteractionEnabled = YES;
     return card;
+}
+
+- (UIView *)createSettingsCard {
+    UIView *card = [UIView new];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    card.layer.cornerRadius = 14;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.clipsToBounds = YES;
+
+    UIStackView *stack = [UIStackView new];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 10;
+
+    UIStackView *row = [UIStackView new];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.distribution = UIStackViewDistributionEqualSpacing;
+
+    UILabel *titleLabel = [UILabel new];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    titleLabel.textColor = UIColor.labelColor;
+    titleLabel.text = @"日志等级";
+
+    UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"关键", @"标准", @"详细"]];
+    seg.translatesAutoresizingMaskIntoConstraints = NO;
+    seg.selectedSegmentIndex = (self.logLevel >= 1 && self.logLevel <= 3) ? (self.logLevel - 1) : 1;
+    [seg addTarget:self action:@selector(onLogLevelChanged:) forControlEvents:UIControlEventValueChanged];
+    self.logLevelSegment = seg;
+
+    [row addArrangedSubview:titleLabel];
+    [row addArrangedSubview:seg];
+    [stack addArrangedSubview:row];
+    [card addSubview:stack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
+        [stack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [stack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [stack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12]
+    ]];
+
+    return card;
+}
+
+- (void)onLogLevelChanged:(UISegmentedControl *)sender {
+    NSInteger oldVal = self.logLevel;
+    NSInteger newVal = sender.selectedSegmentIndex + 1;
+    self.logLevel = newVal;
+    NSError *err = nil;
+    if (![self saveConfigWithError:&err]) {
+        self.logLevel = oldVal;
+        sender.selectedSegmentIndex = (oldVal >= 1 && oldVal <= 3) ? (oldVal - 1) : 1;
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"保存失败"
+                                                                       message:[NSString stringWithFormat:@"日志等级保存失败：%@", err.localizedDescription ?: @"写入错误"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+    }
 }
 
 - (UIView *)createAboutCard {
@@ -3788,6 +4155,8 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 - (void)loadConfig {
     [self.rules removeAllObjects];
+    self.configExtraLines = [NSMutableArray array];
+    self.logLevel = 2;
     NSError *err = nil;
     NSString *content = [NSString stringWithContentsOfFile:kConfig encoding:NSUTF8StringEncoding error:&err];
     if (!content || content.length == 0) {
@@ -3805,12 +4174,12 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         for (NSString *t in tokens) {
             if (t.length > 0) [cleanTokens addObject:t];
         }
-        if (cleanTokens.count < 2) continue;
+        if (cleanTokens.count == 0) continue;
 
         NSString *verb = cleanTokens[0];
-        NSString *frag = cleanTokens[1];
-
         if ([verb isEqualToString:@"protect"]) {
+            if (cleanTokens.count < 2) continue;
+            NSString *frag = cleanTokens[1];
             NSInteger band = 50;
             if (cleanTokens.count >= 3) {
                 band = [cleanTokens[2] integerValue];
@@ -3827,6 +4196,8 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             [self evaluateRuleConflict:r];
             [self.rules addObject:r];
         } else if ([verb isEqualToString:@"demote"]) {
+            if (cleanTokens.count < 2) continue;
+            NSString *frag = cleanTokens[1];
             NSInteger band = 30;
             if (cleanTokens.count >= 3) {
                 band = [cleanTokens[2] integerValue];
@@ -3841,7 +4212,27 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             r.displayName = [self resolveDisplayNameForFragment:frag];
             [self evaluateRuleConflict:r];
             [self.rules addObject:r];
+        } else if ([verb isEqualToString:@"loglevel"]) {
+            if (cleanTokens.count >= 2) {
+                const char *cstr = [cleanTokens[1] UTF8String];
+                char *endp = NULL;
+                long val = strtol(cstr, &endp, 10);
+                if (endp && *endp == '\0' && endp != cstr) {
+                    if (val < 1) val = 1;
+                    if (val > 3) val = 3;
+                    self.logLevel = val;
+                } else {
+                    self.logLevel = 2;
+                }
+            } else {
+                self.logLevel = 2;
+            }
+        } else {
+            [self.configExtraLines addObject:rawLine];
         }
+    }
+    if (self.logLevelSegment) {
+        self.logLevelSegment.selectedSegmentIndex = (self.logLevel >= 1 && self.logLevel <= 3) ? (self.logLevel - 1) : 1;
     }
 }
 
@@ -3850,6 +4241,11 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [outStr appendString:@"# JetPilot 规则（iOS 16 档位：后台 30，前台 100）\n"];
     [outStr appendString:@"# protect <路径片段> <档位，最高 95>\n"];
     [outStr appendString:@"# demote  <路径片段> [档位] （降到指定档位，默认 30）\n"];
+
+    NSInteger lvl = self.logLevel;
+    if (lvl < 1) lvl = 1;
+    if (lvl > 3) lvl = 3;
+    [outStr appendFormat:@"loglevel %ld\n", (long)lvl];
 
     for (JPRule *r in self.rules) {
         if (r.type == JPRuleTypeProtect) {
@@ -3863,6 +4259,10 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             if (band > 30) band = 30;
             [outStr appendFormat:@"demote %@ %ld\n", r.pathFragment, (long)band];
         }
+    }
+
+    for (NSString *extra in self.configExtraLines) {
+        [outStr appendFormat:@"%@\n", extra];
     }
 
     NSError *err = nil;
@@ -4740,11 +5140,11 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         self.thrLabel.textColor = UIColor.systemBlueColor;
     } else {
         self.alpha = 1.0;
-        BOOL isLow = (floor && floor.median > 0 && self.rule.thresholdMB < (floor.median + 50.0));
+        BOOL isLow = (floor && floor.median > 0 && self.rule.thresholdMB < floor.median);
         if (isLow) {
-            self.thrLabel.textColor = UIColor.systemOrangeColor;
-            self.statusLabel.text = [NSString stringWithFormat:@"底线 ~%.1f MB (样本 %ld) · 阈值偏低", floor.median, (long)floor.sampleCount];
-            self.statusLabel.textColor = UIColor.systemOrangeColor;
+            self.thrLabel.textColor = UIColor.systemRedColor;
+            self.statusLabel.text = [NSString stringWithFormat:@"底线 ~%.1f MB (样本 %ld) · 阈值低于底线", floor.median, (long)floor.sampleCount];
+            self.statusLabel.textColor = UIColor.systemRedColor;
         } else if (floor && floor.median > 0) {
             self.thrLabel.textColor = UIColor.systemBlueColor;
             self.statusLabel.text = [NSString stringWithFormat:@"底线 ~%.1f MB (有效样本 %ld 个)", floor.median, (long)floor.sampleCount];
@@ -4928,6 +5328,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @property (nonatomic, strong) UILabel *thrWarnLabel;
 @property (nonatomic, strong) UILabel *cdValLabel;
 @property (nonatomic, assign) uint64_t memcapMB;
+@property (nonatomic, strong) JPBandsSnapshot *bandsSnapshot;
+@property (nonatomic, assign) NSInteger matchedFpMb;
+@property (nonatomic, assign) BOOL hasMatchedFp;
 @end
 
 @implementation JPMemPressureRuleEditViewController
@@ -4967,6 +5370,56 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
     ]];
+
+    if (!self.floor && self.rule.frag.length > 0) {
+        NSDictionary<NSString *, JPMemPressureFloorEntry *> *floors = [JPMemPressureFloorEntry loadFloorFile];
+        JPMemPressureFloorEntry *f = floors[self.rule.frag];
+        if (!f && [self.rule.frag hasPrefix:@"bid:"]) {
+            f = floors[[self.rule.frag substringFromIndex:4]];
+        }
+        if (!f && ![self.rule.frag hasPrefix:@"bid:"]) {
+            f = floors[[@"bid:" stringByAppendingString:self.rule.frag]];
+        }
+        self.floor = f;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [JPBandsSnapshot requestSnapshotWithCompletion:^(JPBandsSnapshot *snapshot) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.bandsSnapshot = snapshot;
+        [strongSelf resolveMatchedFp];
+        [strongSelf updateThresholdDisplay];
+    }];
+}
+
+- (void)resolveMatchedFp {
+    self.hasMatchedFp = NO;
+    self.matchedFpMb = 0;
+    if (!self.bandsSnapshot || self.bandsSnapshot.processes.count == 0) return;
+
+    NSString *targetBid = nil;
+    if ([self.rule.frag hasPrefix:@"bid:"]) {
+        targetBid = [self.rule.frag substringFromIndex:4];
+    } else {
+        for (JPInstalledApp *ia in self.installedApps) {
+            if ([ia.pathFragment isEqualToString:self.rule.frag] ||
+                [ia.bundleId isEqualToString:self.rule.frag]) {
+                targetBid = ia.bundleId;
+                break;
+            }
+        }
+    }
+
+    JPBandsProcess *matchedProc = nil;
+    if (targetBid.length > 0) {
+        matchedProc = [self.bandsSnapshot bestProcessForBundleId:targetBid];
+    }
+
+    if (matchedProc && matchedProc.hasFp && matchedProc.fpMb > 0) {
+        self.matchedFpMb = matchedProc.fpMb;
+        self.hasMatchedFp = YES;
+    }
 }
 
 - (void)cancelTapped {
@@ -5189,13 +5642,24 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 - (void)updateThresholdDisplay {
     self.thrValLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.currentThr];
-    BOOL isLow = (self.floor && self.floor.median > 0 && self.currentThr < (self.floor.median + 50.0));
-    if (isLow) {
+
+    double floorMed = (self.floor && self.floor.median > 0) ? self.floor.median : 0.0;
+    BOOL belowFloor = (floorMed > 0 && (double)self.currentThr < floorMed);
+    BOOL aboveFloorBelowFp = (self.hasMatchedFp && self.currentThr < self.matchedFpMb && (floorMed == 0.0 || (double)self.currentThr >= floorMed));
+
+    if (belowFloor) {
+        self.thrValLabel.textColor = UIColor.systemRedColor;
+        self.thrWarnLabel.textColor = UIColor.systemRedColor;
+        self.thrWarnLabel.text = [NSString stringWithFormat:@"这个 App 释放后也有约 %ld MB，阈值比它还低，每次冷却结束都会再触发", (long)round(floorMed)];
+        self.thrWarnLabel.hidden = NO;
+    } else if (aboveFloorBelowFp) {
         self.thrValLabel.textColor = UIColor.systemOrangeColor;
-        self.thrWarnLabel.text = [NSString stringWithFormat:@"⚠️ 阈值低于「底线 + 50 MB」（底线 %.1f MB），可能频繁无效触发并导致冷却退避。", self.floor.median];
+        self.thrWarnLabel.textColor = UIColor.systemOrangeColor;
+        self.thrWarnLabel.text = [NSString stringWithFormat:@"此刻约 %ld MB，已经超过阈值，保存后会马上触发一次", (long)self.matchedFpMb];
         self.thrWarnLabel.hidden = NO;
     } else {
         self.thrValLabel.textColor = UIColor.systemBlueColor;
+        self.thrWarnLabel.text = @"";
         self.thrWarnLabel.hidden = YES;
     }
 }
