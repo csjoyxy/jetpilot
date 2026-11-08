@@ -1183,6 +1183,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, assign) NSInteger totalKills;
 @property (nonatomic, copy) NSArray<JPJetsamDaySummary *> *daySummaries;
 @property (nonatomic, assign) NSInteger skippedFilesCount;
+@property (nonatomic, assign) BOOL available;
 + (JPKilledStatsInfo *)loadStatsForRules:(NSArray<JPRule *> *)rules installedApps:(NSArray<JPInstalledApp *> *)apps;
 @end
 
@@ -1193,18 +1194,9 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     result.totalKills = 0;
     result.daySummaries = @[];
     result.skippedFilesCount = 0;
+    result.available = NO;
 
     @try {
-        NSMutableArray<JPRule *> *protectRules = [NSMutableArray array];
-        for (JPRule *r in rules) {
-            if (r.type == JPRuleTypeProtect && r.pathFragment.length > 0) {
-                [protectRules addObject:r];
-            }
-        }
-        if (protectRules.count == 0) {
-            return result;
-        }
-
         NSFileManager *fm = NSFileManager.defaultManager;
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:kCrashReporterDir isDirectory:&isDir] || !isDir) {
@@ -1213,7 +1205,33 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
         NSError *dirErr = nil;
         NSArray<NSString *> *allFiles = [fm contentsOfDirectoryAtPath:kCrashReporterDir error:&dirErr];
-        if (!allFiles || allFiles.count == 0) {
+        if (!allFiles) {
+            return result;
+        }
+
+        result.available = YES;
+
+        if (allFiles.count == 0) {
+            return result;
+        }
+
+        NSInteger jetsamFilesCount = 0;
+        for (NSString *filename in allFiles) {
+            if ([filename hasPrefix:@"JetsamEvent-"] && [filename.pathExtension isEqualToString:@"ips"]) {
+                jetsamFilesCount++;
+            }
+        }
+        if (jetsamFilesCount == 0) {
+            return result;
+        }
+
+        NSMutableArray<JPRule *> *protectRules = [NSMutableArray array];
+        for (JPRule *r in rules) {
+            if (r.type == JPRuleTypeProtect && r.pathFragment.length > 0) {
+                [protectRules addObject:r];
+            }
+        }
+        if (protectRules.count == 0) {
             return result;
         }
 
@@ -1479,8 +1497,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, strong) UIView *errorContainerView;
 @property (nonatomic, strong) UILabel *failureCountLabel;
 @property (nonatomic, strong) UILabel *failureDetailLabel;
+@property (nonatomic, strong) UIButton *killedStatsEntryButton;
+@property (nonatomic, copy) void (^onTapKilledStats)(void);
 
 - (void)updateWithStatus:(JPStatusInfo *)status isRunning:(BOOL)isRunning;
+- (void)updateKilledCount:(NSInteger)totalKills available:(BOOL)available;
+- (void)updateKilledCount:(NSInteger)totalKills;
 @end
 
 @implementation JPStatusCardView
@@ -1611,6 +1633,18 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     div2.translatesAutoresizingMaskIntoConstraints = NO;
     div2.backgroundColor = UIColor.separatorColor;
 
+    self.killedStatsEntryButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.killedStatsEntryButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.killedStatsEntryButton setTitle:@"被杀统计读取中…" forState:UIControlStateNormal];
+    [self.killedStatsEntryButton setTitleColor:UIColor.secondaryLabelColor forState:UIControlStateNormal];
+    self.killedStatsEntryButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    self.killedStatsEntryButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+    [self.killedStatsEntryButton addTarget:self action:@selector(killedStatsEntryTapped) forControlEvents:UIControlEventTouchUpInside];
+
+    UIView *div3 = [UIView new];
+    div3.translatesAutoresizingMaskIntoConstraints = NO;
+    div3.backgroundColor = UIColor.separatorColor;
+
     self.actionButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.actionButton.translatesAutoresizingMaskIntoConstraints = NO;
     self.actionButton.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
@@ -1623,6 +1657,8 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [self addSubview:div1];
     [self addSubview:self.metricsAndErrorStack];
     [self addSubview:div2];
+    [self addSubview:self.killedStatsEntryButton];
+    [self addSubview:div3];
     [self addSubview:self.actionButton];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -1644,7 +1680,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         [div2.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
         [div2.heightAnchor constraintEqualToConstant:0.5],
 
-        [self.actionButton.topAnchor constraintEqualToAnchor:div2.bottomAnchor constant:12],
+        [self.killedStatsEntryButton.topAnchor constraintEqualToAnchor:div2.bottomAnchor constant:6],
+        [self.killedStatsEntryButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [self.killedStatsEntryButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [self.killedStatsEntryButton.heightAnchor constraintEqualToConstant:30],
+
+        [div3.topAnchor constraintEqualToAnchor:self.killedStatsEntryButton.bottomAnchor constant:6],
+        [div3.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
+        [div3.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
+        [div3.heightAnchor constraintEqualToConstant:0.5],
+
+        [self.actionButton.topAnchor constraintEqualToAnchor:div3.bottomAnchor constant:12],
         [self.actionButton.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
         [self.actionButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
         [self.actionButton.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-16],
@@ -1735,6 +1781,32 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     if (self.onActionToggle) {
         self.onActionToggle();
     }
+}
+
+- (void)killedStatsEntryTapped {
+    if (self.onTapKilledStats) {
+        self.onTapKilledStats();
+    }
+}
+
+- (void)updateKilledCount:(NSInteger)totalKills available:(BOOL)available {
+    if (!available) {
+        [self.killedStatsEntryButton setTitle:@"被杀统计不可用" forState:UIControlStateNormal];
+        [self.killedStatsEntryButton setTitleColor:UIColor.secondaryLabelColor forState:UIControlStateNormal];
+        self.killedStatsEntryButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    } else if (totalKills == 0) {
+        [self.killedStatsEntryButton setTitle:@"近 7 天无被杀 ›" forState:UIControlStateNormal];
+        [self.killedStatsEntryButton setTitleColor:UIColor.secondaryLabelColor forState:UIControlStateNormal];
+        self.killedStatsEntryButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    } else {
+        [self.killedStatsEntryButton setTitle:[NSString stringWithFormat:@"近 7 天被杀 %ld 次 ›", (long)totalKills] forState:UIControlStateNormal];
+        [self.killedStatsEntryButton setTitleColor:UIColor.systemRedColor forState:UIControlStateNormal];
+        self.killedStatsEntryButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    }
+}
+
+- (void)updateKilledCount:(NSInteger)totalKills {
+    [self updateKilledCount:totalKills available:YES];
 }
 
 - (void)updateWithStatus:(JPStatusInfo *)status isRunning:(BOOL)isRunning {
@@ -1859,8 +1931,8 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.summaryLabel = [UILabel new];
     self.summaryLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.summaryLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    self.summaryLabel.textColor = UIColor.systemGreenColor;
-    self.summaryLabel.text = @"无被杀记录";
+    self.summaryLabel.textColor = UIColor.secondaryLabelColor;
+    self.summaryLabel.text = @"被杀统计读取中…";
 
     self.div2 = [UIView new];
     self.div2.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1951,7 +2023,12 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         [v removeFromSuperview];
     }
 
-    if (stats.totalKills == 0) {
+    if (!stats.available) {
+        self.summaryLabel.textColor = UIColor.secondaryLabelColor;
+        self.summaryLabel.text = @"被杀统计不可用";
+        self.div2.hidden = YES;
+        self.rowsStackView.hidden = YES;
+    } else if (stats.totalKills == 0) {
         self.summaryLabel.textColor = UIColor.systemGreenColor;
         self.summaryLabel.text = @"无被杀记录";
         self.div2.hidden = YES;
@@ -4155,15 +4232,14 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.statusCard.onTapProtected = ^{
         [weakSelf showProtectedList];
     };
+    self.statusCard.onTapKilledStats = ^{
+        [weakSelf scrollToKilledStatsCard];
+    };
 
     [self.contentStackView addArrangedSubview:statusHeader];
     [self.contentStackView addArrangedSubview:self.statusCard];
 
-    // 2. Killed Stats Section
-    self.killedStatsCard = [JPKilledStatsCardView new];
-    [self.contentStackView addArrangedSubview:self.killedStatsCard];
-
-    // 3. Rules Section
+    // 2. Rules Section
     self.rulesSectionHeaderLabel = [self createSectionHeader:@"保护规则"];
     UILabel *rulesNote = [UILabel new];
     rulesNote.translatesAutoresizingMaskIntoConstraints = NO;
@@ -4185,6 +4261,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.addRuleCard = [self createAddRuleCard];
     [self.contentStackView addArrangedSubview:self.addRuleCard];
 
+    // 4. Killed Stats Section（卡片挪到主页最底部，放在「关于」上面）
+    self.killedStatsCard = [JPKilledStatsCardView new];
+    [self.contentStackView addArrangedSubview:self.killedStatsCard];
 
     UILabel *aboutHeader = [self createSectionHeader:@"关于"];
     [self.contentStackView addArrangedSubview:aboutHeader];
@@ -4879,6 +4958,20 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [self refreshStatus];
 }
 
+- (void)scrollToKilledStatsCard {
+    if (!self.killedStatsCard) return;
+    CGRect rect = [self.contentStackView convertRect:self.killedStatsCard.bounds fromView:self.killedStatsCard];
+    rect.origin.y += 12; // 算上 contentStackView 顶部 12pt 偏移，卡片底边完整露出 (P8)
+    [self.scrollView scrollRectToVisible:rect animated:YES];
+    [UIView animateWithDuration:0.2 animations:^{
+        self.killedStatsCard.alpha = 0.5;
+    } completion:^(BOOL finished) {
+        [UIView animateWithDuration:0.3 animations:^{
+            self.killedStatsCard.alpha = 1.0;
+        }];
+    }];
+}
+
 - (void)refreshKilledStatsIfNeeded:(BOOL)force {
     if (!self.killedStatsCard) return;
 
@@ -4906,6 +4999,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf || strongSelf.killStatsGeneration != gen) return;
             [strongSelf.killedStatsCard updateWithStats:stats];
+            [strongSelf.statusCard updateKilledCount:stats.totalKills available:stats.available];
         });
     });
 }
