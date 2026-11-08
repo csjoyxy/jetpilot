@@ -63,7 +63,7 @@ static NSString *const kBandsPath       = @"/var/mobile/Library/JetPilot/bands.t
         if (self.hasOrig) {
             return [NSString stringWithFormat:@"原 %ld → 现 %ld", (long)self.origBand, (long)self.curBand];
         } else {
-            return [NSString stringWithFormat:@"现 %ld（原档位未知，守护进程重启过）", (long)self.curBand];
+            return [NSString stringWithFormat:@"%ld · 原档位未知", (long)self.curBand];
         }
     } else {
         if (self.curBand == 100) {
@@ -2328,7 +2328,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 }
 
 - (void)updateFooterView {
-    UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 44)];
+    UILabel *footer = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 56)];
     footer.font = [UIFont systemFontOfSize:12];
     footer.textColor = UIColor.secondaryLabelColor;
     footer.textAlignment = NSTextAlignmentCenter;
@@ -2337,7 +2337,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         footer.text = @"档位快照：守护进程未响应";
         footer.textColor = UIColor.systemOrangeColor;
     } else if (self.bandsSnapshot) {
-        footer.text = @"说明：原档位表示首次接管前的状态；守护进程重启后若原档位未知将提示。";
+        footer.text = @"档位会随状态变化（挂起 0、刚切后台 30–40、收推送时会被拉高），这里只是此刻的值。原档位未知 = 守护进程重启前就接管了。";
     } else {
         footer.text = @"正在获取进程档位快照…";
     }
@@ -2476,6 +2476,8 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     JPInstalledApp *app = self.filteredApps[indexPath.row];
     cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
     cell.textLabel.text = app.displayName;
+    cell.textLabel.numberOfLines = 0;
+    cell.detailTextLabel.numberOfLines = 0;
 
     JPBandsProcess *matchedProc = nil;
     if (self.bandsSnapshot && app.bundleId.length > 0) {
@@ -3471,6 +3473,166 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 @end
 
+#pragma mark - Controllers: Process Bands
+
+@interface JPProcessBandsViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, copy) NSString *targetBundleId;
+@property (nonatomic, copy) NSString *appName;
+@property (nonatomic, strong) JPBandsSnapshot *snapshot;
+@property (nonatomic, copy) NSArray<JPBandsProcess *> *processes;
+@property (nonatomic, strong) UITableView *tableView;
+@end
+
+@implementation JPProcessBandsViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"进程档位";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+
+    UIBarButtonItem *refreshItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(refreshBands)];
+    self.navigationItem.rightBarButtonItem = refreshItem;
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    [self.view addSubview:self.tableView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.tableView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
+
+    [self reloadProcessesFromSnapshot];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    if (self.targetBundleId.length == 0) {
+        [self reloadProcessesFromSnapshot];
+        return;
+    }
+    if (!self.snapshot) {
+        [self refreshBands];
+    } else {
+        [self reloadProcessesFromSnapshot];
+    }
+}
+
+- (void)reloadProcessesFromSnapshot {
+    NSMutableArray<JPBandsProcess *> *matched = [NSMutableArray array];
+    if (self.targetBundleId.length > 0 && self.snapshot.processes.count > 0) {
+        for (JPBandsProcess *p in self.snapshot.processes) {
+            if ([p.bundleId isEqualToString:self.targetBundleId]) {
+                [matched addObject:p];
+            }
+        }
+    }
+    [matched sortUsingComparator:^NSComparisonResult(JPBandsProcess *p1, JPBandsProcess *p2) {
+        BOOL isMain1 = [p1.procLabel isEqualToString:@"main"];
+        BOOL isMain2 = [p2.procLabel isEqualToString:@"main"];
+        if (isMain1 && !isMain2) return NSOrderedAscending;
+        if (!isMain1 && isMain2) return NSOrderedDescending;
+        if (p1.curBand > p2.curBand) return NSOrderedAscending;
+        if (p1.curBand < p2.curBand) return NSOrderedDescending;
+        if (p1.pid < p2.pid) return NSOrderedAscending;
+        if (p1.pid > p2.pid) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    self.processes = [matched copy];
+    [self.tableView reloadData];
+}
+
+- (void)refreshBands {
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    [spinner startAnimating];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:spinner];
+
+    __weak typeof(self) weakSelf = self;
+    [JPBandsSnapshot requestSnapshotWithCompletion:^(JPBandsSnapshot *snap) {
+        weakSelf.snapshot = snap;
+        [weakSelf reloadProcessesFromSnapshot];
+        UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:weakSelf action:@selector(refreshBands)];
+        weakSelf.navigationItem.rightBarButtonItem = item;
+    }];
+}
+
+#pragma mark - Table View
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return 1;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return (self.processes.count > 0) ? self.processes.count : 1;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (self.targetBundleId.length == 0) {
+        return @"活跃进程";
+    }
+    if (self.snapshot.updatedTime.length > 0) {
+        return [NSString stringWithFormat:@"快照时间：%@（%lu 个进程）", self.snapshot.updatedTime, (unsigned long)self.processes.count];
+    }
+    return self.processes.count > 0 ? [NSString stringWithFormat:@"活跃进程（%lu 个）", (unsigned long)self.processes.count] : @"活跃进程";
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    return @"档位会随状态变化（挂起 0、刚切后台 30–40、收推送时会被拉高），这里只是此刻的值。原档位未知 = 守护进程重启前就接管了。";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    static NSString *const kCellId = @"JPProcessBandCell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kCellId];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:kCellId];
+    }
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.textLabel.numberOfLines = 0;
+    cell.detailTextLabel.numberOfLines = 0;
+
+    if (self.processes.count == 0) {
+        cell.textLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+        cell.textLabel.textColor = UIColor.secondaryLabelColor;
+        if (self.targetBundleId.length == 0) {
+            cell.textLabel.text = @"无法确定这条规则对应的 App";
+            cell.detailTextLabel.text = @"";
+        } else if (self.snapshot.timedOut) {
+            cell.textLabel.text = @"守护进程未响应";
+            cell.detailTextLabel.text = @"获取档位快照超时";
+        } else if (!self.snapshot) {
+            cell.textLabel.text = @"正在获取快照…";
+            cell.detailTextLabel.text = @"请稍候";
+        } else {
+            cell.textLabel.text = @"未检测到运行中的进程";
+            cell.detailTextLabel.text = @"当前 App 没有处于运行中的主程序或扩展进程";
+        }
+        cell.detailTextLabel.textColor = UIColor.tertiaryLabelColor;
+        return cell;
+    }
+
+    JPBandsProcess *bp = self.processes[indexPath.row];
+    BOOL isMain = [bp.procLabel isEqualToString:@"main"];
+    NSString *name = isMain ? [NSString stringWithFormat:@"%@ (主程序)", self.appName ?: @"主程序"] : [NSString stringWithFormat:@"%@ (扩展)", bp.procLabel];
+    cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    cell.textLabel.textColor = UIColor.labelColor;
+    cell.textLabel.text = name;
+
+    NSString *origStr = bp.hasOrig ? [NSString stringWithFormat:@"原 %ld", (long)bp.origBand] : @"原档位未知";
+    NSString *memStr = bp.hasFp ? [NSString stringWithFormat:@"%ld MB", (long)bp.fpMb] : @"内存未知";
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"pid %d · 现 %ld · %@ · %@",
+                                 (int)bp.pid, (long)bp.curBand, origStr, memStr];
+
+    return cell;
+}
+
+@end
+
 #pragma mark - Controllers: Rule Edit
 
 @protocol JPRuleEditViewControllerDelegate <NSObject>
@@ -3613,6 +3775,13 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     return nil;
 }
 
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 0) {
+        return @"档位会随状态变化（挂起 0、刚切后台 30–40、收推送时会被拉高），这里只是此刻的值。原档位未知 = 守护进程重启前就接管了。";
+    }
+    return nil;
+}
+
 - (void)updateBandDisplay {
     self.sliderValLabel.text = BandDescription(self.currentBand);
     if (self.rule.type == JPRuleTypeProtect) {
@@ -3658,6 +3827,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         } else if (indexPath.row == 2) {
             UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
             cell.textLabel.text = @"当前档位";
+            cell.detailTextLabel.numberOfLines = 0;
             NSString *desc = nil;
             if (self.bandsSnapshot) {
                 if (self.bandsSnapshot.timedOut) {
@@ -3688,7 +3858,8 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
                 desc = @"获取中…";
             }
             cell.detailTextLabel.text = desc;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
             return cell;
         } else {
             UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
@@ -3786,7 +3957,24 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    if (indexPath.section == 0 && indexPath.row == 3) {
+    if (indexPath.section == 0 && indexPath.row == 2) {
+        NSString *targetBid = nil;
+        if ([self.currentFrag hasPrefix:@"bid:"]) {
+            targetBid = [self.currentFrag substringFromIndex:4];
+        } else {
+            for (JPInstalledApp *ia in self.installedApps) {
+                if ([ia.pathFragment isEqualToString:self.currentFrag]) {
+                    targetBid = ia.bundleId;
+                    break;
+                }
+            }
+        }
+        JPProcessBandsViewController *vc = [JPProcessBandsViewController new];
+        vc.targetBundleId = targetBid;
+        vc.appName = self.currentDisplayName.length > 0 ? self.currentDisplayName : self.currentFrag;
+        vc.snapshot = self.bandsSnapshot;
+        [self.navigationController pushViewController:vc animated:YES];
+    } else if (indexPath.section == 0 && indexPath.row == 3) {
         [self reselectApp];
     } else if (indexPath.section == 2) {
         [self confirmDelete];
