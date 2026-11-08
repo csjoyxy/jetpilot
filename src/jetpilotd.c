@@ -165,15 +165,38 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define BANDS_TAKEN_PATH CONFIG_DIR "/bands.req.taken"
 #define BANDS_PATH       CONFIG_DIR "/bands.txt"
 #define BANDS_TMP_PATH   CONFIG_DIR "/bands.txt.tmp"
-#define JP_VERSION   "0.7.5"
+#define JP_VERSION   "0.7.6"
 #define LOG_PATH     CONFIG_DIR "/daemon.log"
 #define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
 #define LOG_MAX_BYTES (256 * 1024)
 
-static int g_loglevel = 2;
+enum {
+    JP_LOG_OFF   = 0,
+    JP_LOG_ERR   = 1,
+    JP_LOG_WARN  = 2,
+    JP_LOG_INFO  = 3,
+    JP_LOG_DEBUG = 4,
+};
+#define JP_ERR   JP_LOG_ERR
+#define JP_WARN  JP_LOG_WARN
+#define JP_INFO  JP_LOG_INFO
+#define JP_DEBUG JP_LOG_DEBUG
+
+static int g_loglevel = JP_LOG_INFO;
+static const char *loglevel_to_str(int lvl) {
+    switch (lvl) {
+        case JP_LOG_OFF:   return "off";
+        case JP_LOG_ERR:   return "error";
+        case JP_LOG_WARN:  return "warning";
+        case JP_LOG_INFO:  return "info";
+        case JP_LOG_DEBUG: return "debug";
+        default:           return "unknown";
+    }
+}
+
 static void jp_log_write(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #define JPLOG(lvl, fmt, ...) do { \
-    if ((lvl) <= g_loglevel) { \
+    if (g_loglevel != JP_LOG_OFF && (lvl) <= g_loglevel) { \
         jp_log_write((fmt), ##__VA_ARGS__); \
     } \
 } while (0)
@@ -272,12 +295,12 @@ static void act_dedup_clear(pid_t pid) {
         if (g_act_dedup[i].pid == pid) {
             if (g_act_dedup[i].suppressed_count > 0) {
                 if (g_act_dedup[i].kind == ACT_KIND_RAISE) {
-                    JPLOG(2, "%-6s pid=%d %s %s ->%d ×%d (end) cur=%d..%d",
+                    JPLOG(JP_INFO, "%-6s pid=%d %s %s ->%d ×%d (end) cur=%d..%d",
                            "RAISE", (int)g_act_dedup[i].pid, g_act_dedup[i].label, g_act_dedup[i].frag,
                            (int)g_act_dedup[i].target, g_act_dedup[i].suppressed_count,
                            (int)g_act_dedup[i].cur_min, (int)g_act_dedup[i].cur_max);
                 } else {
-                    JPLOG(2, "%-6s pid=%d %s %s %d->%d ×%d (end)",
+                    JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ×%d (end)",
                            "DEMOTE", (int)g_act_dedup[i].pid, g_act_dedup[i].label, g_act_dedup[i].frag,
                            (int)g_act_dedup[i].cur, (int)g_act_dedup[i].target, g_act_dedup[i].suppressed_count);
                 }
@@ -293,12 +316,12 @@ static void act_dedup_flush_all(void) {
     for (int i = 0; i < g_act_dedup_count; i++) {
         if (g_act_dedup[i].suppressed_count > 0) {
             if (g_act_dedup[i].kind == ACT_KIND_RAISE) {
-                JPLOG(2, "%-6s pid=%d %s %s ->%d ×%d (end) cur=%d..%d",
+                JPLOG(JP_INFO, "%-6s pid=%d %s %s ->%d ×%d (end) cur=%d..%d",
                        "RAISE", (int)g_act_dedup[i].pid, g_act_dedup[i].label, g_act_dedup[i].frag,
                        (int)g_act_dedup[i].target, g_act_dedup[i].suppressed_count,
                        (int)g_act_dedup[i].cur_min, (int)g_act_dedup[i].cur_max);
             } else {
-                JPLOG(2, "%-6s pid=%d %s %s %d->%d ×%d (end)",
+                JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ×%d (end)",
                        "DEMOTE", (int)g_act_dedup[i].pid, g_act_dedup[i].label, g_act_dedup[i].frag,
                        (int)g_act_dedup[i].cur, (int)g_act_dedup[i].target, g_act_dedup[i].suppressed_count);
             }
@@ -320,7 +343,7 @@ static void act_log_success(int kind, pid_t pid, const char *path, const char *f
                     if (cur > entry->cur_max) entry->cur_max = cur;
                     entry->cur = cur;
                     if (now - entry->last_log_time >= 600) {
-                        JPLOG(2, "%-6s pid=%d %s %s ->%d ×%d (10min) cur=%d..%d",
+                        JPLOG(JP_INFO, "%-6s pid=%d %s %s ->%d ×%d (10min) cur=%d..%d",
                                "RAISE", (int)pid, entry->label, entry->frag, (int)target,
                                entry->suppressed_count, (int)entry->cur_min, (int)entry->cur_max);
                         entry->last_log_time = now;
@@ -331,7 +354,7 @@ static void act_log_success(int kind, pid_t pid, const char *path, const char *f
                     return;
                 }
                 if (entry->suppressed_count > 0) {
-                    JPLOG(2, "%-6s pid=%d %s %s ->%d ×%d (end) cur=%d..%d",
+                    JPLOG(JP_INFO, "%-6s pid=%d %s %s ->%d ×%d (end) cur=%d..%d",
                            "RAISE", (int)pid, entry->label, entry->frag, (int)entry->target,
                            entry->suppressed_count, (int)entry->cur_min, (int)entry->cur_max);
                 }
@@ -345,14 +368,14 @@ static void act_log_success(int kind, pid_t pid, const char *path, const char *f
                 entry->label[sizeof(entry->label) - 1] = '\0';
                 entry->last_log_time = now;
                 entry->suppressed_count = 0;
-                JPLOG(2, "%-6s pid=%d %s %s %d->%d ok",
+                JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ok",
                        "RAISE", (int)pid, entry->label, entry->frag, (int)cur, (int)target);
                 return;
             } else {
                 if (entry->cur == cur && entry->target == target) {
                     entry->suppressed_count++;
                     if (now - entry->last_log_time >= 600) {
-                        JPLOG(2, "%-6s pid=%d %s %s %d->%d ×%d (10min)",
+                        JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ×%d (10min)",
                                "DEMOTE", (int)pid, entry->label, entry->frag, (int)cur, (int)target,
                                entry->suppressed_count);
                         entry->last_log_time = now;
@@ -361,7 +384,7 @@ static void act_log_success(int kind, pid_t pid, const char *path, const char *f
                     return;
                 }
                 if (entry->suppressed_count > 0) {
-                    JPLOG(2, "%-6s pid=%d %s %s %d->%d ×%d (end)",
+                    JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ×%d (end)",
                            "DEMOTE", (int)pid, entry->label, entry->frag, (int)entry->cur, (int)entry->target,
                            entry->suppressed_count);
                 }
@@ -373,7 +396,7 @@ static void act_log_success(int kind, pid_t pid, const char *path, const char *f
                 entry->label[sizeof(entry->label) - 1] = '\0';
                 entry->last_log_time = now;
                 entry->suppressed_count = 0;
-                JPLOG(2, "%-6s pid=%d %s %s %d->%d ok",
+                JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ok",
                        "DEMOTE", (int)pid, entry->label, entry->frag, (int)cur, (int)target);
                 return;
             }
@@ -386,11 +409,11 @@ static void act_log_success(int kind, pid_t pid, const char *path, const char *f
         entry = &g_act_dedup[g_act_dedup_head];
         if (entry->suppressed_count > 0) {
             if (entry->kind == ACT_KIND_RAISE) {
-                JPLOG(2, "%-6s pid=%d %s %s ->%d ×%d (end) cur=%d..%d",
+                JPLOG(JP_INFO, "%-6s pid=%d %s %s ->%d ×%d (end) cur=%d..%d",
                        "RAISE", (int)entry->pid, entry->label, entry->frag, (int)entry->target,
                        entry->suppressed_count, (int)entry->cur_min, (int)entry->cur_max);
             } else {
-                JPLOG(2, "%-6s pid=%d %s %s %d->%d ×%d (end)",
+                JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ×%d (end)",
                        "DEMOTE", (int)entry->pid, entry->label, entry->frag, (int)entry->cur, (int)entry->target,
                        entry->suppressed_count);
             }
@@ -411,7 +434,7 @@ static void act_log_success(int kind, pid_t pid, const char *path, const char *f
     entry->suppressed_count = 0;
 
     const char *act_name = (kind == ACT_KIND_RAISE) ? "RAISE" : "DEMOTE";
-    JPLOG(2, "%-6s pid=%d %s %s %d->%d ok",
+    JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ok",
            act_name, (int)pid, entry->label, entry->frag, (int)cur, (int)target);
 }
 
@@ -699,12 +722,40 @@ static void load_old_targets(void) {
     fclose(f);
 }
 
+static int parse_loglevel_str(const char *frag) {
+    if (!frag) return JP_LOG_INFO;
+    if (strcasecmp(frag, "off") == 0) return JP_LOG_OFF;
+    if (strcasecmp(frag, "error") == 0 || strcasecmp(frag, "err") == 0) return JP_LOG_ERR;
+    if (strcasecmp(frag, "warning") == 0 || strcasecmp(frag, "warn") == 0 || strcmp(frag, "1") == 0) return JP_LOG_WARN;
+    if (strcasecmp(frag, "info") == 0 || strcmp(frag, "2") == 0) return JP_LOG_INFO;
+    if (strcasecmp(frag, "debug") == 0 || strcmp(frag, "3") == 0) return JP_LOG_DEBUG;
+    return JP_LOG_INFO;
+}
+
+static void init_loglevel(void) {
+    g_loglevel = JP_LOG_INFO;
+    FILE *f = fopen(CONFIG_PATH, "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+        char verb[32], frag[256];
+        int n = sscanf(p, "%31s %255s", verb, frag);
+        if (n >= 2 && strcmp(verb, "loglevel") == 0) {
+            g_loglevel = parse_loglevel_str(frag);
+        }
+    }
+    fclose(f);
+}
+
 static int load_config(void) {
     FILE *f = fopen(CONFIG_PATH, "r");
     if (!f) return -1;
     g_nprotect = g_ndemote = 0;
     g_has_bid_rules = 0;
-    int parsed_loglevel = 2;
+    int parsed_loglevel = JP_LOG_INFO;
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         char *p = line;
@@ -733,22 +784,16 @@ static int load_config(void) {
             if (is_bid) g_has_bid_rules = 1;
             g_ndemote++;
         } else if (strcmp(verb, "loglevel") == 0) {
-            char *endp = NULL;
-            long val = strtol(frag, &endp, 10);
-            if (endp && *endp == '\0' && endp != frag) {
-                if (val < 1) val = 1;
-                if (val > 3) val = 3;
-                parsed_loglevel = (int)val;
-            } else {
-                parsed_loglevel = 2;
-            }
+            parsed_loglevel = parse_loglevel_str(frag);
         }
     }
     fclose(f);
     if (parsed_loglevel != g_loglevel) {
         int old_lvl = g_loglevel;
         g_loglevel = parsed_loglevel;
-        JPLOG(1, "LOGLVL %d->%d", old_lvl, g_loglevel);
+        if (old_lvl != JP_LOG_OFF && g_loglevel != JP_LOG_OFF) {
+            JPLOG(JP_INFO, "LOGLVL %s->%s", loglevel_to_str(old_lvl), loglevel_to_str(g_loglevel));
+        }
     }
     return 0;
 }
@@ -1131,7 +1176,7 @@ static void memp_log_repair_skip_fp_fail(pid_t pid, time_t now_sec) {
                 return;
             }
             g_memp_repair_skip_seen[i].last_fail_sec = now_sec;
-            JPLOG(3, "MEMP repair_skip reason=fp_fail pid=%d", (int)pid);
+            JPLOG(JP_DEBUG, "MEMP repair_skip reason=fp_fail pid=%d", (int)pid);
             return;
         }
     }
@@ -1143,7 +1188,7 @@ static void memp_log_repair_skip_fp_fail(pid_t pid, time_t now_sec) {
     }
     g_memp_repair_skip_seen[idx].pid = pid;
     g_memp_repair_skip_seen[idx].last_fail_sec = now_sec;
-    JPLOG(3, "MEMP repair_skip reason=fp_fail pid=%d", (int)pid);
+    JPLOG(JP_DEBUG, "MEMP repair_skip reason=fp_fail pid=%d", (int)pid);
 }
 
 /* 让位记录项 */
@@ -1252,9 +1297,9 @@ static int memp_read_level(int *level_out, int *err_out) {
         char eb[128];
         memp_fmt_errno(err, eb, sizeof(eb));
         if (rc == 0) {
-            JPLOG(3, "MEMP level_first val=%d errno=%s", lvl, eb);
+            JPLOG(JP_DEBUG, "MEMP level_first val=%d errno=%s", lvl, eb);
         } else {
-            JPLOG(3, "MEMP level_first val=NA errno=%s", eb);
+            JPLOG(JP_DEBUG, "MEMP level_first val=NA errno=%s", eb);
         }
     }
     if (err_out) *err_out = err;
@@ -1289,7 +1334,7 @@ static void memp_enter_fatal(const char *reason) {
         fsync(fileno(f));
         fclose(f);
     }
-    JPLOG(1, "MEMP fatal reason=%s", reason);
+    JPLOG(JP_ERR, "MEMP fatal reason=%s", reason);
 }
 
 static void memp_enter_unsupported(const char *reason, int err) {
@@ -1299,7 +1344,7 @@ static void memp_enter_unsupported(const char *reason, int err) {
     g_memp_last_errno = err;
     char eb[128];
     memp_fmt_errno(err, eb, sizeof(eb));
-    JPLOG(1, "MEMP unsupported reason=%s errno=%s", reason, eb);
+    JPLOG(JP_WARN, "MEMP unsupported reason=%s errno=%s", reason, eb);
 }
 
 static void memp_enter_reset_pending_normal(int retry_count, struct timespec warn_mono) {
@@ -1353,7 +1398,7 @@ static void memp_taint_add(pid_t pid, uint64_t tvsec, uint64_t tvusec, const cha
     }
     if (g_memp_ntaint >= MEMP_MAX_TAINT) {
         pid_t dropped_pid = g_memp_taint[0].pid;
-        JPLOG(3, "MEMP taint_drop pid=%d", (int)dropped_pid);
+        JPLOG(JP_DEBUG, "MEMP taint_drop pid=%d", (int)dropped_pid);
         for (int i = 0; i < MEMP_MAX_TAINT - 1; i++) {
             g_memp_taint[i] = g_memp_taint[i + 1];
         }
@@ -1365,7 +1410,7 @@ static void memp_taint_add(pid_t pid, uint64_t tvsec, uint64_t tvusec, const cha
     e->tvusec = tvusec;
     strncpy(e->frag, frag ? frag : "", sizeof(e->frag) - 1);
     e->frag[sizeof(e->frag) - 1] = '\0';
-    JPLOG(2, "MEMP taint app=%s pid=%d reason=%s", e->frag, (int)pid, reason);
+    JPLOG(JP_INFO, "MEMP taint app=%s pid=%d reason=%s", e->frag, (int)pid, reason);
     memp_taint_save();
 }
 
@@ -1390,7 +1435,7 @@ static void memp_taint_load(void) {
         if (errno != ENOENT) {
             char eb[128];
             memp_fmt_errno(errno, eb, sizeof(eb));
-            JPLOG(1, "MEMP taint_load_fail line=- errno=%s", eb);
+            JPLOG(JP_ERR, "MEMP taint_load_fail line=- errno=%s", eb);
         }
         return;
     }
@@ -1405,7 +1450,7 @@ static void memp_taint_load(void) {
         if (sscanf(line, "%d %llu %llu %255s", &pid, &tvsec, &tvusec, frag) != 4) {
             char eb[128];
             memp_fmt_errno(0, eb, sizeof(eb));
-            JPLOG(1, "MEMP taint_load_fail line=%d errno=%s", line_no, eb);
+            JPLOG(JP_ERR, "MEMP taint_load_fail line=%d errno=%s", line_no, eb);
             needs_resave = 1;
             continue;
         }
@@ -1443,7 +1488,7 @@ static void mempressure_init_memcap(void) {
         g_memp_memcap_fallback = 1;
         char eb[128];
         memp_fmt_errno(err, eb, sizeof(eb));
-        JPLOG(1, "MEMP memsize_fail errno=%s", eb);
+        JPLOG(JP_ERR, "MEMP memsize_fail errno=%s", eb);
         return;
     }
     uint64_t mb = memsize / (1024ULL * 1024ULL);
@@ -1451,7 +1496,7 @@ static void mempressure_init_memcap(void) {
     if (half < 200) {
         g_memp_memcap = 2048;
         g_memp_memcap_fallback = 1;
-        JPLOG(1, "MEMP memsize_small bytes=%llu", (unsigned long long)memsize);
+        JPLOG(JP_WARN, "MEMP memsize_small bytes=%llu", (unsigned long long)memsize);
         return;
     }
     g_memp_memcap = half;
@@ -1471,7 +1516,7 @@ static void memp_check_fatal_persist(void) {
     g_memp_state = MEMP_STATE_FATAL;
     strncpy(g_memp_fatal_reason, reason, sizeof(g_memp_fatal_reason) - 1);
     g_memp_fatal_reason[sizeof(g_memp_fatal_reason) - 1] = '\0';
-    JPLOG(1, "MEMP fatal_persist reason=%s", reason);
+    JPLOG(JP_ERR, "MEMP fatal_persist reason=%s", reason);
 }
 
 static void memp_check_boot_reset(void) {
@@ -1493,7 +1538,7 @@ static void memp_check_boot_reset(void) {
     int err = (rc != 0) ? errno : 0;
     char eb[128];
     memp_fmt_errno(err, eb, sizeof(eb));
-    JPLOG(2, "MEMP boot_reset ret=%d errno=%s", rc, eb);
+    JPLOG(JP_INFO, "MEMP boot_reset ret=%d errno=%s", rc, eb);
 
     if (rc == 0) {
         unlink(MEMP_PENDING_PATH);
@@ -1600,11 +1645,11 @@ static void memp_restore_yielded(memp_yielded_entry_t *yielded, int nyielded,
             rfail++;
             char eb[128];
             memp_fmt_errno(err, eb, sizeof(eb));
-            JPLOG(1, "MEMP restore_fail pid=%d errno=%s", (int)yielded[i].pid, eb);
+            JPLOG(JP_ERR, "MEMP restore_fail pid=%d errno=%s", (int)yielded[i].pid, eb);
             if (yielded[i].is_sys) {
                 char pname[32];
                 memp_get_proc_name(yielded[i].pid, pname, sizeof(pname));
-                JPLOG(1, "MEMP yield_sys_fail pid=%d name=%s step=restore errno=%s",
+                JPLOG(JP_ERR, "MEMP yield_sys_fail pid=%d name=%s step=restore errno=%s",
                        (int)yielded[i].pid, pname, eb);
             }
         }
@@ -1669,7 +1714,7 @@ static void memp_log_skip(memp_rule_t *rule, pid_t pid, double fp_mb, int thr_mb
         ok = moved = gone = rfail = 0;
     }
 
-    JPLOG(2, "MEMP skip app=%s pid=%d fp=%.1f thr=%d reason=%s yielded=%d yielded_sys=%d errno=%s comp=%s restored=ok:%d,moved:%d,gone:%d,rfail:%d",
+    JPLOG(JP_DEBUG, "MEMP skip app=%s pid=%d fp=%.1f thr=%d reason=%s yielded=%d yielded_sys=%d errno=%s comp=%s restored=ok:%d,moved:%d,gone:%d,rfail:%d",
            rule ? rule->frag : "-", (int)pid, fp_mb, thr_mb, reason, yielded, yielded_sys, eb,
            (comp_str && comp_str[0]) ? comp_str : "-", ok, moved, gone, rfail);
 }
@@ -1752,7 +1797,7 @@ static void memp_floor_save(void) {
     if (rename(MEMP_FLOOR_TMP, MEMP_FLOOR_PATH) != 0) {
         char eb[128];
         memp_fmt_errno(errno, eb, sizeof(eb));
-        JPLOG(1, "MEMP floor_save_fail errno=%s", eb);
+        JPLOG(JP_ERR, "MEMP floor_save_fail errno=%s", eb);
         unlink(MEMP_FLOOR_TMP);
     }
 }
@@ -1855,7 +1900,7 @@ static void memp_floor_load(void) {
             if (strncmp(p, "# jetpilot floor v1", 19) == 0) {
                 is_v1 = 1;
             } else {
-                JPLOG(2, "MEMP floor_reset reason=version");
+                JPLOG(JP_INFO, "MEMP floor_reset reason=version");
                 fclose(f);
                 return;
             }
@@ -1920,7 +1965,7 @@ static void memp_floor_load(void) {
     }
     fclose(f);
     if (had_bad && g_nmemp_floors == 0) {
-        JPLOG(2, "MEMP floor_reset reason=corrupt");
+        JPLOG(JP_INFO, "MEMP floor_reset reason=corrupt");
     }
 }
 
@@ -1947,11 +1992,11 @@ static void memp_backoff_on_sample(const char *frag, double freed_mb) {
             rule->ineff = 0;
             char med_str[32] = "NA";
             memp_floor_get_median_str(rule->frag, med_str, sizeof(med_str));
-            JPLOG(2, "MEMP backoff app=%s cd=%d floor=%s", rule->frag, (int)rule->eff_cd, med_str);
+            JPLOG(JP_INFO, "MEMP backoff app=%s cd=%d floor=%s", rule->frag, (int)rule->eff_cd, med_str);
         }
     } else {
         if (rule->eff_cd != base_cd) {
-            JPLOG(2, "MEMP backoff_reset app=%s cd=%d", rule->frag, (int)base_cd);
+            JPLOG(JP_INFO, "MEMP backoff_reset app=%s cd=%d", rule->frag, (int)base_cd);
         }
         rule->eff_cd = base_cd;
         rule->ineff = 0;
@@ -2017,7 +2062,7 @@ static void memp_post_sample(memorystatus_priority_entry_t *list, int count) {
         g_memp_post.fg_ok = 0;
     }
 
-    JPLOG(1, "MEMP post app=%s pid=%d fp_before=%.1f fp_post30=%s dt=%ld fg_ok=%d nsamp=%d freed=%s",
+    JPLOG(JP_INFO, "MEMP post app=%s pid=%d fp_before=%.1f fp_post30=%s dt=%ld fg_ok=%d nsamp=%d freed=%s",
            g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb,
            fp_post30_buf, dt, g_memp_post.fg_ok, g_memp_post.nsamp, freed_buf);
 
@@ -2035,7 +2080,7 @@ static void memp_post_sample(memorystatus_priority_entry_t *list, int count) {
 static void memp_post_register(const char *frag, pid_t pid, uint64_t tvsec, uint64_t tvusec, time_t warn_sec, double fp_before_mb, int cur_band) {
     if (g_memp_post.valid) {
         long dt = (long)(warn_sec - g_memp_post.warn_mono_sec);
-        JPLOG(1, "MEMP post app=%s pid=%d fp_before=%.1f fp_post30=dropped dt=%ld fg_ok=0 nsamp=%d freed=NA",
+        JPLOG(JP_INFO, "MEMP post app=%s pid=%d fp_before=%.1f fp_post30=dropped dt=%ld fg_ok=0 nsamp=%d freed=NA",
                g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb, dt, g_memp_post.nsamp);
     }
     g_memp_post.valid = 1;
@@ -2084,7 +2129,7 @@ static int mempressure_load_config(void) {
             if (cr) *cr = '\0';
 
             if (oversized) {
-                JPLOG(1, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
@@ -2106,26 +2151,26 @@ static int mempressure_load_config(void) {
 
             if (ntokens <= 0) continue;
             if (ntokens > 8) {
-                JPLOG(1, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
             if (strcmp(tokens[0], "cooldown") == 0) {
                 if (ntokens != 2) {
-                    JPLOG(1, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
                 char *endp = NULL;
                 long cd = strtol(tokens[1], &endp, 10);
                 if (!endp || *endp != '\0' || cd < MEMP_MIN_COOLDOWN || cd > MEMP_MAX_COOLDOWN) {
-                    JPLOG(1, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
                 new_cooldown = (int)cd;
             } else {
                 /* 规则行 */
                 if (nparsed >= MEMP_MAX_RULES) {
-                    JPLOG(1, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
 
@@ -2137,7 +2182,7 @@ static int mempressure_load_config(void) {
                     }
                 }
                 if (duplicate) {
-                    JPLOG(1, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
 
@@ -2159,7 +2204,7 @@ static int mempressure_load_config(void) {
                 }
 
                 if (bad) {
-                    JPLOG(1, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
 
@@ -2191,7 +2236,7 @@ static int mempressure_load_config(void) {
                 }
 
                 if (bad) {
-                    JPLOG(1, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
+                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
                     continue;
                 }
 
@@ -2242,7 +2287,7 @@ static int mempressure_load_config(void) {
         } else {
             snprintf(cap_str, sizeof(cap_str), "%llu", (unsigned long long)g_memp_memcap);
         }
-        JPLOG(2, "MEMP cfg rules=%d cooldown=%d file=%s memcap=%s rule_cd=%d",
+        JPLOG(JP_INFO, "MEMP cfg rules=%d cooldown=%d file=%s memcap=%s rule_cd=%d",
                nparsed, new_cooldown, file_absent ? "absent" : "ok", cap_str, rule_cd_count);
 
         for (int i = 0; i < nparsed; i++) {
@@ -2252,7 +2297,7 @@ static int mempressure_load_config(void) {
             } else {
                 snprintf(cd_str, sizeof(cd_str), "global");
             }
-            JPLOG(2, "MEMP cfg_rule i=%d app=%s thr=%d cd=%s",
+            JPLOG(JP_DEBUG, "MEMP cfg_rule i=%d app=%s thr=%d cd=%s",
                    i, parsed_rules[i].frag, (int)parsed_rules[i].thr_mb, cd_str);
         }
 
@@ -2309,7 +2354,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
                 g_memp_last_marker_rm_fail_time = now.tv_sec;
                 char eb[128];
                 memp_fmt_errno(err, eb, sizeof(eb));
-                JPLOG(1, "MEMP marker_rm_fail n=%d errno=%s", g_memp_marker_rm_fail_count, eb);
+                JPLOG(JP_ERR, "MEMP marker_rm_fail n=%d errno=%s", g_memp_marker_rm_fail_count, eb);
             }
         }
         return;
@@ -2320,7 +2365,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         long secs_since_warn = (long)(now.tv_sec - g_memp_warn_monotonic.tv_sec);
         if (secs_since_warn >= 600 && !g_memp_reset_overdue_logged) {
             g_memp_reset_overdue_logged = 1;
-            JPLOG(1, "MEMP reset_overdue secs=%ld", secs_since_warn);
+            JPLOG(JP_WARN, "MEMP reset_overdue secs=%ld", secs_since_warn);
         }
         g_memp_reset_retry_count++;
         int v = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
@@ -2336,7 +2381,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
                 g_memp_last_marker_rm_fail_time = now.tv_sec;
                 char eb[128];
                 memp_fmt_errno(errno, eb, sizeof(eb));
-                JPLOG(1, "MEMP marker_rm_fail n=1 errno=%s", eb);
+                JPLOG(JP_ERR, "MEMP marker_rm_fail n=1 errno=%s", eb);
             }
         } else if (err == EINVAL) {
             memp_enter_fatal("einval");
@@ -2347,7 +2392,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
                 g_memp_last_reset_retry_time = now.tv_sec;
                 char eb[128];
                 memp_fmt_errno(err, eb, sizeof(eb));
-                JPLOG(2, "MEMP reset_retry n=%d ret=%d errno=%s", g_memp_reset_retry_count, rc, eb);
+                JPLOG(JP_INFO, "MEMP reset_retry n=%d ret=%d errno=%s", g_memp_reset_retry_count, rc, eb);
             }
         }
         return;
@@ -2478,7 +2523,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         }
 
         if (!t_is_100 || comp_has_larger) {
-            JPLOG(3, "MEMP repair app=%s pid=%d band_before=100 band_after=%d comp=%s ret=0 errno=0(-) result=skip",
+            JPLOG(JP_DEBUG, "MEMP repair app=%s pid=%d band_before=100 band_after=%d comp=%s ret=0 errno=0(-) result=skip",
                    repair_rule ? repair_rule->frag : "-", (int)repair_pid, t_is_100 ? 100 : 0, comp_buf);
             if (rlist1) free(rlist1);
             return;
@@ -2539,11 +2584,11 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         if (rc == 0 && after_is_100 && !after_comp_larger) {
             if (seen_entry) seen_entry->fail_count = 0;
             memp_taint_remove(repair_pid);
-            JPLOG(2, "MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=ok",
+            JPLOG(JP_INFO, "MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=ok",
                    repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb);
         } else {
             int n = seen_entry ? ++seen_entry->fail_count : 1;
-            JPLOG(2, "MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=retry n=%d",
+            JPLOG(JP_INFO, "MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=retry n=%d",
                    repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb, n);
         }
         return; /* 修复已执行 sysctl，本轮结束 */
@@ -2567,7 +2612,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
         static int fg_first_logged = 0;
         if (!fg_first_logged && cur == 100 && strstr(path, "/containers/Bundle/Application/") != NULL) {
             fg_first_logged = 1;
-            JPLOG(3, "MEMP fg_first pid=%d main=%d path=%s", (int)pid, memp_is_main_app_binary(path), path);
+            JPLOG(JP_DEBUG, "MEMP fg_first pid=%d main=%d path=%s", (int)pid, memp_is_main_app_binary(path), path);
         }
 
         if (!memp_is_main_app_binary(path)) continue;
@@ -2605,7 +2650,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
                     g_memp_rusage_fail_seen[fidx].last_fail_sec = now_ts.tv_sec;
                     char eb[128];
                     memp_fmt_errno(rerr, eb, sizeof(eb));
-                    JPLOG(1, "MEMP rusage_fail pid=%d errno=%s", (int)pid, eb);
+                    JPLOG(JP_ERR, "MEMP rusage_fail pid=%d errno=%s", (int)pid, eb);
                 }
             }
             continue;
@@ -2628,7 +2673,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
             } else {
                 g_memp_seen_targets[0] = pid;
             }
-            JPLOG(3, "MEMP target app=%s pid=%d rule=%s path=%s",
+            JPLOG(JP_DEBUG, "MEMP target app=%s pid=%d rule=%s path=%s",
                    rule->frag, (int)pid, rule->frag, path);
         }
 
@@ -2755,7 +2800,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
                 memp_get_proc_name(yield_candidates[i].pid, pname, sizeof(pname));
                 char eb[128];
                 memp_fmt_errno(err, eb, sizeof(eb));
-                JPLOG(1, "MEMP yield_sys_fail pid=%d name=%s step=down errno=%s",
+                JPLOG(JP_ERR, "MEMP yield_sys_fail pid=%d name=%s step=down errno=%s",
                        (int)yield_candidates[i].pid, pname, eb);
             }
             break;
@@ -2906,7 +2951,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
     int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
     char web[128];
     memp_fmt_errno(warn_err, web, sizeof(web));
-    JPLOG(1, "MEMP warn app=%s pid=%d fp_before=%.1f thr=%d yielded=%d yielded_sys=%d fg_others=%d gate_ms=%ld ret=%d errno=%s recheck=%s",
+    JPLOG(JP_WARN, "MEMP warn app=%s pid=%d fp_before=%.1f thr=%d yielded=%d yielded_sys=%d fg_others=%d gate_ms=%ld ret=%d errno=%s recheck=%s",
            target_rule->frag, (int)target_pid, fp_before_mb, target_rule->thr_mb,
            nyielded, nyielded_sys, fg_others, gate_ms, warn_rc, web, recheck_str);
 
@@ -2968,7 +3013,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
 
     char neb[128];
     memp_fmt_errno(normal_err, neb, sizeof(neb));
-    JPLOG(2, "MEMP normal app=%s pid=%d fp_after5=%s band_now=%s stuck=%d early_stop=%d ret=%d errno=%s yielded=%d yielded_sys=%d restored=ok:%d,moved:%d,gone:%d,rfail:%d",
+    JPLOG(JP_INFO, "MEMP normal app=%s pid=%d fp_after5=%s band_now=%s stuck=%d early_stop=%d ret=%d errno=%s yielded=%d yielded_sys=%d restored=ok:%d,moved:%d,gone:%d,rfail:%d",
            target_rule->frag, (int)target_pid, fp_after5_buf, band_now_buf, stuck, early_stop,
            normal_rc, neb, nyielded, nyielded_sys, r_ok, r_moved, r_gone, r_rfail);
 
@@ -2992,7 +3037,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
             g_memp_last_marker_rm_fail_time = 0;
             char meb[128];
             memp_fmt_errno(errno, meb, sizeof(meb));
-            JPLOG(1, "MEMP marker_rm_fail n=1 errno=%s", meb);
+            JPLOG(JP_ERR, "MEMP marker_rm_fail n=1 errno=%s", meb);
         }
         g_memp_fails = 0;
     } else {
@@ -3007,7 +3052,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
                 memp_enter_reset_pending_normal(1, warn_mono);
                 char reb[128];
                 memp_fmt_errno(normal_err, reb, sizeof(reb));
-                JPLOG(2, "MEMP reset_retry n=1 ret=%d errno=%s", normal_rc, reb);
+                JPLOG(JP_INFO, "MEMP reset_retry n=1 ret=%d errno=%s", normal_rc, reb);
             }
         } else {
             /* WARN 没进测试态 */
@@ -3023,7 +3068,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
                 g_memp_state = MEMP_STATE_DISABLED;
                 char deb[128];
                 memp_fmt_errno(g_memp_last_errno, deb, sizeof(deb));
-                JPLOG(1, "MEMP disabled fails=3 last_errno=%s", deb);
+                JPLOG(JP_WARN, "MEMP disabled fails=3 last_errno=%s", deb);
             }
         }
     }
@@ -3056,9 +3101,10 @@ int main(void) {
 
     setsid();  /* 脱离拉起它的 App 会话 */
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
+    init_loglevel();  /* 从启动第一行起按配置 loglevel 过滤 (P1) */
     lockmon_init();  /* 锁屏监听（失败则保持常速轮询，不影响保护） */
     load_old_targets();  /* 启动时导入旧 status.txt 记录供首轮认领 */
-    JPLOG(1, "%-6s v%s pid=%d old_records=%d locked=%d",
+    JPLOG(JP_INFO, "%-6s v%s pid=%d old_records=%d locked=%d",
            "START", JP_VERSION, (int)getpid(), g_nold_targets, g_locked);
     mempressure_init();  /* 前台 App 内存压力触发初始化 (v0.7.0) */
 
@@ -3141,7 +3187,7 @@ int main(void) {
                                 prev->orig_known = 0;
                             }
                         }
-                        JPLOG(2, "%-6s pid=%d band=%d", "CLAIM", (int)pid, (int)cur);
+                        JPLOG(JP_INFO, "%-6s pid=%d band=%d", "CLAIM", (int)pid, (int)cur);
                     }
                 }
                 const char *app_bid = NULL;
@@ -3174,7 +3220,7 @@ int main(void) {
                             cur = target;
                         } else {
                             /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
-                            JPLOG(1, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
+                            JPLOG(JP_ERR, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
                                    "RAISE", (int)pid, proc_label_log(path), frag, (int)cur, (int)target,
                                    g_last_err_no, strerror(g_last_err_no));
                         }
@@ -3185,12 +3231,12 @@ int main(void) {
                             if (rc == 0) {
                                 g_reassert_count++;
                                 applied_set_ex(pid, target, cur);
-                                JPLOG(2, "%-6s pid=%d %s %s %d->%d ok",
+                                JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ok",
                                        "LOWER", (int)pid, proc_label_log(path), frag, (int)cur, (int)target);
                                 cur = target;
                             } else {
                                 /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
-                                JPLOG(1, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
+                                JPLOG(JP_ERR, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
                                        "LOWER", (int)pid, proc_label_log(path), frag, (int)cur, (int)target,
                                        g_last_err_no, strerror(g_last_err_no));
                             }
@@ -3201,7 +3247,7 @@ int main(void) {
                                 char ours_str[32];
                                 if (prev) snprintf(ours_str, sizeof(ours_str), "%d", (int)prev->band);
                                 else snprintf(ours_str, sizeof(ours_str), "none");
-                                JPLOG(3, "%-6s pid=%d %s %s cur=%d target=%d ours=%s",
+                                JPLOG(JP_DEBUG, "%-6s pid=%d %s %s cur=%d target=%d ours=%s",
                                        "SKIP", (int)pid, proc_label_log(path), frag, (int)cur, (int)target, ours_str);
                             }
                         }
@@ -3233,7 +3279,7 @@ int main(void) {
                             cur = demote_target;
                         } else {
                             /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
-                            JPLOG(1, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
+                            JPLOG(JP_ERR, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
                                    "DEMOTE", (int)pid, proc_label_log(path), demote_frag, (int)cur, (int)demote_target,
                                    g_last_err_no, strerror(g_last_err_no));
                         }
@@ -3246,11 +3292,11 @@ int main(void) {
                             applied_remove(pid);   /* 还回后不再是我们的档位，内含 act_dedup_clear */
                             prev = NULL;           /* 指针已失效 */
                             cur = BAND_BACKGROUND;
-                            JPLOG(2, "%-6s pid=%d %s %d->%d ok",
+                            JPLOG(JP_INFO, "%-6s pid=%d %s %d->%d ok",
                                    "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND);
                         } else {
                             /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
-                            JPLOG(1, "%-6s pid=%d %s %d->%d FAIL errno=%d %s",
+                            JPLOG(JP_ERR, "%-6s pid=%d %s %d->%d FAIL errno=%d %s",
                                    "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND,
                                    g_last_err_no, strerror(g_last_err_no));
                         }
@@ -3330,7 +3376,7 @@ int main(void) {
     }
 
     act_dedup_flush_all();
-    JPLOG(1, "STOP");
+    JPLOG(JP_INFO, "STOP");
     unlink(PID_PATH);
     fprintf(stderr, "[JetPilot] 收到停止信号，退出\n");
     return 0;

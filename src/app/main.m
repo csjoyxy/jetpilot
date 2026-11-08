@@ -1,5 +1,5 @@
 /*
- * JetPilot v0.7.5 — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetPilot v0.7.6 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
@@ -3010,6 +3010,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @property (nonatomic, strong) UITextView *textView;
 @property (nonatomic, strong) UIBarButtonItem *exportItem;
 @property (nonatomic, strong) UIBarButtonItem *clearItem;
+@property (nonatomic, copy) NSString *logLevel;
+@property (nonatomic, copy) void (^onLogLevelChanged)(NSString *newLevel);
+@property (nonatomic, strong) UIButton *levelButton;
 @end
 
 @implementation JPLogViewController
@@ -3033,6 +3036,58 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
                                                      action:@selector(confirmClearLog)];
     self.navigationItem.rightBarButtonItems = @[self.exportItem, copyBtn, self.clearItem];
 
+    UIView *headerCard = [UIView new];
+    headerCard.translatesAutoresizingMaskIntoConstraints = NO;
+    headerCard.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    headerCard.layer.cornerRadius = 12;
+    headerCard.layer.cornerCurve = kCACornerCurveContinuous;
+    headerCard.clipsToBounds = YES;
+
+    UIStackView *headerStack = [UIStackView new];
+    headerStack.translatesAutoresizingMaskIntoConstraints = NO;
+    headerStack.axis = UILayoutConstraintAxisVertical;
+    headerStack.spacing = 6;
+
+    UIStackView *levelRow = [UIStackView new];
+    levelRow.translatesAutoresizingMaskIntoConstraints = NO;
+    levelRow.axis = UILayoutConstraintAxisHorizontal;
+    levelRow.alignment = UIStackViewAlignmentCenter;
+    levelRow.distribution = UIStackViewDistributionEqualSpacing;
+
+    UILabel *titleLabel = [UILabel new];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    titleLabel.textColor = UIColor.labelColor;
+    titleLabel.text = @"日志等级";
+
+    self.levelButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.levelButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.levelButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    self.levelButton.showsMenuAsPrimaryAction = YES;
+    [self updateLevelMenu];
+
+    UILabel *tipLabel = [UILabel new];
+    tipLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    tipLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    tipLabel.textColor = UIColor.secondaryLabelColor;
+    tipLabel.text = @"排查问题时请选 Info 或 Debug";
+
+    [levelRow addArrangedSubview:titleLabel];
+    [levelRow addArrangedSubview:self.levelButton];
+
+    [headerStack addArrangedSubview:levelRow];
+    [headerStack addArrangedSubview:tipLabel];
+    [headerCard addSubview:headerStack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [headerStack.topAnchor constraintEqualToAnchor:headerCard.topAnchor constant:10],
+        [headerStack.leadingAnchor constraintEqualToAnchor:headerCard.leadingAnchor constant:16],
+        [headerStack.trailingAnchor constraintEqualToAnchor:headerCard.trailingAnchor constant:-16],
+        [headerStack.bottomAnchor constraintEqualToAnchor:headerCard.bottomAnchor constant:-10]
+    ]];
+
+    [self.view addSubview:headerCard];
+
     self.textView = [[UITextView alloc] initWithFrame:CGRectZero];
     self.textView.translatesAutoresizingMaskIntoConstraints = NO;
     self.textView.editable = NO;
@@ -3050,11 +3105,108 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [self.view addSubview:self.textView];
 
     [NSLayoutConstraint activateConstraints:@[
-        [self.textView.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [headerCard.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:10],
+        [headerCard.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [headerCard.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+
+        [self.textView.topAnchor constraintEqualToAnchor:headerCard.bottomAnchor constant:10],
         [self.textView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
         [self.textView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
         [self.textView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
     ]];
+}
+
+- (void)updateLevelMenu {
+    NSString *current = self.logLevel.lowercaseString ?: @"info";
+    NSDictionary *titles = @{
+        @"off": @"OFF",
+        @"error": @"Error",
+        @"warning": @"Warning",
+        @"info": @"Info",
+        @"debug": @"Debug"
+    };
+    NSString *display = titles[current] ?: @"Info";
+    [self.levelButton setTitle:[NSString stringWithFormat:@"%@  ▾", display] forState:UIControlStateNormal];
+
+    NSArray *keys = @[@"off", @"error", @"warning", @"info", @"debug"];
+    NSMutableArray<UIAction *> *actions = [NSMutableArray array];
+    __weak typeof(self) weakSelf = self;
+    for (NSString *key in keys) {
+        NSString *title = titles[key];
+        BOOL isSel = [key isEqualToString:current];
+        UIAction *act = [UIAction actionWithTitle:title image:nil identifier:nil handler:^(__kindof UIAction * _Nonnull action) {
+            [weakSelf selectLogLevel:key];
+        }];
+        if (isSel) {
+            act.state = UIMenuElementStateOn;
+        }
+        [actions addObject:act];
+    }
+    self.levelButton.menu = [UIMenu menuWithTitle:@"" children:actions];
+}
+
+- (void)selectLogLevel:(NSString *)newLevel {
+    NSString *oldLevel = self.logLevel;
+    self.logLevel = newLevel;
+    [self updateLevelMenu];
+    if (self.onLogLevelChanged) {
+        self.onLogLevelChanged(newLevel);
+    } else {
+        NSError *err = nil;
+        NSString *content = [NSString stringWithContentsOfFile:kConfig encoding:NSUTF8StringEncoding error:&err];
+        BOOL ok = NO;
+        if (content) {
+            NSArray *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+            NSMutableArray *newLines = [NSMutableArray array];
+            BOOL found = NO;
+            for (NSString *line in lines) {
+                NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                if ([trimmed hasPrefix:@"loglevel"]) {
+                    [newLines addObject:[NSString stringWithFormat:@"loglevel %@", newLevel]];
+                    found = YES;
+                } else {
+                    [newLines addObject:line];
+                }
+            }
+            if (!found) {
+                [newLines insertObject:[NSString stringWithFormat:@"loglevel %@", newLevel] atIndex:0];
+            }
+            NSString *outContent = [newLines componentsJoinedByString:@"\n"];
+            ok = [outContent writeToFile:kConfig atomically:YES encoding:NSUTF8StringEncoding error:&err];
+        }
+        if (!ok) {
+            self.logLevel = oldLevel;
+            [self updateLevelMenu];
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"保存失败"
+                                                                           message:[NSString stringWithFormat:@"日志等级保存失败：%@", err.localizedDescription ?: @"写入错误"]
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+        }
+    }
+}
+
+- (void)saveLogLevelToConfigFile:(NSString *)level {
+    NSError *err = nil;
+    NSString *content = [NSString stringWithContentsOfFile:kConfig encoding:NSUTF8StringEncoding error:&err];
+    if (!content) return;
+    NSArray *lines = [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSMutableArray *newLines = [NSMutableArray array];
+    BOOL found = NO;
+    for (NSString *line in lines) {
+        NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if ([trimmed hasPrefix:@"loglevel"]) {
+            [newLines addObject:[NSString stringWithFormat:@"loglevel %@", level]];
+            found = YES;
+        } else {
+            [newLines addObject:line];
+        }
+    }
+    if (!found) {
+        [newLines insertObject:[NSString stringWithFormat:@"loglevel %@", level] atIndex:0];
+    }
+    NSString *outContent = [newLines componentsJoinedByString:@"\n"];
+    [outContent writeToFile:kConfig atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -3259,7 +3411,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         NSDateFormatter *df = [NSDateFormatter new];
         df.dateFormat = @"yyyyMMdd-HHmmss";
         NSString *dateStr = [df stringFromDate:[NSDate date]];
-        NSString *zipFileName = [NSString stringWithFormat:@"JetPilot-logs-%@-v0.7.5.zip", dateStr];
+        NSString *zipFileName = [NSString stringWithFormat:@"JetPilot-logs-%@-v0.7.6.zip", dateStr];
         NSString *zipPath = [exportDir stringByAppendingPathComponent:zipFileName];
 
         NSData *zipData = JPCreateZipArchive(entries);
@@ -3649,9 +3801,8 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @interface MainViewController : UIViewController <JPRuleCardViewDelegate, JPRuleEditViewControllerDelegate>
 @property (nonatomic, strong) NSMutableArray<JPRule *> *rules;
 @property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
-@property (nonatomic, assign) NSInteger logLevel;
+@property (nonatomic, copy) NSString *logLevel;
 @property (nonatomic, strong) NSMutableArray<NSString *> *configExtraLines;
-@property (nonatomic, strong) UISegmentedControl *logLevelSegment;
 
 @property (nonatomic, strong) UIScrollView *scrollView;
 @property (nonatomic, strong) UIStackView *contentStackView;
@@ -3846,10 +3997,6 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.addRuleCard = [self createAddRuleCard];
     [self.contentStackView addArrangedSubview:self.addRuleCard];
 
-    UILabel *settingsHeader = [self createSectionHeader:@"设置"];
-    [self.contentStackView addArrangedSubview:settingsHeader];
-    UIView *settingsCard = [self createSettingsCard];
-    [self.contentStackView addArrangedSubview:settingsCard];
 
     UILabel *aboutHeader = [self createSectionHeader:@"关于"];
     [self.contentStackView addArrangedSubview:aboutHeader];
@@ -3924,67 +4071,6 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     return card;
 }
 
-- (UIView *)createSettingsCard {
-    UIView *card = [UIView new];
-    card.translatesAutoresizingMaskIntoConstraints = NO;
-    card.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
-    card.layer.cornerRadius = 14;
-    card.layer.cornerCurve = kCACornerCurveContinuous;
-    card.clipsToBounds = YES;
-
-    UIStackView *stack = [UIStackView new];
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 10;
-
-    UIStackView *row = [UIStackView new];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-    row.axis = UILayoutConstraintAxisHorizontal;
-    row.alignment = UIStackViewAlignmentCenter;
-    row.distribution = UIStackViewDistributionEqualSpacing;
-
-    UILabel *titleLabel = [UILabel new];
-    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
-    titleLabel.textColor = UIColor.labelColor;
-    titleLabel.text = @"日志等级";
-
-    UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"关键", @"标准", @"详细"]];
-    seg.translatesAutoresizingMaskIntoConstraints = NO;
-    seg.selectedSegmentIndex = (self.logLevel >= 1 && self.logLevel <= 3) ? (self.logLevel - 1) : 1;
-    [seg addTarget:self action:@selector(onLogLevelChanged:) forControlEvents:UIControlEventValueChanged];
-    self.logLevelSegment = seg;
-
-    [row addArrangedSubview:titleLabel];
-    [row addArrangedSubview:seg];
-    [stack addArrangedSubview:row];
-    [card addSubview:stack];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [stack.topAnchor constraintEqualToAnchor:card.topAnchor constant:12],
-        [stack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
-        [stack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
-        [stack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12]
-    ]];
-
-    return card;
-}
-
-- (void)onLogLevelChanged:(UISegmentedControl *)sender {
-    NSInteger oldVal = self.logLevel;
-    NSInteger newVal = sender.selectedSegmentIndex + 1;
-    self.logLevel = newVal;
-    NSError *err = nil;
-    if (![self saveConfigWithError:&err]) {
-        self.logLevel = oldVal;
-        sender.selectedSegmentIndex = (oldVal >= 1 && oldVal <= 3) ? (oldVal - 1) : 1;
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"保存失败"
-                                                                       message:[NSString stringWithFormat:@"日志等级保存失败：%@", err.localizedDescription ?: @"写入错误"]
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
-    }
-}
 
 - (UIView *)createAboutCard {
     UIView *card = [UIView new];
@@ -4043,6 +4129,24 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 - (void)openLogViewer {
     JPLogViewController *vc = [JPLogViewController new];
+    vc.logLevel = self.logLevel.length > 0 ? self.logLevel : @"info";
+    __weak typeof(self) weakSelf = self;
+    __weak typeof(vc) weakVC = vc;
+    vc.onLogLevelChanged = ^(NSString *newLevel) {
+        NSString *oldLevel = weakSelf.logLevel;
+        weakSelf.logLevel = newLevel;
+        NSError *err = nil;
+        if (![weakSelf saveConfigWithError:&err]) {
+            weakSelf.logLevel = oldLevel;
+            weakVC.logLevel = oldLevel;
+            [weakVC updateLevelMenu];
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"保存失败"
+                                                                           message:[NSString stringWithFormat:@"日志等级保存失败：%@", err.localizedDescription ?: @"写入错误"]
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakVC presentViewController:alert animated:YES completion:nil];
+        }
+    };
     if (self.navigationController) {
         [self.navigationController pushViewController:vc animated:YES];
     } else {
@@ -4156,7 +4260,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 - (void)loadConfig {
     [self.rules removeAllObjects];
     self.configExtraLines = [NSMutableArray array];
-    self.logLevel = 2;
+    self.logLevel = @"info";
     NSError *err = nil;
     NSString *content = [NSString stringWithContentsOfFile:kConfig encoding:NSUTF8StringEncoding error:&err];
     if (!content || content.length == 0) {
@@ -4214,25 +4318,26 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             [self.rules addObject:r];
         } else if ([verb isEqualToString:@"loglevel"]) {
             if (cleanTokens.count >= 2) {
-                const char *cstr = [cleanTokens[1] UTF8String];
-                char *endp = NULL;
-                long val = strtol(cstr, &endp, 10);
-                if (endp && *endp == '\0' && endp != cstr) {
-                    if (val < 1) val = 1;
-                    if (val > 3) val = 3;
-                    self.logLevel = val;
+                NSString *val = cleanTokens[1].lowercaseString;
+                if ([val isEqualToString:@"off"]) {
+                    self.logLevel = @"off";
+                } else if ([val isEqualToString:@"error"] || [val isEqualToString:@"err"]) {
+                    self.logLevel = @"error";
+                } else if ([val isEqualToString:@"warning"] || [val isEqualToString:@"warn"] || [val isEqualToString:@"1"]) {
+                    self.logLevel = @"warning";
+                } else if ([val isEqualToString:@"info"] || [val isEqualToString:@"2"]) {
+                    self.logLevel = @"info";
+                } else if ([val isEqualToString:@"debug"] || [val isEqualToString:@"3"]) {
+                    self.logLevel = @"debug";
                 } else {
-                    self.logLevel = 2;
+                    self.logLevel = @"info";
                 }
             } else {
-                self.logLevel = 2;
+                self.logLevel = @"info";
             }
         } else {
             [self.configExtraLines addObject:rawLine];
         }
-    }
-    if (self.logLevelSegment) {
-        self.logLevelSegment.selectedSegmentIndex = (self.logLevel >= 1 && self.logLevel <= 3) ? (self.logLevel - 1) : 1;
     }
 }
 
@@ -4242,10 +4347,8 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [outStr appendString:@"# protect <路径片段> <档位，最高 95>\n"];
     [outStr appendString:@"# demote  <路径片段> [档位] （降到指定档位，默认 30）\n"];
 
-    NSInteger lvl = self.logLevel;
-    if (lvl < 1) lvl = 1;
-    if (lvl > 3) lvl = 3;
-    [outStr appendFormat:@"loglevel %ld\n", (long)lvl];
+    NSString *lvl = self.logLevel.length > 0 ? self.logLevel : @"info";
+    [outStr appendFormat:@"loglevel %@\n", lvl];
 
     for (JPRule *r in self.rules) {
         if (r.type == JPRuleTypeProtect) {
