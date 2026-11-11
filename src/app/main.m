@@ -1073,9 +1073,17 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
 @property (nonatomic, assign) BOOL isEnabled;       // YES=生效, NO=#off
 @property (nonatomic, assign) BOOL isDuplicate;     // 重复规则标记
 @property (nonatomic, copy) NSString *displayName;  // App 显示名称
+@property (nonatomic, assign) NSInteger lineIndex;  // 行定位 (M1')
 @end
 
 @implementation JPRestartRule
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _lineIndex = -1;
+    }
+    return self;
+}
 @end
 
 @interface JPRestartLine : NSObject
@@ -1238,6 +1246,7 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
         r.max = valMax;
         r.relaunch = valRelaunch;
         r.isEnabled = !isOff;
+        r.lineIndex = (NSInteger)cfg.lines.count;
 
         JPRestartLine *l = [JPRestartLine new];
         l.rule = r;
@@ -1280,7 +1289,20 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
     if (bid.length == 0 || !rule) return;
     rule.bid = bid;
 
-    for (JPRestartLine *l in self.lines) {
+    // 1. 按行定位：优先按 rule 对象本身匹配所在行
+    for (NSUInteger i = 0; i < self.lines.count; i++) {
+        JPRestartLine *l = self.lines[i];
+        if (!l.isUnknownOrComment && l.rule == rule) {
+            rule.lineIndex = (NSInteger)i;
+            l.rawText = nil;
+            [self updateDuplicateRules];
+            return;
+        }
+    }
+
+    // 2. 按行定位：若 rule 指针因重新载入而变更，按记录的 lineIndex 定位
+    if (rule.lineIndex >= 0 && (NSUInteger)rule.lineIndex < self.lines.count) {
+        JPRestartLine *l = self.lines[(NSUInteger)rule.lineIndex];
         if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:bid]) {
             NSUInteger idx = [self.rules indexOfObject:l.rule];
             if (idx != NSNotFound) {
@@ -1293,10 +1315,33 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
         }
     }
 
+    // 3. 若为单条已有规则更新（非重复行场景）
+    JPRestartLine *singleMatch = nil;
+    int matchCount = 0;
+    for (JPRestartLine *l in self.lines) {
+        if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:bid]) {
+            singleMatch = l;
+            matchCount++;
+        }
+    }
+    if (matchCount == 1 && singleMatch) {
+        NSUInteger idx = [self.rules indexOfObject:singleMatch.rule];
+        if (idx != NSNotFound) {
+            self.rules[idx] = rule;
+        }
+        singleMatch.rule = rule;
+        singleMatch.rawText = nil;
+        rule.lineIndex = (NSInteger)[self.lines indexOfObject:singleMatch];
+        [self updateDuplicateRules];
+        return;
+    }
+
+    // 4. 新建规则行
     JPRestartLine *newLine = [JPRestartLine new];
     newLine.rule = rule;
     newLine.rawText = nil;
     newLine.isUnknownOrComment = NO;
+    rule.lineIndex = (NSInteger)self.lines.count;
     [self.lines addObject:newLine];
     [self.rules addObject:rule];
     [self updateDuplicateRules];
@@ -8611,7 +8656,10 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
                                                                        message:[NSString stringWithFormat:@"写入 restart.txt 失败：%@", err ? err.localizedDescription : @"未知错误"]
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf presentViewController:alert animated:YES completion:nil];
+        });
     }
     return ok;
 }

@@ -3332,7 +3332,7 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
             }
             bg_sec_elapsed = (int)(now_mono - r_state->bg_start_mono);
             if (bg_sec_elapsed < rule->bg_sec) {
-                skip_reason = "fg";
+                skip_reason = "bgwait";
             }
         }
 
@@ -3410,15 +3410,27 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
         }
 
         /* 全部条件满足：触发重启！ */
-        kill(main_pid, SIGKILL);
-        int today_n = restart_state_record_restart(rule->bid, now_mono);
-        rst_c4_floor_reset(main_pid, rule->bid);
+        int krc = kill(main_pid, SIGKILL);
+        int kill_errno = (krc == 0) ? 0 : errno;
+        int today_n = 0;
+        if (kill_errno == 0 || kill_errno == ESRCH) {
+            today_n = restart_state_record_restart(rule->bid, now_mono);
+            rst_c4_floor_reset(main_pid, rule->bid);
+        } else {
+            today_n = restart_state_get_today_count(rule->bid);
+        }
         s_rst_kill_path[0] = '\0';
 
-        JPLOG(JP_INFO, "%-6s kill pid=%d bid=%s fp=%llu thr=%d bg=%d sys_band=%d n=%d",
+        JPLOG(JP_INFO, "%-6s kill pid=%d bid=%s fp=%llu thr=%d bg=%d sys_band=%d n=%d rc=%d",
               "RST", (int)main_pid, rule->bid,
               (unsigned long long)fp_mb, (int)rule->thr_mb,
-              bg_sec_elapsed, (int)sys_band, today_n);
+              bg_sec_elapsed, (int)sys_band, today_n, kill_errno);
+
+        if (kill_errno != 0 && kill_errno != ESRCH) {
+            g_rst_sm.state = RST_STATE_IDLE;
+            r_state->sample_count = 0;
+            continue;
+        }
 
         r_state->sample_count = 0;
         r_state->in_bg = 0;
@@ -3433,7 +3445,7 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
             const char *err_stage = NULL;
             int c3_rc = rst_fbs_launch(rule->bid, &err_stage);
             if (c3_rc != 0) {
-                JPLOG(JP_INFO, "%-6s relaunch ok=0 err=%s", "RST", err_stage ? err_stage : "unknown");
+                JPLOG(JP_INFO, "%-6s relaunch bid=%s ok=0 err=%s", "RST", rule->bid, err_stage ? err_stage : "unknown");
                 g_rst_sm.state = RST_STATE_IDLE;
             } else {
                 clock_gettime(CLOCK_MONOTONIC, &g_rst_sm.t_launch);
