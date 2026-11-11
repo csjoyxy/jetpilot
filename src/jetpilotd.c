@@ -46,6 +46,7 @@ extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <sys/resource.h>
 #include <dispatch/dispatch.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dlfcn.h>
 #include <math.h>
 
 /* kern.memorypressure_manual_trigger 相关定义
@@ -3080,6 +3081,228 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
     target_rule->last_warn_sec = warn_mono.tv_sec;
 }
 
+/* ========================================================================= */
+/* --- 调试开关：restart_spike 验证（测试分支专供，不进发版） --- */
+/* ========================================================================= */
+#define RESTART_SPIKE_PATH CONFIG_DIR "/restart_spike"
+
+#ifndef OBJC_TYPEDEFS_DEFINED
+#define OBJC_TYPEDEFS_DEFINED
+typedef void *jp_objc_id;
+typedef void *jp_objc_SEL;
+typedef void *jp_objc_Class;
+#endif
+
+static jp_objc_Class (*jp_objc_getClass)(const char *name) = NULL;
+static jp_objc_SEL (*jp_sel_registerName)(const char *str) = NULL;
+static jp_objc_id (*jp_objc_msgSend)(jp_objc_id self, jp_objc_SEL op, ...) = NULL;
+
+static void init_objc_bridge(void) {
+    if (jp_objc_getClass && jp_sel_registerName && jp_objc_msgSend) return;
+    void *h = dlopen("/usr/lib/libobjc.A.dylib", RTLD_LAZY);
+    if (!h) h = RTLD_DEFAULT;
+    jp_objc_getClass = (jp_objc_Class (*)(const char *))dlsym(h, "objc_getClass");
+    jp_sel_registerName = (jp_objc_SEL (*)(const char *))dlsym(h, "sel_registerName");
+    jp_objc_msgSend = (jp_objc_id (*)(jp_objc_id, jp_objc_SEL, ...))dlsym(h, "objc_msgSend");
+}
+
+/* 路径 1: FrontBoardServices FBSSystemService openApplication:options: (suspended=1) */
+static int spike_launch_path1_frontboard(const char *bid) {
+    init_objc_bridge();
+    if (!jp_objc_getClass || !jp_sel_registerName || !jp_objc_msgSend) {
+        JPLOG(JP_ERR, "%-6s FBS: objc runtime not found", "RST");
+        return -1;
+    }
+    void *fbs = dlopen("/System/Library/PrivateFrameworks/FrontBoardServices.framework/FrontBoardServices", RTLD_LAZY);
+    if (!fbs) {
+        JPLOG(JP_ERR, "%-6s FBS: dlopen FrontBoardServices failed: %s", "RST", dlerror());
+        return -2;
+    }
+    jp_objc_Class clsFBSSystemService = jp_objc_getClass("FBSSystemService");
+    if (!clsFBSSystemService) {
+        JPLOG(JP_ERR, "%-6s FBS: objc_getClass FBSSystemService failed", "RST");
+        return -3;
+    }
+    jp_objc_SEL selSharedService = jp_sel_registerName("sharedService");
+    jp_objc_id service = ((jp_objc_id (*)(jp_objc_id, jp_objc_SEL))jp_objc_msgSend)((jp_objc_id)clsFBSSystemService, selSharedService);
+    if (!service) {
+        JPLOG(JP_ERR, "%-6s FBS: [FBSSystemService sharedService] returned nil", "RST");
+        return -4;
+    }
+
+    CFStringRef *pKey = (CFStringRef *)dlsym(fbs, "FBSOpenApplicationOptionKeyActivateSuspended");
+    CFStringRef optKey = pKey ? *pKey : CFSTR("__ActivateSuspended");
+
+    const void *keys[] = { optKey };
+    const void *values[] = { kCFBooleanTrue };
+    CFDictionaryRef options = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
+                                                 &kCFTypeDictionaryKeyCallBacks,
+                                                 &kCFTypeDictionaryValueCallBacks);
+    CFStringRef cf_bid = CFStringCreateWithCString(kCFAllocatorDefault, bid, kCFStringEncodingUTF8);
+
+    jp_objc_SEL selResponds = jp_sel_registerName("respondsToSelector:");
+    jp_objc_SEL selWithResult = jp_sel_registerName("openApplication:options:withResult:");
+    jp_objc_SEL selWithoutResult = jp_sel_registerName("openApplication:options:");
+
+    int invoked = 0;
+    if (((intptr_t (*)(jp_objc_id, jp_objc_SEL, jp_objc_SEL))jp_objc_msgSend)(service, selResponds, selWithResult)) {
+        JPLOG(JP_INFO, "%-6s FBS: calling openApplication:options:withResult: (suspended=1)", "RST");
+        ((jp_objc_id (*)(jp_objc_id, jp_objc_SEL, jp_objc_id, jp_objc_id, jp_objc_id))jp_objc_msgSend)(service, selWithResult, (jp_objc_id)cf_bid, (jp_objc_id)options, NULL);
+        invoked = 1;
+    } else if (((intptr_t (*)(jp_objc_id, jp_objc_SEL, jp_objc_SEL))jp_objc_msgSend)(service, selResponds, selWithoutResult)) {
+        JPLOG(JP_INFO, "%-6s FBS: calling openApplication:options: (suspended=1)", "RST");
+        ((jp_objc_id (*)(jp_objc_id, jp_objc_SEL, jp_objc_id, jp_objc_id))jp_objc_msgSend)(service, selWithoutResult, (jp_objc_id)cf_bid, (jp_objc_id)options);
+        invoked = 1;
+    } else {
+        JPLOG(JP_ERR, "%-6s FBS: service does not respond to openApplication selectors", "RST");
+    }
+
+    if (cf_bid) CFRelease(cf_bid);
+    if (options) CFRelease(options);
+
+    return invoked ? 0 : -5;
+}
+
+/* 路径 2: SpringBoardServices SBSLaunchApplicationWithIdentifier(bid, suspended=1) */
+static int spike_launch_path2_springboard(const char *bid) {
+    void *sbs = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices", RTLD_LAZY);
+    if (!sbs) {
+        JPLOG(JP_ERR, "%-6s SBS: dlopen SpringBoardServices failed: %s", "RST", dlerror());
+        return -1;
+    }
+    int (*fn_SBSLaunch)(CFStringRef, Boolean) = (int (*)(CFStringRef, Boolean))dlsym(sbs, "SBSLaunchApplicationWithIdentifier");
+    if (!fn_SBSLaunch) {
+        JPLOG(JP_ERR, "%-6s SBS: dlsym SBSLaunchApplicationWithIdentifier failed: %s", "RST", dlerror());
+        return -2;
+    }
+    CFStringRef cf_bid = CFStringCreateWithCString(kCFAllocatorDefault, bid, kCFStringEncodingUTF8);
+    if (!cf_bid) return -3;
+    JPLOG(JP_INFO, "%-6s SBS: calling SBSLaunchApplicationWithIdentifier(bid=%s, suspended=1)", "RST", bid);
+    int rc = fn_SBSLaunch(cf_bid, 1);
+    CFRelease(cf_bid);
+    JPLOG(JP_INFO, "%-6s SBS: SBSLaunchApplicationWithIdentifier returned %d", "RST", rc);
+    return (rc == 0) ? 0 : rc;
+}
+
+static pid_t spike_find_pid(const char *target_bid, int32_t *band_out, char *path_out, size_t path_sz) {
+    if (!target_bid || target_bid[0] == '\0') return 0;
+    int count = 0;
+    memorystatus_priority_entry_t *list = get_list(&count);
+    if (!list) return 0;
+    pid_t found_pid = 0;
+    for (int i = 0; i < count; i++) {
+        pid_t p = list[i].pid;
+        if (p <= 0) continue;
+        char ppath[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(p, ppath, sizeof(ppath)) <= 0) continue;
+        if (!strstr(ppath, "/var/containers/Bundle/Application/")) continue;
+        const char *bid = app_bid_for_path(ppath);
+        if (bid && strcmp(bid, target_bid) == 0) {
+            char plabel[64] = {0};
+            proc_label(ppath, plabel, sizeof(plabel));
+            if (strcmp(plabel, "main") == 0 || found_pid == 0) {
+                found_pid = p;
+                if (band_out) *band_out = list[i].priority;
+                if (path_out && path_sz > 0) {
+                    strncpy(path_out, ppath, path_sz - 1);
+                    path_out[path_sz - 1] = '\0';
+                }
+                if (strcmp(plabel, "main") == 0) break;
+            }
+        }
+    }
+    free(list);
+    return found_pid;
+}
+
+static void check_and_run_restart_spike(void) {
+    struct stat st;
+    if (stat(RESTART_SPIKE_PATH, &st) != 0) return;
+
+    char target_bid[128] = {0};
+    FILE *f = fopen(RESTART_SPIKE_PATH, "r");
+    if (f) {
+        if (fgets(target_bid, sizeof(target_bid), f)) {
+            char *p = target_bid;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            if (p != target_bid) memmove(target_bid, p, strlen(p) + 1);
+            int len = (int)strlen(target_bid);
+            while (len > 0 && (target_bid[len - 1] == ' ' || target_bid[len - 1] == '\t' ||
+                               target_bid[len - 1] == '\r' || target_bid[len - 1] == '\n')) {
+                target_bid[--len] = '\0';
+            }
+        }
+        fclose(f);
+    }
+    unlink(RESTART_SPIKE_PATH); /* 只触发一次，立即移除开关文件 */
+
+    if (target_bid[0] == '\0') {
+        strncpy(target_bid, "com.tencent.xin", sizeof(target_bid) - 1);
+    }
+
+    JPLOG(JP_INFO, "%-6s file detected, target bid=%s", "RST", target_bid);
+
+    int32_t old_band = 0;
+    char old_path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    pid_t old_pid = spike_find_pid(target_bid, &old_band, old_path, sizeof(old_path));
+
+    if (old_pid > 0) {
+        JPLOG(JP_INFO, "%-6s kill pid=%d bid=%s band=%d path=%s",
+               "RST", (int)old_pid, target_bid, (int)old_band, old_path);
+        kill(old_pid, SIGKILL);
+        sleep(3);
+    } else {
+        JPLOG(JP_INFO, "%-6s bid=%s not running, proceeding directly to launch", "RST", target_bid);
+    }
+
+    /* 路径 1: FrontBoardServices */
+    JPLOG(JP_INFO, "%-6s attempting Path 1 (FrontBoardServices)", "RST");
+    int r1 = spike_launch_path1_frontboard(target_bid);
+    pid_t new_pid = 0;
+    int32_t new_band = 0;
+    char new_path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+
+    if (r1 == 0) {
+        /* 等待最多 10 秒看新 pid 是否出现 */
+        for (int sec = 1; sec <= 10; sec++) {
+            sleep(1);
+            pid_t p = spike_find_pid(target_bid, &new_band, new_path, sizeof(new_path));
+            if (p > 0 && p != old_pid) {
+                new_pid = p;
+                break;
+            }
+        }
+    }
+
+    if (new_pid > 0) {
+        JPLOG(JP_INFO, "%-6s relaunch bid=%s path=FBS new_pid=%d band=%d ok=1",
+               "RST", target_bid, (int)new_pid, (int)new_band);
+        return;
+    }
+
+    JPLOG(JP_WARN, "%-6s Path 1 (FBS) failed or timed out (new_pid=none ok=0), trying Path 2 (SpringBoardServices)", "RST");
+
+    /* 路径 2: SpringBoardServices */
+    int r2 = spike_launch_path2_springboard(target_bid);
+    if (r2 == 0) {
+        for (int sec = 1; sec <= 10; sec++) {
+            sleep(1);
+            pid_t p = spike_find_pid(target_bid, &new_band, new_path, sizeof(new_path));
+            if (p > 0 && p != old_pid) {
+                new_pid = p;
+                break;
+            }
+        }
+    }
+
+    if (new_pid > 0) {
+        JPLOG(JP_INFO, "%-6s relaunch bid=%s path=SBS new_pid=%d band=%d ok=1",
+               "RST", target_bid, (int)new_pid, (int)new_band);
+    } else {
+        JPLOG(JP_ERR, "%-6s relaunch bid=%s both paths failed (new_pid=none ok=0)", "RST", target_bid);
+    }
+}
+
 int main(void) {
     if (geteuid() != 0) {
         fprintf(stderr, "[JetPilot] 必须以 root 运行\n");
@@ -3109,6 +3332,7 @@ int main(void) {
     mempressure_init();  /* 前台 App 内存压力触发初始化 (v0.7.0) */
 
     while (!should_stop()) {
+        check_and_run_restart_spike();
         if (load_config() != 0) { sleep(5); continue; }
 
         char bands_token[128] = {0};
