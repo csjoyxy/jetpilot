@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - "review/**"   # 预览分支：推分支即 CI 出包，真机验证 ok 才合 main
+      - "diag/**"     # 诊断分支
     tags:
       - "v*"
     paths:
@@ -19,6 +20,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-latest
+    if: "!startsWith(github.ref, 'refs/heads/diag/')"
     steps:
       - uses: actions/checkout@v4
 
@@ -69,3 +71,26 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: src/JetPilot.tipa
+
+  build-jplimit:
+    runs-on: macos-latest
+    if: "startsWith(github.ref, 'refs/heads/diag/')"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build jplimit
+        working-directory: src
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall \
+            -miphoneos-version-min=15.0 \
+            -framework CoreFoundation \
+            tools/jplimit.c -o jplimit
+          ldid -Sentitlements-jplimit.plist jplimit
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jplimit
+          path: src/jplimit
