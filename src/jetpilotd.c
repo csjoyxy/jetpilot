@@ -39,6 +39,9 @@ extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#if !defined(__APPLE__) && !defined(st_mtimespec)
+#define st_mtimespec st_mtim
+#endif
 #include <signal.h>
 #include <notify.h>   /* 锁屏状态：com.apple.springboard.lockstate（libSystem 自带） */
 #include <sys/select.h>
@@ -168,7 +171,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define BANDS_TAKEN_PATH CONFIG_DIR "/bands.req.taken"
 #define BANDS_PATH       CONFIG_DIR "/bands.txt"
 #define BANDS_TMP_PATH   CONFIG_DIR "/bands.txt.tmp"
-#define JP_VERSION   "0.7.7"
+#define JP_VERSION   "0.7.8"
 #ifndef JP_COMMIT
 #define JP_COMMIT    "dev"
 #endif
@@ -931,6 +934,7 @@ static const char *proc_label_log(const char *path) {
 static char  *g_last_body = NULL;   /* 上次成功写盘的内容（不含 updated= 行） */
 static size_t g_last_body_len = 0;
 static time_t g_last_write = 0;     /* 上次成功写盘的 CLOCK_MONOTONIC 秒 */
+static int    g_restart_cfg_bad_count = 0; /* restart.txt 无效行数 (v0.7.8 C1-N6) */
 
 static void write_status(int protected_now, int demoted_pids,
                          protected_entry_t *plist, int nplist,
@@ -941,8 +945,12 @@ static void write_status(int protected_now, int demoted_pids,
     if (!m) return;
     fprintf(m, "bid_support=1\n"
                "restart_support=1\n"
+               "version=" JP_VERSION "\n"
+               "commit=" JP_COMMIT "\n"
+               "cfg_bad=%d\n"
                "protect_rules=%d\ndemote_rules=%d\n"
                "protected_pids=%d\ndemoted_pids=%d\nreasserts_total=%lu\n",
+            g_restart_cfg_bad_count,
             g_nprotect, g_ndemote, protected_now, demoted_pids, g_reassert_count);
     /* 失败记录：无失败时只写总数 0，App 端隐藏红色区域 */
     fprintf(m, "set_fail_total=%lu\n", g_set_fail_total);
@@ -2471,11 +2479,99 @@ static int restart_rule_cfg_equal(const restart_rule_t *a, const restart_rule_t 
     return 1;
 }
 
+/* =========================================================================
+ * 配置文件状态变更检查通用判据 (供 restart.txt 与卡 2 的 pulse.txt 共同复用)
+ * ========================================================================= */
+typedef struct {
+    int             initialized;   /* 0: 未初始化; 1: 已记录状态 */
+    int             file_absent;   /* 上次检查时文件是否不存在 (1: 不存在; 0: 存在) */
+    ino_t           ino;           /* 上次文件的 st_ino */
+    off_t           size;          /* 上次文件的 st_size */
+    struct timespec mtimespec;     /* 上次文件的 st_mtimespec (含纳秒 tv_nsec) */
+} jp_file_stamp_t;
+
+/* 检查指定路径文件的内容/元数据是否发生变更。
+ * 判定依据：st_ino + st_size + st_mtimespec (纳秒)。
+ * App 采用 atomic rename 保存配置，每次都会更换 inode；手改或覆盖时纳秒 mtime 也会变化。
+ * 卡 2 的 pulse.txt 加载应直接复用此函数与 jp_file_stamp_t。
+ *
+ * 参数：
+ *   path: 文件绝对路径
+ *   stamp: 状态跟踪结构体指针（调用者维护独立静态或堆变量）
+ *   out_file_absent: (可选) 输出当前文件是否存在 (1: 不存在; 0: 存在)
+ *
+ * 返回值：
+ *   1: 文件发生变化（首次检查、文件存在性变更、或 ino/size/mtimespec 变更）
+ *   0: 文件无变化
+ */
+static int jp_file_stat_changed(const char *path, jp_file_stamp_t *stamp, int *out_file_absent) {
+    if (!path || !stamp) return 0;
+
+    struct stat st;
+    int stat_rc = stat(path, &st);
+    int cur_absent = (stat_rc != 0);
+    if (out_file_absent) {
+        *out_file_absent = cur_absent;
+    }
+
+    if (!stamp->initialized) {
+        stamp->initialized = 1;
+        stamp->file_absent = cur_absent;
+        if (!cur_absent) {
+            stamp->ino = st.st_ino;
+            stamp->size = st.st_size;
+            stamp->mtimespec = st.st_mtimespec;
+        } else {
+            stamp->ino = 0;
+            stamp->size = -1;
+            memset(&stamp->mtimespec, 0, sizeof(stamp->mtimespec));
+        }
+        return 1;
+    }
+
+    if (cur_absent != stamp->file_absent) {
+        stamp->file_absent = cur_absent;
+        if (!cur_absent) {
+            stamp->ino = st.st_ino;
+            stamp->size = st.st_size;
+            stamp->mtimespec = st.st_mtimespec;
+        } else {
+            stamp->ino = 0;
+            stamp->size = -1;
+            memset(&stamp->mtimespec, 0, sizeof(stamp->mtimespec));
+        }
+        return 1;
+    }
+
+    if (!cur_absent) {
+        if (st.st_ino != stamp->ino ||
+            st.st_size != stamp->size ||
+            st.st_mtimespec.tv_sec != stamp->mtimespec.tv_sec ||
+            st.st_mtimespec.tv_nsec != stamp->mtimespec.tv_nsec) {
+            stamp->ino = st.st_ino;
+            stamp->size = st.st_size;
+            stamp->mtimespec = st.st_mtimespec;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static jp_file_stamp_t s_restart_cfg_stamp = {0};
+
 static int restart_load_config(void) {
-    FILE *f = fopen(RESTART_CONFIG_PATH, "r");
-    int file_absent = (f == NULL);
+    int file_absent = 0;
+    int content_changed = jp_file_stat_changed(RESTART_CONFIG_PATH, &s_restart_cfg_stamp, &file_absent);
+
+    if (!content_changed) {
+        return g_restart_cfg_file_absent ? -1 : 0;
+    }
+
+    FILE *f = file_absent ? NULL : fopen(RESTART_CONFIG_PATH, "r");
     restart_rule_t parsed_rules[RESTART_MAX_RULES];
     int nparsed = 0;
+    int bad_line_count = 0;
 
     if (f) {
         char line[512];
@@ -2503,6 +2599,7 @@ static int restart_load_config(void) {
             if (cr) *cr = '\0';
 
             if (oversized) {
+                bad_line_count++;
                 JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "RST", line_no, raw_text);
                 continue;
             }
@@ -2524,17 +2621,20 @@ static int restart_load_config(void) {
             }
 
             if (ntokens != 5) {
+                bad_line_count++;
                 JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "RST", line_no, raw_text);
                 continue;
             }
 
             if (strncmp(tokens[0], "bid:", 4) != 0) {
+                bad_line_count++;
                 JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "RST", line_no, raw_text);
                 continue;
             }
 
             const char *bid = tokens[0] + 4;
             if (bid[0] == '\0' || strlen(bid) >= sizeof(parsed_rules[0].bid) || restart_is_blocked_bid(bid)) {
+                bad_line_count++;
                 JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "RST", line_no, raw_text);
                 continue;
             }
@@ -2547,6 +2647,7 @@ static int restart_load_config(void) {
                 }
             }
             if (duplicate) {
+                bad_line_count++;
                 JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "RST", line_no, raw_text);
                 continue;
             }
@@ -2600,11 +2701,13 @@ static int restart_load_config(void) {
             }
 
             if (bad || !has_thr || !has_bg || !has_max || !has_relaunch) {
+                bad_line_count++;
                 JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "RST", line_no, raw_text);
                 continue;
             }
 
             if (nparsed >= RESTART_MAX_RULES) {
+                bad_line_count++;
                 JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "RST", line_no, raw_text);
                 continue;
             }
@@ -2619,6 +2722,8 @@ static int restart_load_config(void) {
         }
         fclose(f);
     }
+
+    g_restart_cfg_bad_count = bad_line_count;
 
     int changed = 0;
     if (g_restart_cfg_first_load) {
@@ -2650,6 +2755,8 @@ static int restart_load_config(void) {
         g_nrestart_rules = nparsed;
         g_restart_cfg_file_absent = file_absent;
 
+        /* 压实 g_rst_rule_states 槽位，删除规则后槽位复用且计数递减 (C1-M5 / N4) */
+        int new_nrst_rule_states = 0;
         for (int i = 0; i < g_nrst_rule_states; i++) {
             int found = 0;
             for (int j = 0; j < g_nrestart_rules; j++) {
@@ -2658,10 +2765,17 @@ static int restart_load_config(void) {
                     break;
                 }
             }
-            if (!found) {
-                rst_clear_rule_state(&g_rst_rule_states[i]);
+            if (found) {
+                if (new_nrst_rule_states != i) {
+                    g_rst_rule_states[new_nrst_rule_states] = g_rst_rule_states[i];
+                }
+                new_nrst_rule_states++;
             }
         }
+        for (int i = new_nrst_rule_states; i < g_nrst_rule_states; i++) {
+            memset(&g_rst_rule_states[i], 0, sizeof(rst_rule_state_t));
+        }
+        g_nrst_rule_states = new_nrst_rule_states;
     }
 
     return file_absent ? -1 : 0;
@@ -3100,11 +3214,118 @@ static int restart_state_record_restart(const char *bid, time_t now_mono) {
             break;
         }
     }
-    if (!found_last && g_rst_nlast < RESTART_STATE_MAX_LAST) {
-        rst_str_copy(g_rst_last[g_rst_nlast].bid, sizeof(g_rst_last[g_rst_nlast].bid), bid);
-        rst_str_copy(g_rst_last[g_rst_nlast].boot_uuid, sizeof(g_rst_last[g_rst_nlast].boot_uuid), boot_uuid);
-        g_rst_last[g_rst_nlast].mono_sec = now_mono;
-        g_rst_nlast++;
+    if (!found_last) {
+        for (int i = 0; i < g_rst_nlast; i++) {
+            if (g_rst_last[i].bid[0] == '\0') {
+                rst_str_copy(g_rst_last[i].bid, sizeof(g_rst_last[i].bid), bid);
+                rst_str_copy(g_rst_last[i].boot_uuid, sizeof(g_rst_last[i].boot_uuid), boot_uuid);
+                g_rst_last[i].mono_sec = now_mono;
+                found_last = 1;
+                break;
+            }
+        }
+    }
+    if (!found_last) {
+        if (g_rst_nlast < RESTART_STATE_MAX_LAST) {
+            rst_str_copy(g_rst_last[g_rst_nlast].bid, sizeof(g_rst_last[g_rst_nlast].bid), bid);
+            rst_str_copy(g_rst_last[g_rst_nlast].boot_uuid, sizeof(g_rst_last[g_rst_nlast].boot_uuid), boot_uuid);
+            g_rst_last[g_rst_nlast].mono_sec = now_mono;
+            g_rst_nlast++;
+            found_last = 1;
+        } else {
+            /* 槽满，按顺序淘汰 (C1-M5-a) */
+            /* 1. 最后一次重启超过 24 小时 (86400 秒) 的记录，最旧的先淘汰 */
+            int evict_idx = -1;
+            time_t max_age = 0;
+
+            for (int i = 0; i < g_rst_nlast; i++) {
+                time_t age = 0;
+                int same_boot = (strcmp(boot_uuid, g_rst_last[i].boot_uuid) == 0);
+                if (same_boot) {
+                    age = (now_mono >= g_rst_last[i].mono_sec) ? (now_mono - g_rst_last[i].mono_sec) : 0;
+                } else {
+                    age = 86400 + now_mono;
+                }
+                if (age > 86400) {
+                    if (evict_idx == -1 || age > max_age) {
+                        evict_idx = i;
+                        max_age = age;
+                    }
+                }
+            }
+
+            if (evict_idx >= 0) {
+                JPLOG(JP_DEBUG, "%-6s RST_LAST_EVICT bid=%s age=%ld why=old",
+                      "RST", g_rst_last[evict_idx].bid, (long)max_age);
+                rst_str_copy(g_rst_last[evict_idx].bid, sizeof(g_rst_last[evict_idx].bid), bid);
+                rst_str_copy(g_rst_last[evict_idx].boot_uuid, sizeof(g_rst_last[evict_idx].boot_uuid), boot_uuid);
+                g_rst_last[evict_idx].mono_sec = now_mono;
+                found_last = 1;
+            } else {
+                /* 2. 不在当前规则里（包括 #off 和已删除）的记录，最旧的先淘汰 */
+                evict_idx = -1;
+                max_age = 0;
+                for (int i = 0; i < g_rst_nlast; i++) {
+                    int in_rules = 0;
+                    for (int j = 0; j < g_nrestart_rules; j++) {
+                        if (strcmp(g_rst_last[i].bid, g_restart_rules[j].bid) == 0) {
+                            in_rules = 1;
+                            break;
+                        }
+                    }
+                    if (!in_rules) {
+                        time_t age = 0;
+                        int same_boot = (strcmp(boot_uuid, g_rst_last[i].boot_uuid) == 0);
+                        if (same_boot) {
+                            age = (now_mono >= g_rst_last[i].mono_sec) ? (now_mono - g_rst_last[i].mono_sec) : 0;
+                        } else {
+                            age = 86400 + now_mono;
+                        }
+                        if (evict_idx == -1 || age > max_age) {
+                            evict_idx = i;
+                            max_age = age;
+                        }
+                    }
+                }
+
+                if (evict_idx >= 0) {
+                    JPLOG(JP_DEBUG, "%-6s RST_LAST_EVICT bid=%s age=%ld why=norule",
+                          "RST", g_rst_last[evict_idx].bid, (long)max_age);
+                    rst_str_copy(g_rst_last[evict_idx].bid, sizeof(g_rst_last[evict_idx].bid), bid);
+                    rst_str_copy(g_rst_last[evict_idx].boot_uuid, sizeof(g_rst_last[evict_idx].boot_uuid), boot_uuid);
+                    g_rst_last[evict_idx].mono_sec = now_mono;
+                    found_last = 1;
+                } else {
+                    /* 3. 还没有：不写入，打 Warn RST_SLOT_FULL bid=<新bid> slots=<n>，每个 bid 每天最多打一次 */
+                    static struct {
+                        char bid[128];
+                        char date[16];
+                    } s_slot_warns[64];
+                    static int s_nslot_warns = 0;
+
+                    int already_warned = 0;
+                    for (int w = 0; w < s_nslot_warns; w++) {
+                        if (strcmp(s_slot_warns[w].bid, bid) == 0 &&
+                            strcmp(s_slot_warns[w].date, today_str) == 0) {
+                            already_warned = 1;
+                            break;
+                        }
+                    }
+                    if (!already_warned) {
+                        if (s_nslot_warns < 64) {
+                            rst_str_copy(s_slot_warns[s_nslot_warns].bid, sizeof(s_slot_warns[s_nslot_warns].bid), bid);
+                            rst_str_copy(s_slot_warns[s_nslot_warns].date, sizeof(s_slot_warns[s_nslot_warns].date), today_str);
+                            s_nslot_warns++;
+                        } else {
+                            rst_str_copy(s_slot_warns[0].bid, sizeof(s_slot_warns[0].bid), bid);
+                            rst_str_copy(s_slot_warns[0].date, sizeof(s_slot_warns[0].date), today_str);
+                        }
+                        JPLOG(JP_WARN, "%-6s RST_SLOT_FULL bid=%s slots=%d",
+                              "RST", bid, RESTART_STATE_MAX_LAST);
+                    }
+                }
+            }
+        }
     }
 
     restart_state_save();
@@ -3179,9 +3400,18 @@ static int32_t rst_c4_read_band_settled(pid_t new_pid, int32_t cur_band) {
 }
 
 static rst_rule_state_t *rst_get_rule_state(const char *bid) {
+    if (!bid || bid[0] == '\0') return NULL;
     for (int i = 0; i < g_nrst_rule_states; i++) {
         if (strcmp(g_rst_rule_states[i].bid, bid) == 0) {
             return &g_rst_rule_states[i];
+        }
+    }
+    for (int i = 0; i < g_nrst_rule_states; i++) {
+        if (g_rst_rule_states[i].bid[0] == '\0') {
+            rst_rule_state_t *st = &g_rst_rule_states[i];
+            memset(st, 0, sizeof(*st));
+            rst_str_copy(st->bid, sizeof(st->bid), bid);
+            return st;
         }
     }
     if (g_nrst_rule_states < RESTART_MAX_RULES) {
@@ -3190,6 +3420,8 @@ static rst_rule_state_t *rst_get_rule_state(const char *bid) {
         rst_str_copy(st->bid, sizeof(st->bid), bid);
         return st;
     }
+    JPLOG(JP_WARN, "%-6s rule state slots full (max %d), cannot track bid=%s",
+          "RST", RESTART_MAX_RULES, bid);
     return NULL;
 }
 
@@ -3214,6 +3446,39 @@ static void restart_log_skip(const restart_rule_t *rule, rst_rule_state_t *r_sta
     }
 }
 
+#define RST_MAX_TRACKED_APPS 256
+typedef struct {
+    pid_t pid;
+    int32_t priority;
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    char bid[128];
+} rst_app_proc_t;
+
+static rst_app_proc_t s_app_procs[RST_MAX_TRACKED_APPS];
+static int s_napp_procs = -1;
+
+static void rst_ensure_app_procs(memorystatus_priority_entry_t *list, int count) {
+    if (s_napp_procs >= 0) return; /* 本轮已构建 */
+    s_napp_procs = 0;
+    if (list && count > 0) {
+        for (int i = 0; i < count && s_napp_procs < RST_MAX_TRACKED_APPS; i++) {
+            pid_t pid = list[i].pid;
+            if (pid <= 0) continue;
+            char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+            if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
+            if (!memp_is_main_app_binary(path)) continue;
+            const char *bid = app_bid_for_path(path);
+            if (!bid || bid[0] == '\0') continue;
+
+            s_app_procs[s_napp_procs].pid = pid;
+            s_app_procs[s_napp_procs].priority = list[i].priority;
+            rst_str_copy(s_app_procs[s_napp_procs].path, sizeof(s_app_procs[s_napp_procs].path), path);
+            rst_str_copy(s_app_procs[s_napp_procs].bid, sizeof(s_app_procs[s_napp_procs].bid), bid);
+            s_napp_procs++;
+        }
+    }
+}
+
 static void restart_round(memorystatus_priority_entry_t *list, int count) {
     restart_state_check_reload();
 
@@ -3221,21 +3486,18 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
     time_t now_mono = now_ts.tv_sec;
 
+    /* 本轮按需懒建 bid -> pid 映射 (C1-N5-a) */
+    s_napp_procs = -1;
+
     /* 1. 推进状态机 (WAIT_PID / WAIT_SETTLE) */
     if (g_rst_sm.state == RST_STATE_WAIT_PID) {
+        rst_ensure_app_procs(list, count);
         pid_t found_new_pid = 0;
-        if (list && count > 0) {
-            for (int i = 0; i < count; i++) {
-                pid_t pid = list[i].pid;
-                if (pid <= 0 || pid == g_rst_sm.old_pid) continue;
-                char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-                if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
-                if (!memp_is_main_app_binary(path)) continue;
-                const char *bid = app_bid_for_path(path);
-                if (bid && strcmp(bid, g_rst_sm.bid) == 0) {
-                    found_new_pid = pid;
-                    break;
-                }
+        for (int i = 0; i < s_napp_procs; i++) {
+            if (s_app_procs[i].pid == g_rst_sm.old_pid) continue;
+            if (strcmp(s_app_procs[i].bid, g_rst_sm.bid) == 0) {
+                found_new_pid = s_app_procs[i].pid;
+                break;
             }
         }
 
@@ -3257,18 +3519,24 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
         double elapsed = (now_ts.tv_sec - g_rst_sm.t_launch.tv_sec) +
                          (now_ts.tv_nsec - g_rst_sm.t_launch.tv_nsec) / 1e9;
         if (elapsed >= 10.0) {
+            rst_ensure_app_procs(list, count);
             int32_t cur_band = 0;
-            if (list && count > 0) {
-                for (int i = 0; i < count; i++) {
-                    if (list[i].pid == g_rst_sm.new_pid) {
-                        cur_band = list[i].priority;
-                        break;
-                    }
+            int found_pid = 0;
+            for (int i = 0; i < s_napp_procs; i++) {
+                if (s_app_procs[i].pid == g_rst_sm.new_pid) {
+                    cur_band = s_app_procs[i].priority;
+                    found_pid = 1;
+                    break;
                 }
             }
-            int32_t band_settled = rst_c4_read_band_settled(g_rst_sm.new_pid, cur_band);
-            JPLOG(JP_INFO, "%-6s relaunch bid=%s new_pid=%d ok=1 band_settled=%d",
-                  "RST", g_rst_sm.bid, (int)g_rst_sm.new_pid, (int)band_settled);
+            if (!found_pid && kill(g_rst_sm.new_pid, 0) != 0 && errno == ESRCH) {
+                JPLOG(JP_INFO, "%-6s relaunch bid=%s new_pid=%d ok=0 err=gone",
+                      "RST", g_rst_sm.bid, (int)g_rst_sm.new_pid);
+            } else {
+                int32_t band_settled = rst_c4_read_band_settled(g_rst_sm.new_pid, cur_band);
+                JPLOG(JP_INFO, "%-6s relaunch bid=%s new_pid=%d ok=1 band_settled=%d",
+                      "RST", g_rst_sm.bid, (int)g_rst_sm.new_pid, (int)band_settled);
+            }
             g_rst_sm.state = RST_STATE_IDLE;
         }
     }
@@ -3276,6 +3544,8 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
     /* 2. 检查重启规则 (遍历 g_restart_rules) */
     if (g_nrestart_rules == 0 || g_restart_cfg_file_absent) return;
     if (!list || count <= 0) return;
+
+    rst_ensure_app_procs(list, count);
 
     for (int i = 0; i < g_nrestart_rules; i++) {
         restart_rule_t *rule = &g_restart_rules[i];
@@ -3285,19 +3555,14 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
         /* 查找该 bid 的用户 App 主进程 */
         pid_t main_pid = 0;
         int32_t main_cur = 0;
-        for (int j = 0; j < count; j++) {
-            pid_t pid = list[j].pid;
-            if (pid <= 0) continue;
-            char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-            if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
-            if (!memp_is_main_app_binary(path)) continue;
-            if (restart_is_blocked_bid(rule->bid)) continue;
-            const char *bid = app_bid_for_path(path);
-            if (bid && strcmp(bid, rule->bid) == 0) {
-                main_pid = pid;
-                main_cur = list[j].priority;
-                rst_str_copy(s_rst_kill_path, sizeof(s_rst_kill_path), path);
-                break;
+        if (!restart_is_blocked_bid(rule->bid)) {
+            for (int j = 0; j < s_napp_procs; j++) {
+                if (strcmp(s_app_procs[j].bid, rule->bid) == 0) {
+                    main_pid = s_app_procs[j].pid;
+                    main_cur = s_app_procs[j].priority;
+                    rst_str_copy(s_rst_kill_path, sizeof(s_rst_kill_path), s_app_procs[j].path);
+                    break;
+                }
             }
         }
 
@@ -3403,6 +3668,9 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
             if (strcmp(skip_reason, "fg") == 0 && fp_mb <= (uint64_t)rule->thr_mb) {
                 suppress_normal = 1;
             }
+            if (strcmp(skip_reason, "bgwait") == 0 && fp_mb <= (uint64_t)rule->thr_mb) {
+                suppress_normal = 1;
+            }
             if (!suppress_normal) {
                 restart_log_skip(rule, r_state, skip_reason, sys_band, now_mono);
             }
@@ -3415,16 +3683,19 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
         int today_n = 0;
         if (kill_errno == 0 || kill_errno == ESRCH) {
             today_n = restart_state_record_restart(rule->bid, now_mono);
-            rst_c4_floor_reset(main_pid, rule->bid);
         } else {
             today_n = restart_state_get_today_count(rule->bid);
         }
-        s_rst_kill_path[0] = '\0';
 
         JPLOG(JP_INFO, "%-6s kill pid=%d bid=%s fp=%llu thr=%d bg=%d sys_band=%d n=%d rc=%d",
               "RST", (int)main_pid, rule->bid,
               (unsigned long long)fp_mb, (int)rule->thr_mb,
               bg_sec_elapsed, (int)sys_band, today_n, kill_errno);
+
+        if (kill_errno == 0 || kill_errno == ESRCH) {
+            rst_c4_floor_reset(main_pid, rule->bid);
+        }
+        s_rst_kill_path[0] = '\0';
 
         if (kill_errno != 0 && kill_errno != ESRCH) {
             g_rst_sm.state = RST_STATE_IDLE;
@@ -4311,8 +4582,22 @@ int rst_fbs_launch(const char *bid, const char **err_stage) {
         return -1;
     }
 
+    void *(*fn_poolPush)(void) = (void *(*)(void))dlsym(h_objc, "objc_autoreleasePoolPush");
+    void (*fn_poolPop)(void *) = (void (*)(void *))dlsym(h_objc, "objc_autoreleasePoolPop");
+
+    void *pool = NULL;
+    if (fn_poolPush && fn_poolPop) {
+        pool = fn_poolPush();
+    } else {
+        JPLOG(JP_WARN, "%-6s objc_autoreleasePool symbols missing, calling without pool", "RST");
+    }
+
     ((void (*)(jp_objc_id, jp_objc_SEL, jp_objc_id, jp_objc_id, jp_objc_id))fn_objc_msgSend)(
         service, selWithResult, (jp_objc_id)cf_bid, (jp_objc_id)options, NULL);
+
+    if (pool && fn_poolPop) {
+        fn_poolPop(pool);
+    }
 
     CFRelease(options);
     CFRelease(cf_bid);

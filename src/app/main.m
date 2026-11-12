@@ -1,5 +1,5 @@
 /*
- * JetPilot v0.7.7 — iOS 15+ TrollStore 守护进程管理与规则编辑
+ * JetPilot v0.7.8 — iOS 15+ TrollStore 守护进程管理与规则编辑
  * 单文件 UIKit 纯代码实现，深色模式自适应，Auto Layout 布局。
  *
  * 编译命令：
@@ -301,6 +301,9 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) BOOL hasDemotedAppLines;
 @property (nonatomic, assign) BOOL bidSupport;      /* 守护进程是否支持 bid: 规则 */
 @property (nonatomic, assign) BOOL restartSupport;  /* 守护进程是否支持超内存重启 (restart.txt) */
+@property (nonatomic, copy) NSString *version;       /* 守护进程版本号 (v0.7.8 C1-V) */
+@property (nonatomic, copy) NSString *commit;        /* 守护进程 commit 哈希 (v0.7.8 C1-V) */
+@property (nonatomic, assign) NSInteger cfgBad;      /* restart.txt 无效行数 (v0.7.8 C1-N6) */
 @property (nonatomic, assign) unsigned long setFailTotal;
 @property (nonatomic, assign) BOOL hasSetFailTotal;
 @property (nonatomic, assign) int lastErrorErrno;
@@ -389,6 +392,12 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     for (NSString *line in lines) {
         if ([line hasPrefix:@"updated="]) {
             st.updated = [line substringFromIndex:8];
+        } else if ([line hasPrefix:@"version="]) {
+            st.version = [[line substringFromIndex:8] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        } else if ([line hasPrefix:@"commit="]) {
+            st.commit = [[line substringFromIndex:7] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        } else if ([line hasPrefix:@"cfg_bad="]) {
+            st.cfgBad = [[line substringFromIndex:8] integerValue];
         } else if ([line hasPrefix:@"bid_support="]) {
             st.bidSupport = ([[line substringFromIndex:12] intValue] == 1);
         } else if ([line hasPrefix:@"restart_support="]) {
@@ -497,6 +506,23 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 }
 
 @end
+
+static BOOL JPCheckVersionOrCommitMismatch(JPStatusInfo *st, NSString *appVersion, NSString *appCommit) {
+    if (!st || st.version.length == 0) return YES;
+    if (![st.version isEqualToString:appVersion]) return YES;
+
+    NSString *tcDaemon = [st.commit stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *tcApp = [appCommit stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    if (tcDaemon.length >= 7 && tcApp.length >= 7 && ![tcDaemon isEqualToString:@"dev"] && ![tcApp isEqualToString:@"dev"]) {
+        NSString *subDaemon = [[tcDaemon substringToIndex:7] lowercaseString];
+        NSString *subApp = [[tcApp substringToIndex:7] lowercaseString];
+        if (![subDaemon isEqualToString:subApp]) {
+            return YES;
+        }
+    }
+    return NO;
+}
 
 @interface JPInstalledApp : NSObject
 @property (nonatomic, copy) NSString *displayName;
@@ -1112,6 +1138,7 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
 - (void)removeRuleForBundleId:(NSString *)bid;
 - (void)removeLine:(JPRestartLine *)line;
 - (void)updateDuplicateRules;
++ (NSDictionary<NSString *, NSNumber *> *)loadAll7DayRestartCounts;
 + (NSInteger)load7DayRestartCountForBundleId:(NSString *)bid;
 + (NSInteger)loadWarnThresholdForBundleId:(NSString *)bid pathFragment:(NSString *)frag;
 @end
@@ -1359,6 +1386,12 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
     }
     [self.lines removeObjectsInArray:linesToRemove];
     [self.rules removeObjectsInArray:rulesToRemove];
+    for (NSUInteger i = 0; i < self.lines.count; i++) {
+        JPRestartLine *l = self.lines[i];
+        if (!l.isUnknownOrComment && l.rule) {
+            l.rule.lineIndex = (NSInteger)i;
+        }
+    }
     [self updateDuplicateRules];
 }
 
@@ -1368,6 +1401,12 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
         [self.rules removeObject:line.rule];
     }
     [self.lines removeObject:line];
+    for (NSUInteger i = 0; i < self.lines.count; i++) {
+        JPRestartLine *l = self.lines[i];
+        if (!l.isUnknownOrComment && l.rule) {
+            l.rule.lineIndex = (NSInteger)i;
+        }
+    }
     [self updateDuplicateRules];
 }
 
@@ -1402,17 +1441,17 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
     return [outStr writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
 }
 
-+ (NSInteger)load7DayRestartCountForBundleId:(NSString *)bid {
-    if (bid.length == 0) return 0;
++ (NSDictionary<NSString *, NSNumber *> *)loadAll7DayRestartCounts {
+    NSMutableDictionary<NSString *, NSNumber *> *counts = [NSMutableDictionary dictionary];
     NSString *raw = [NSString stringWithContentsOfFile:kRestartState encoding:NSUTF8StringEncoding error:nil];
-    if (!raw || raw.length == 0) return 0;
+    if (!raw || raw.length == 0) return counts;
 
     NSArray<NSString *> *lines = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-    if (lines.count == 0) return 0;
+    if (lines.count == 0) return counts;
 
     NSString *firstLine = [lines[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
     if (![firstLine isEqualToString:@"v1"]) {
-        return 0;
+        return counts;
     }
 
     time_t now_wall = time(NULL);
@@ -1427,9 +1466,9 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
     cur_tm.tm_mon = m_now - 1;
     cur_tm.tm_mday = d_now;
     cur_tm.tm_hour = 12;
+    cur_tm.tm_isdst = -1;
     time_t cur_midday = mktime(&cur_tm);
 
-    NSInteger sum = 0;
     for (NSUInteger i = 1; i < lines.count; i++) {
         NSString *line = [lines[i] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         if (line.length == 0 || [line hasPrefix:@"#"] || [line hasPrefix:@"last "]) continue;
@@ -1443,7 +1482,7 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
         if (tokens.count != 3) continue;
 
         NSString *lineBid = [tokens[0] substringFromIndex:4];
-        if (![lineBid isEqualToString:bid]) continue;
+        if (lineBid.length == 0) continue;
 
         NSString *dateStr = tokens[1];
         int ey = 0, em = 0, ed = 0;
@@ -1454,17 +1493,26 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
         e_tm.tm_mon = em - 1;
         e_tm.tm_mday = ed;
         e_tm.tm_hour = 12;
+        e_tm.tm_isdst = -1;
         time_t e_midday = mktime(&e_tm);
 
         if (e_midday != (time_t)-1 && cur_midday != (time_t)-1) {
-            long diffSec = (long)(cur_midday - e_midday);
-            long diffDays = diffSec / 86400L;
+            double sec_diff = difftime(cur_midday, e_midday);
+            long diffDays = (long)((sec_diff + 43200.0) / 86400.0);
             if (diffDays >= 0 && diffDays <= 6) {
-                sum += [tokens[2] integerValue];
+                NSInteger val = [tokens[2] integerValue];
+                NSInteger cur = [counts[lineBid] integerValue];
+                counts[lineBid] = @(cur + val);
             }
         }
     }
-    return sum;
+    return counts;
+}
+
++ (NSInteger)load7DayRestartCountForBundleId:(NSString *)bid {
+    if (bid.length == 0) return 0;
+    NSDictionary<NSString *, NSNumber *> *counts = [self loadAll7DayRestartCounts];
+    return [counts[bid] integerValue];
 }
 
 + (NSInteger)loadWarnThresholdForBundleId:(NSString *)bid pathFragment:(NSString *)frag {
@@ -4071,7 +4119,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         NSDateFormatter *df = [NSDateFormatter new];
         df.dateFormat = @"yyyyMMdd-HHmmss";
         NSString *dateStr = [df stringFromDate:[NSDate date]];
-        NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.7.7";
+        NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.7.8";
         NSString *zipFileName = [NSString stringWithFormat:@"JetPilot-logs-%@-v%@.zip", dateStr, ver];
         NSString *zipPath = [exportDir stringByAppendingPathComponent:zipFileName];
 
@@ -4793,7 +4841,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.versionWarningBanner.backgroundColor = UIColor.systemRedColor;
     self.versionWarningBanner.layer.cornerRadius = 12;
     self.versionWarningBanner.layer.cornerCurve = kCACornerCurveContinuous;
-    [self.versionWarningBanner setTitle:@"守护进程是旧版本，按 App 添加的规则不会生效。点击重启守护进程。" forState:UIControlStateNormal];
+    [self.versionWarningBanner setTitle:@"守护进程不是当前版本，请重启。点击重启守护进程。" forState:UIControlStateNormal];
     [self.versionWarningBanner setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     self.versionWarningBanner.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     self.versionWarningBanner.titleLabel.numberOfLines = 0;
@@ -5604,7 +5652,10 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.deadBanner.hidden = (state != JPDaemonStateDead);
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     self.lastLoadedStatus = st;
-    self.versionWarningBanner.hidden = !(running && [self hasBidRules] && !st.bidSupport);
+    NSString *appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.7.8";
+    NSString *appCommit = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"JPGitCommit"] ?: @"";
+    BOOL versionMismatch = running && (JPCheckVersionOrCommitMismatch(st, appVersion, appCommit) || ([self hasBidRules] && !st.bidSupport));
+    self.versionWarningBanner.hidden = !versionMismatch;
     [self.statusCard updateWithStatus:st isRunning:running];
     [self refreshKilledStatsIfNeeded:NO];
     for (UIView *v in self.rulesStackView.arrangedSubviews) {
@@ -7558,6 +7609,10 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 - (instancetype)initWithRule:(JPRestartRule *)rule
                     delegate:(id<JPRestartRuleCardViewDelegate>)delegate
                installedApps:(NSArray<JPInstalledApp *> *)apps;
+- (instancetype)initWithRule:(JPRestartRule *)rule
+                    delegate:(id<JPRestartRuleCardViewDelegate>)delegate
+               installedApps:(NSArray<JPInstalledApp *> *)apps
+            restart7DayCount:(NSInteger)count7;
 @end
 
 @implementation JPRestartRuleCardView
@@ -7565,16 +7620,23 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 - (instancetype)initWithRule:(JPRestartRule *)rule
                     delegate:(id<JPRestartRuleCardViewDelegate>)delegate
                installedApps:(NSArray<JPInstalledApp *> *)apps {
+    return [self initWithRule:rule delegate:delegate installedApps:apps restart7DayCount:-1];
+}
+
+- (instancetype)initWithRule:(JPRestartRule *)rule
+                    delegate:(id<JPRestartRuleCardViewDelegate>)delegate
+               installedApps:(NSArray<JPInstalledApp *> *)apps
+            restart7DayCount:(NSInteger)count7 {
     self = [super initWithFrame:CGRectZero];
     if (self) {
         _rule = rule;
         _delegate = delegate;
-        [self setupUIWithApps:apps];
+        [self setupUIWithApps:apps restart7DayCount:count7];
     }
     return self;
 }
 
-- (void)setupUIWithApps:(NSArray<JPInstalledApp *> *)apps {
+- (void)setupUIWithApps:(NSArray<JPInstalledApp *> *)apps restart7DayCount:(NSInteger)providedCount {
     self.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
     self.layer.cornerRadius = 14;
     self.layer.cornerCurve = kCACornerCurveContinuous;
@@ -7614,11 +7676,12 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.paramLabel.textColor = UIColor.secondaryLabelColor;
     self.paramLabel.numberOfLines = 1;
 
-    NSInteger bgMin = (self.rule.bg >= 60) ? (self.rule.bg / 60) : self.rule.bg;
-    NSString *bgUnit = (self.rule.bg >= 60) ? @"分" : @"秒";
+    NSString *bgStr = (self.rule.bg % 60 == 0) ?
+        [NSString stringWithFormat:@"%ld分", (long)(self.rule.bg / 60)] :
+        [NSString stringWithFormat:@"%ld秒", (long)self.rule.bg];
     NSString *relaunchStr = (self.rule.relaunch == 1) ? @"自动拉起" : @"不拉起";
-    self.paramLabel.text = [NSString stringWithFormat:@"%ld MB · 后台 %ld%@ · 每天 %ld 次 · %@",
-                            (long)self.rule.thr, (long)bgMin, bgUnit, (long)self.rule.max, relaunchStr];
+    self.paramLabel.text = [NSString stringWithFormat:@"%ld MB · 后台 %@ · 每天 %ld 次 · %@",
+                            (long)self.rule.thr, bgStr, (long)self.rule.max, relaunchStr];
     [self addSubview:self.paramLabel];
 
     self.statusLabel = [UILabel new];
@@ -7693,7 +7756,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         }
     }
 
-    NSInteger count7 = [JPRestartConfig load7DayRestartCountForBundleId:self.rule.bid];
+    NSInteger count7 = (providedCount >= 0) ? providedCount : [JPRestartConfig load7DayRestartCountForBundleId:self.rule.bid];
     if (!installed) {
         self.statusLabel.text = [NSString stringWithFormat:@"未安装 · 近 7 天 %ld 次", (long)count7];
         self.statusLabel.textColor = UIColor.secondaryLabelColor;
@@ -7885,6 +7948,8 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, assign) NSInteger currentThr;
 @property (nonatomic, assign) NSInteger currentBgMinutes;
+@property (nonatomic, assign) NSInteger currentBgSeconds;
+@property (nonatomic, assign) BOOL bgEdited;
 @property (nonatomic, assign) NSInteger currentMax;
 @property (nonatomic, assign) BOOL relaunch;
 @property (nonatomic, assign) BOOL isEnabled;
@@ -7905,9 +7970,11 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.currentThr = (self.rule.thr >= 200) ? self.rule.thr : 800;
     if ((uint64_t)self.currentThr > self.memcapMB) self.currentThr = (NSInteger)self.memcapMB;
 
-    self.currentBgMinutes = (self.rule.bg >= 60) ? (self.rule.bg / 60) : 10;
+    self.currentBgSeconds = (self.rule.bg >= 60 && self.rule.bg <= 7200) ? self.rule.bg : 600;
+    self.currentBgMinutes = (self.currentBgSeconds >= 60) ? (self.currentBgSeconds / 60) : 10;
     if (self.currentBgMinutes < 1) self.currentBgMinutes = 1;
     if (self.currentBgMinutes > 120) self.currentBgMinutes = 120;
+    self.bgEdited = NO;
 
     self.currentMax = (self.rule.max >= 1 && self.rule.max <= 10) ? self.rule.max : 3;
     self.relaunch = (self.rule.relaunch == 1);
@@ -7930,6 +7997,8 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
     self.tableView.dataSource = self;
     self.tableView.delegate = self;
+    self.tableView.estimatedSectionFooterHeight = 44.0;
+    self.tableView.sectionFooterHeight = UITableViewAutomaticDimension;
     [self.view addSubview:self.tableView];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -7954,7 +8023,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             [self presentViewController:err animated:YES completion:nil];
             return;
         }
-        if (self.currentBgMinutes < 1 || self.currentBgMinutes > 120) {
+        if (self.currentBgSeconds < 60 || self.currentBgSeconds > 7200 || (self.bgEdited && (self.currentBgMinutes < 1 || self.currentBgMinutes > 120))) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"后台时长超出范围"
                                                                          message:@"后台判定时长必须在 1 到 120 分钟之间"
                                                                   preferredStyle:UIAlertControllerStyleAlert];
@@ -7973,7 +8042,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     }
 
     self.rule.thr = self.currentThr;
-    self.rule.bg = self.currentBgMinutes * 60;
+    if (self.bgEdited) {
+        self.rule.bg = self.currentBgMinutes * 60;
+    }
     self.rule.max = self.currentMax;
     self.rule.relaunch = self.relaunch ? 1 : 0;
     self.rule.isEnabled = self.isEnabled;
@@ -8044,9 +8115,6 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
-    if (section == 2) {
-        return 44.0;
-    }
     return UITableViewAutomaticDimension;
 }
 
@@ -8099,7 +8167,10 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         } else if (indexPath.row == 1) {
             UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
             cell.textLabel.text = @"后台驻留时间";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 分钟", (long)self.currentBgMinutes];
+            NSString *bgText = (self.currentBgSeconds % 60 == 0) ?
+                [NSString stringWithFormat:@"%ld 分钟", (long)(self.currentBgSeconds / 60)] :
+                [NSString stringWithFormat:@"%ld 秒", (long)self.currentBgSeconds];
+            cell.detailTextLabel.text = bgText;
             if (!self.isEnabled) {
                 cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
                 cell.textLabel.textColor = UIColor.secondaryLabelColor;
@@ -8191,10 +8262,16 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     __weak typeof(alert) weakAlert = alert;
     __weak typeof(self) weakSelf = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        NSString *txt = weakAlert.textFields.firstObject.text;
+        NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         NSInteger val = [txt integerValue];
-        if (val < 200) val = 200;
-        if ((uint64_t)val > weakSelf.memcapMB) val = (NSInteger)weakSelf.memcapMB;
+        if (txt.length == 0 || val < 200 || (uint64_t)val > weakSelf.memcapMB) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
+                                                                         message:[NSString stringWithFormat:@"重启阈值必须在 200 到 %llu MB 之间", weakSelf.memcapMB]
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
         weakSelf.currentThr = val;
         [weakSelf.tableView reloadData];
     }]];
@@ -8209,17 +8286,26 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
         textField.keyboardType = UIKeyboardTypeNumberPad;
         textField.placeholder = @"分钟 (1 - 120)";
-        textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentBgMinutes];
+        NSInteger defaultMin = (self.currentBgSeconds >= 60) ? (self.currentBgSeconds / 60) : 10;
+        textField.text = [NSString stringWithFormat:@"%ld", (long)defaultMin];
     }];
 
     __weak typeof(alert) weakAlert = alert;
     __weak typeof(self) weakSelf = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        NSString *txt = weakAlert.textFields.firstObject.text;
+        NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         NSInteger val = [txt integerValue];
-        if (val < 1) val = 1;
-        if (val > 120) val = 120;
+        if (txt.length == 0 || val < 1 || val > 120) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
+                                                                         message:@"后台判定时长必须在 1 到 120 分钟之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
         weakSelf.currentBgMinutes = val;
+        weakSelf.currentBgSeconds = val * 60;
+        weakSelf.bgEdited = YES;
         [weakSelf.tableView reloadData];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -8239,10 +8325,16 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     __weak typeof(alert) weakAlert = alert;
     __weak typeof(self) weakSelf = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        NSString *txt = weakAlert.textFields.firstObject.text;
+        NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         NSInteger val = [txt integerValue];
-        if (val < 1) val = 1;
-        if (val > 10) val = 10;
+        if (txt.length == 0 || val < 1 || val > 10) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
+                                                                         message:@"每天重启上限必须在 1 到 10 次之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
         weakSelf.currentMax = val;
         [weakSelf.tableView reloadData];
     }]];
@@ -8417,7 +8509,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.versionWarningBanner.backgroundColor = UIColor.systemRedColor;
     self.versionWarningBanner.layer.cornerRadius = 12;
     self.versionWarningBanner.layer.cornerCurve = kCACornerCurveContinuous;
-    [self.versionWarningBanner setTitle:@"守护进程版本过旧，请重启守护进程" forState:UIControlStateNormal];
+    [self.versionWarningBanner setTitle:@"守护进程不是当前版本，请重启。点击重启守护进程。" forState:UIControlStateNormal];
     [self.versionWarningBanner setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     self.versionWarningBanner.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     self.versionWarningBanner.titleLabel.numberOfLines = 0;
@@ -8720,11 +8812,14 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         ]];
         [self.rulesStackView addArrangedSubview:emptyCard];
     } else {
+        NSDictionary<NSString *, NSNumber *> *counts = [JPRestartConfig loadAll7DayRestartCounts];
         for (JPRestartLine *line in self.config.lines) {
             if (!line.isUnknownOrComment && line.rule) {
+                NSInteger count7 = [counts[line.rule.bid] integerValue];
                 JPRestartRuleCardView *card = [[JPRestartRuleCardView alloc] initWithRule:line.rule
                                                                                  delegate:self
-                                                                            installedApps:self.installedApps];
+                                                                            installedApps:self.installedApps
+                                                                         restart7DayCount:count7];
                 [self.rulesStackView addArrangedSubview:card];
             } else if (line.isUnknownOrComment && ![line isCommentOrEmpty]) {
                 JPRestartUnknownLineCardView *card = [[JPRestartUnknownLineCardView alloc] initWithLine:line delegate:self];
@@ -8744,7 +8839,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     self.restartSupport = running && st.restartSupport;
 
-    BOOL isOutdated = running && !st.restartSupport;
+    NSString *appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.7.8";
+    NSString *appCommit = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"JPGitCommit"] ?: @"";
+    BOOL isOutdated = running && (!st.restartSupport || JPCheckVersionOrCommitMismatch(st, appVersion, appCommit));
     self.versionWarningBanner.hidden = !isOutdated;
 
     if (!running) {
@@ -8756,10 +8853,15 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     }
 
     if (isOutdated) {
-        self.moduleStatusLabel.text = @"守护进程版本过旧，未开启超内存重启";
+        self.moduleStatusLabel.text = @"守护进程不是当前版本，请重启";
         self.moduleStatusLabel.textColor = UIColor.systemOrangeColor;
         self.addRuleCard.alpha = 0.5;
         self.addRuleCard.userInteractionEnabled = NO;
+    } else if (st.cfgBad > 0) {
+        self.moduleStatusLabel.text = [NSString stringWithFormat:@"配置有 %ld 行无效", (long)st.cfgBad];
+        self.moduleStatusLabel.textColor = UIColor.systemOrangeColor;
+        self.addRuleCard.alpha = 1.0;
+        self.addRuleCard.userInteractionEnabled = YES;
     } else {
         self.moduleStatusLabel.text = @"模块状态：正常运行中";
         self.moduleStatusLabel.textColor = UIColor.systemGreenColor;

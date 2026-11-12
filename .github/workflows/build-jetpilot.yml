@@ -28,12 +28,18 @@ jobs:
       - name: Check release gate
         run: bash scripts/check-release.sh
 
+      - name: Set commit env and inject into Info.plist
+        run: |
+          COMMIT="$(git rev-parse --short=7 HEAD)"
+          echo "JP_COMMIT=$COMMIT" >> $GITHUB_ENV
+          plutil -replace JPGitCommit -string "$COMMIT" src/app/Info.plist || plutil -insert JPGitCommit -string "$COMMIT" src/app/Info.plist
+
       - name: Build daemon
         working-directory: src
         run: |
           xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall \
             -miphoneos-version-min=15.0 \
-            -DJP_COMMIT=\"$(git rev-parse --short HEAD)\" \
+            -DJP_COMMIT=\"${{ env.JP_COMMIT }}\" \
             -framework CoreFoundation \
             jetpilotd.c -o jetpilotd
           ldid -Sentitlements-daemon.plist jetpilotd
@@ -43,7 +49,7 @@ jobs:
         run: |
           xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall -fobjc-arc \
             -miphoneos-version-min=15.0 \
-            -DJP_COMMIT=\"$(git rev-parse --short HEAD)\" \
+            -DJP_COMMIT=\"${{ env.JP_COMMIT }}\" \
             -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
             app/main.m -o JetPilot
           ldid -Sentitlements-app.plist JetPilot
