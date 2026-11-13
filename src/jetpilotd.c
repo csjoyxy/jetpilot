@@ -2480,7 +2480,7 @@ static int restart_rule_cfg_equal(const restart_rule_t *a, const restart_rule_t 
 }
 
 /* =========================================================================
- * 配置文件状态变更检查通用判据 (供 restart.txt 与卡 2 的 pulse.txt 共同复用)
+ * 配置文件状态变更检查与打开通用函数 (供 restart.txt 与卡 2 的 pulse.txt 共同复用)
  * ========================================================================= */
 typedef struct {
     int             initialized;   /* 0: 未初始化; 1: 已记录状态 */
@@ -2488,6 +2488,7 @@ typedef struct {
     ino_t           ino;           /* 上次文件的 st_ino */
     off_t           size;          /* 上次文件的 st_size */
     struct timespec mtimespec;     /* 上次文件的 st_mtimespec (含纳秒 tv_nsec) */
+    int             open_failed;   /* 是否处于打开失败状态 (用于只打一次 Warn) */
 } jp_file_stamp_t;
 
 /* 检查指定路径文件的内容/元数据是否发生变更。
@@ -2558,17 +2559,72 @@ static int jp_file_stat_changed(const char *path, jp_file_stamp_t *stamp, int *o
     return 0;
 }
 
+/*
+ * 检查配置文件变更并尝试打开文件。
+ * 供 restart.txt 与卡 2 的 pulse.txt 共同复用。
+ *
+ * 参数：
+ *   path: 文件绝对路径
+ *   stamp: 状态跟踪结构体指针
+ *   log_tag: 日志模块标签（如 "RST"、"PLS"）
+ *   out_file_absent: (输出) 文件是否存在 (1: 不存在; 0: 存在)
+ *   out_file: (输出) 成功打开时的 FILE* 指针；未打开或打开失败时置 NULL
+ *
+ * 返回值：
+ *   0: 文件无变化，无需重新载入
+ *   1: 文件发生变化且状态已处理（若 out_file != NULL 则成功打开；若 out_file == NULL 且 *out_file_absent == 1 则为文件缺失）
+ *  -1: 文件存在但打开失败（EMFILE/EINTR 等），stamp->initialized 已置 0，下一轮将重试，已打 Warn（单次）
+ */
+static int jp_config_open(const char *path, jp_file_stamp_t *stamp, const char *log_tag,
+                          int *out_file_absent, FILE **out_file) {
+    if (out_file) *out_file = NULL;
+    int absent = 0;
+    int changed = jp_file_stat_changed(path, stamp, &absent);
+    if (out_file_absent) *out_file_absent = absent;
+
+    if (!changed) {
+        return 0;
+    }
+
+    if (absent) {
+        stamp->open_failed = 0;
+        return 1;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        int err = errno;
+        stamp->initialized = 0;
+        if (!stamp->open_failed) {
+            stamp->open_failed = 1;
+            JPLOG(JP_WARN, "%-6s cfg_open_fail errno=%d", log_tag ? log_tag : "CFG", err);
+        }
+        return -1;
+    }
+
+    stamp->open_failed = 0;
+    if (out_file) {
+        *out_file = f;
+    } else {
+        fclose(f);
+    }
+    return 1;
+}
+
 static jp_file_stamp_t s_restart_cfg_stamp = {0};
 
 static int restart_load_config(void) {
     int file_absent = 0;
-    int content_changed = jp_file_stat_changed(RESTART_CONFIG_PATH, &s_restart_cfg_stamp, &file_absent);
+    FILE *f = NULL;
+    int rc = jp_config_open(RESTART_CONFIG_PATH, &s_restart_cfg_stamp, "RST", &file_absent, &f);
 
-    if (!content_changed) {
+    if (rc == 0) {
+        return g_restart_cfg_file_absent ? -1 : 0;
+    }
+    if (rc < 0) {
         return g_restart_cfg_file_absent ? -1 : 0;
     }
 
-    FILE *f = file_absent ? NULL : fopen(RESTART_CONFIG_PATH, "r");
     restart_rule_t parsed_rules[RESTART_MAX_RULES];
     int nparsed = 0;
     int bad_line_count = 0;
