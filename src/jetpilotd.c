@@ -3139,6 +3139,213 @@ static int pulse_load_config(void) {
 }
 
 /* =========================================================================
+ * 后台内存释放：档位判定、状态跟踪与触发条件校验 (v0.7.8 C2-1)
+ * ========================================================================= */
+typedef struct {
+    char    bid[128];
+    pid_t   tracked_pid;
+    int     in_bg;              /* 1: 当前处于 0..95 档 */
+    time_t  bg_start_mono;      /* 进入 0..95 档的单调时间 (秒) */
+    time_t  last_pulse_mono;    /* 上次完成 pulse 的单调时间 (秒) */
+    int     pulsed_this_bg;     /* 1: 本次进入后台期间已触发过 pulse (每次进入后台最多 1 次) */
+    int     day_count;          /* 当天已触发 pulse 次数 */
+    char    day_date[16];       /* YYYY-MM-DD 本地日期 */
+    int     tripped_today;      /* 1: 当天已熔断 */
+    int     unresponsive;       /* 1: 标记为对释放无响应 */
+    int     total_pulses;       /* 累计 pulse 次数 */
+    int     no_drop_pulses;     /* 降幅 <= 5MB 的 pulse 次数 */
+} pulse_app_state_t;
+
+static pulse_app_state_t g_pulse_app_states[PULSE_MAX_RULES];
+static int g_npulse_app_states = 0;
+static int g_pulse_global_today_count = 0;
+static char g_pulse_global_today_date[16] = {0};
+
+static void pulse_get_local_date_str(char *buf, size_t sz) {
+    time_t t = time(NULL);
+    struct tm tm_val;
+    localtime_r(&t, &tm_val);
+    strftime(buf, sz, "%Y-%m-%d", &tm_val);
+}
+
+static void pulse_check_date_reset(const char *today_str) {
+    if (g_pulse_global_today_date[0] == '\0' || strcmp(g_pulse_global_today_date, today_str) != 0) {
+        snprintf(g_pulse_global_today_date, sizeof(g_pulse_global_today_date), "%s", today_str);
+        g_pulse_global_today_count = 0;
+        for (int i = 0; i < g_npulse_app_states; i++) {
+            g_pulse_app_states[i].day_count = 0;
+            g_pulse_app_states[i].tripped_today = 0;
+            snprintf(g_pulse_app_states[i].day_date, sizeof(g_pulse_app_states[i].day_date), "%s", today_str);
+        }
+    }
+}
+
+static pulse_app_state_t *pulse_get_app_state(const char *bid, const char *today_str) {
+    if (!bid || bid[0] == '\0') return NULL;
+    for (int i = 0; i < g_npulse_app_states; i++) {
+        if (strcmp(g_pulse_app_states[i].bid, bid) == 0) {
+            if (strcmp(g_pulse_app_states[i].day_date, today_str) != 0) {
+                g_pulse_app_states[i].day_count = 0;
+                g_pulse_app_states[i].tripped_today = 0;
+                snprintf(g_pulse_app_states[i].day_date, sizeof(g_pulse_app_states[i].day_date), "%s", today_str);
+            }
+            return &g_pulse_app_states[i];
+        }
+    }
+    if (g_npulse_app_states < PULSE_MAX_RULES) {
+        pulse_app_state_t *st = &g_pulse_app_states[g_npulse_app_states++];
+        memset(st, 0, sizeof(*st));
+        rst_str_copy(st->bid, sizeof(st->bid), bid);
+        snprintf(st->day_date, sizeof(st->day_date), "%s", today_str);
+        return st;
+    }
+    return NULL;
+}
+
+static int pulse_get_footprint_mb(pid_t pid, uint64_t *fp_mb_out) {
+    uint64_t fp_bytes = 0;
+    int rc = memp_get_phys_footprint(pid, &fp_bytes);
+    if (rc == 0) {
+        if (fp_mb_out) *fp_mb_out = fp_bytes / (1024 * 1024);
+        return 0;
+    }
+    return rc;
+}
+
+/*
+ * 评估 App 是否满足 pulse 的 7 项触发条件 (C2-1)。
+ * 返回 1 表示满足触发条件；返回 0 表示不满足。
+ * 输出参数:
+ *   out_fp: 读取到的当前物理内存占用 (MB)
+ *   out_skip_ctrl: 1 表示满足前置条件但因频控 (n / daymax / 全局上限) 跳过，可供对照组采样
+ */
+static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st,
+                                 pid_t pid, int32_t cur, const char *path,
+                                 time_t now_mono, uint64_t *out_fp, int *out_skip_ctrl) {
+    if (out_skip_ctrl) *out_skip_ctrl = 0;
+    if (!rule || !st || pid <= 0) return 0;
+
+    /* 条件 1: pulse.txt 里该 App 为 on，且为受支持的主进程 */
+    if (!rule->enabled) return 0;
+    if (!pulse_is_supported_app(pid, path, rule->bid)) return 0;
+
+    /* 条件 2: 同一个 pid 连续在 0..95 档满 delay 分钟 */
+    if (!st->in_bg || st->tracked_pid != pid || st->bg_start_mono <= 0) return 0;
+    time_t elapsed_sec = now_mono - st->bg_start_mono;
+    time_t delay_sec = (time_t)rule->delay_min * 60;
+    if (elapsed_sec < delay_sec) return 0;
+
+    /* 每次进入后台最多做 1 次 pulse */
+    if (st->pulsed_this_bg) return 0;
+
+    /* 条件 3: 当前 fp > target */
+    uint64_t fp_mb = 0;
+    if (pulse_get_footprint_mb(pid, &fp_mb) != 0) return 0;
+    if (out_fp) *out_fp = fp_mb;
+    if (fp_mb <= (uint64_t)rule->target_mb) return 0;
+
+    /* 条件 6: 有重启规则时，fp 不能超过重启阈值 (超过则交由 0.7.7 重启规则处理) */
+    for (int r = 0; r < g_nrestart_rules; r++) {
+        if (strcmp(g_restart_rules[r].bid, rule->bid) == 0) {
+            if (fp_mb > (uint64_t)g_restart_rules[r].thr_mb) {
+                return 0; /* 超过重启阈值，跳过 pulse */
+            }
+            break;
+        }
+    }
+
+    /* 条件 7: 该 App 今天没有被熔断 */
+    if (st->tripped_today) return 0;
+
+    /* 检查是否命中频控 (条件 4 和 5)：命中频控者可作为对照组采样来源 */
+    int cooldown_hit = 0;
+    if (st->last_pulse_mono > 0 && (now_mono - st->last_pulse_mono) < (time_t)rule->n_min * 60) {
+        cooldown_hit = 1;
+    }
+    int daymax_hit = (st->day_count >= rule->daymax);
+    int global_hit = (g_pulse_global_today_count >= PULSE_GLOBAL_DAYMAX);
+
+    if (cooldown_hit || daymax_hit || global_hit) {
+        if (out_skip_ctrl) *out_skip_ctrl = 1;
+        return 0;
+    }
+
+    return 1;
+}
+
+static void pulse_round(memorystatus_priority_entry_t *list, int count) {
+    if (g_npulse_rules == 0 || g_pulse_cfg_file_absent) return;
+
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    time_t now_mono = now_ts.tv_sec;
+
+    char today_str[16] = {0};
+    pulse_get_local_date_str(today_str, sizeof(today_str));
+    pulse_check_date_reset(today_str);
+
+    rst_ensure_app_procs(list, count);
+
+    for (int i = 0; i < g_npulse_rules; i++) {
+        pulse_rule_t *rule = &g_pulse_rules[i];
+        pulse_app_state_t *st = pulse_get_app_state(rule->bid, today_str);
+        if (!st) continue;
+
+        /* 在 s_app_procs 中查找该 rule 的运行进程 */
+        pid_t main_pid = 0;
+        int32_t main_cur = -1;
+        const char *main_path = NULL;
+        for (int j = 0; j < s_napp_procs; j++) {
+            if (strcmp(s_app_procs[j].bid, rule->bid) == 0) {
+                main_pid = s_app_procs[j].pid;
+                main_cur = s_app_procs[j].priority;
+                main_path = s_app_procs[j].path;
+                break;
+            }
+        }
+
+        if (main_pid <= 0) {
+            /* 进程已消失或未启动：重置后台跟踪状态 */
+            st->tracked_pid = 0;
+            st->in_bg = 0;
+            st->bg_start_mono = 0;
+            st->pulsed_this_bg = 0;
+            continue;
+        }
+
+        /* 档位状态推进与 delay 计时 (Q2 / delay 裁定) */
+        if (main_cur == 100) {
+            /* 前台：计时清零，允许下次进后台时再次 pulse */
+            st->in_bg = 0;
+            st->bg_start_mono = 0;
+            st->pulsed_this_bg = 0;
+            st->tracked_pid = main_pid;
+        } else if (main_cur == 120) {
+            /* 后台音频：暂停/重置计时，回到 0..95 后从 0 重新计 */
+            st->in_bg = 0;
+            st->bg_start_mono = 0;
+            st->tracked_pid = main_pid;
+        } else if (main_cur >= 0 && main_cur <= 95) {
+            /* 后台档位 0..95 */
+            if (st->tracked_pid != main_pid) {
+                /* PID 变化：计时清零 */
+                st->tracked_pid = main_pid;
+                st->in_bg = 1;
+                st->bg_start_mono = now_mono;
+                st->pulsed_this_bg = 0;
+            } else if (!st->in_bg || st->bg_start_mono == 0) {
+                /* 刚进入后台：开始计时 */
+                st->in_bg = 1;
+                st->bg_start_mono = now_mono;
+            }
+            /* 已经在后台：保持计时 */
+        } else {
+            /* 其他档位 (101-119 或 >120)：一律不处理 */
+        }
+    }
+}
+
+/* =========================================================================
  * 超内存自动重启：状态持久化与状态机实现 (v0.7.7 C2)
  * ========================================================================= */
 int rst_fbs_launch(const char *bid, const char **err_stage);
@@ -4105,6 +4312,9 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
 
     /* 2.5 自动重启判定与状态机 (v0.7.7 C2) */
     restart_round(list, count);
+
+    /* 2.6 后台内存释放判定 (v0.7.8 C2-1) */
+    pulse_round(list, count);
 
     /* 3. 检查 fatal 状态 */
     if (g_memp_state == MEMP_STATE_FATAL) return;
