@@ -43,6 +43,7 @@ extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #define st_mtimespec st_mtim
 #endif
 #include <signal.h>
+#include <pthread.h>
 #include <notify.h>   /* 锁屏状态：com.apple.springboard.lockstate（libSystem 自带） */
 #include <sys/select.h>
 #include <sys/time.h>
@@ -210,7 +211,10 @@ static void jp_log_write(const char *fmt, ...) __attribute__((format(printf, 1, 
     } \
 } while (0)
 static const char *proc_label_log(const char *path);  /* 前置声明：act_log_success 在其定义前调用 */
+static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void jp_log_write(const char *fmt, ...) {
+    pthread_mutex_lock(&s_log_mutex);
     struct stat st;
     int existed = (stat(LOG_PATH, &st) == 0);
     if (existed && st.st_size > LOG_MAX_BYTES) {
@@ -218,16 +222,23 @@ static void jp_log_write(const char *fmt, ...) {
         existed = 0;
     }
     FILE *f = fopen(LOG_PATH, "a");
-    if (!f) return;
+    if (!f) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return;
+    }
     if (!existed) {
         fchmod(fileno(f), 0644);
     }
     time_t t = time(NULL);
-    char ts[32]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    struct tm tm_val;
+    localtime_r(&t, &tm_val);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_val);
     fprintf(f, "%s ", ts);
     va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
     fputc('\n', f);
     fclose(f);
+    pthread_mutex_unlock(&s_log_mutex);
 }
 
 #define MAX_SKIP_DEDUP 64
@@ -814,7 +825,7 @@ static int load_config(void) {
 }
 
 static volatile sig_atomic_t g_got_sigterm = 0;
-static volatile int g_pulse_stop_requested = 0;
+static volatile sig_atomic_t g_pulse_stop_requested = 0;
 
 static void sigterm_handler(int sig) {
     (void)sig;
@@ -858,8 +869,10 @@ static int set_priority(pid_t pid, int32_t band) {
         g_last_err_pid = pid;
         g_last_err_target = band;
         time_t t = time(NULL);
+        struct tm tm_val;
+        localtime_r(&t, &tm_val);
         strftime(g_last_err_time, sizeof(g_last_err_time),
-                 "%Y-%m-%d %H:%M:%S", localtime(&t));
+                 "%Y-%m-%d %H:%M:%S", &tm_val);
         fprintf(stderr, "[JetPilot] set pid %d -> %d 失败: %s\n",
                 pid, band, strerror(errno));
     }
@@ -945,6 +958,7 @@ static char  *g_last_body = NULL;   /* 上次成功写盘的内容（不含 upda
 static size_t g_last_body_len = 0;
 static time_t g_last_write = 0;     /* 上次成功写盘的 CLOCK_MONOTONIC 秒 */
 static int    g_restart_cfg_bad_count = 0; /* restart.txt 无效行数 (v0.7.8 C1-N6) */
+static void pulse_write_status(FILE *m);
 
 static void write_status(int protected_now, int demoted_pids,
                          protected_entry_t *plist, int nplist,
@@ -985,6 +999,7 @@ static void write_status(int protected_now, int demoted_pids,
             fprintf(m, "applied_orig=%d|%d|%d\n", (int)g_applied[i].pid, (int)g_applied[i].orig, (int)g_applied[i].band);
         }
     }
+    pulse_write_status(m);
     int merr = ferror(m);
     fclose(m);                         /* fclose 后 body/blen 才有效 */
     if (merr || !body) { free(body); return; }
@@ -1001,7 +1016,9 @@ static void write_status(int protected_now, int demoted_pids,
     FILE *f = fopen(tmp, "w");
     if (!f) { free(body); return; }
     time_t t = time(NULL);
-    char ts[64]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
+    struct tm tm_val;
+    localtime_r(&t, &tm_val);
+    char ts[64]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_val);
     fprintf(f, "updated=%s\n", ts);
     fwrite(body, 1, blen, f);
     int werr = ferror(f);  /* 必须在 fclose 之前查 */
@@ -1036,7 +1053,13 @@ static void lockmon_init(void) {
 
 /* 睡 secs 秒，锁屏状态一变就提前醒。返回 1 表示状态变了 */
 static int wait_lock_change(int secs) {
-    if (g_lock_fd < 0) { sleep(secs); return 0; }
+    if (g_got_sigterm) return 0;
+    if (g_lock_fd < 0) {
+        for (int i = 0; i < secs && !g_got_sigterm; i++) {
+            sleep(1);
+        }
+        return 0;
+    }
     fd_set rf; FD_ZERO(&rf); FD_SET(g_lock_fd, &rf);
     struct timeval tv = { secs, 0 };
     if (select(g_lock_fd + 1, &rf, NULL, NULL, &tv) > 0) {
@@ -3018,7 +3041,7 @@ static int pulse_load_config(void) {
 
             if (oversized) {
                 bad_line_count++;
-                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                JPLOG(JP_ERR, "PULSE cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
@@ -3041,20 +3064,20 @@ static int pulse_load_config(void) {
             /* 格式: bid:<bid> on|off target=<MB> n=<分钟> daymax=<次> delay=<分钟> (6 个 token) */
             if (ntokens != 6) {
                 bad_line_count++;
-                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                JPLOG(JP_ERR, "PULSE cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
             if (strncmp(tokens[0], "bid:", 4) != 0) {
                 bad_line_count++;
-                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                JPLOG(JP_ERR, "PULSE cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
             const char *bid = tokens[0] + 4;
             if (bid[0] == '\0' || strlen(bid) >= sizeof(parsed_rules[0].bid) || restart_is_blocked_bid(bid)) {
                 bad_line_count++;
-                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                JPLOG(JP_ERR, "PULSE cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
@@ -3065,7 +3088,7 @@ static int pulse_load_config(void) {
                 enabled = 0;
             } else {
                 bad_line_count++;
-                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                JPLOG(JP_ERR, "PULSE cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
@@ -3078,7 +3101,7 @@ static int pulse_load_config(void) {
             }
             if (duplicate) {
                 bad_line_count++;
-                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                JPLOG(JP_ERR, "PULSE cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
@@ -3132,13 +3155,13 @@ static int pulse_load_config(void) {
 
             if (bad || !has_target || !has_n || !has_daymax || !has_delay) {
                 bad_line_count++;
-                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                JPLOG(JP_ERR, "PULSE cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
             if (nparsed >= PULSE_MAX_RULES) {
                 bad_line_count++;
-                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                JPLOG(JP_ERR, "PULSE cfg_bad line=%d text=%s", line_no, raw_text);
                 continue;
             }
 
@@ -3201,7 +3224,9 @@ typedef struct {
     time_t  last_pulse_mono;    /* 上次完成 pulse 的单调时间 (秒) */
     time_t  last_ctrl_start_mono; /* 上次启动对照组采样的单调时间 (秒) */
     int     pulsed_this_bg;     /* 1: 本次进入后台期间已触发过 pulse (每次进入后台最多 1 次) */
+    int     ctrl_this_bg;       /* 1: 本次进入后台期间已采过对照组 (每段后台最多 1 次，与 pulse 二选一) (M5 / Q2) */
     int     day_count;          /* 当天已触发 pulse 次数 */
+    int     ctrl_day_count;     /* 当天已采对照组次数 (每天上限 10) (M5 / Q2) */
     char    day_date[16];       /* YYYY-MM-DD 本地日期 */
     int     tripped_today;      /* 1: 当天已熔断 */
     int     unresponsive;       /* 1: 标记为对释放无响应 */
@@ -3209,28 +3234,36 @@ typedef struct {
     int     no_drop_pulses;     /* 降幅 <= 5MB 的 pulse 次数 */
 } pulse_app_state_t;
 
-/* 对照组采样追踪器 (C2-4) */
-typedef struct {
-    char     bid[128];
-    pid_t    pid;
-    time_t   start_mono;
-    uint64_t fp0;
-    uint64_t fp15;
-    uint64_t fp30;
-    uint64_t fp60;
-    int      has_fp15;
-    int      has_fp30;
-    int      has_fp60;
-    int      active;
-} pulse_ctrl_tracker_t;
+#define PULSE_CTRL_APP_DAYMAX    10
+#define PULSE_CTRL_GLOBAL_DAYMAX 30
+static int g_pulse_ctrl_global_today_count = 0;
 
-#define PULSE_MAX_CTRL_TRACKERS 8
-static pulse_ctrl_tracker_t g_pulse_ctrl_trackers[PULSE_MAX_CTRL_TRACKERS];
+static pthread_mutex_t s_pulse_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static pulse_app_state_t g_pulse_app_states[PULSE_MAX_RULES];
 static int g_npulse_app_states = 0;
 static int g_pulse_global_today_count = 0;
 static char g_pulse_global_today_date[16] = {0};
+static int g_pulse_corrupt_state = 0;
+static char g_pulse_corrupt_bid[128] = {0};
+
+static void pulse_write_status(FILE *m) {
+    if (!m) return;
+    pthread_mutex_lock(&s_pulse_mutex);
+    fprintf(m, "pulse_support=1\n");
+    fprintf(m, "pulse_today=%d\n", g_pulse_global_today_count);
+    fprintf(m, "pulse_cfg_bad=%d\n", g_pulse_cfg_bad_count);
+    fprintf(m, "pulse_corrupt=%d\n", g_pulse_corrupt_state);
+    if (g_pulse_corrupt_state && g_pulse_corrupt_bid[0]) {
+        fprintf(m, "pulse_corrupt_bid=%s\n", g_pulse_corrupt_bid);
+    }
+    for (int i = 0; i < g_npulse_app_states; i++) {
+        pulse_app_state_t *st = &g_pulse_app_states[i];
+        fprintf(m, "pulse_app=%s|%d|%d|%d\n",
+                st->bid, st->day_count, st->tripped_today, st->unresponsive);
+    }
+    pthread_mutex_unlock(&s_pulse_mutex);
+}
 
 static void pulse_get_local_date_str(char *buf, size_t sz) {
     time_t t = time(NULL);
@@ -3240,15 +3273,21 @@ static void pulse_get_local_date_str(char *buf, size_t sz) {
 }
 
 static void pulse_check_date_reset(const char *today_str) {
+    pthread_mutex_lock(&s_pulse_mutex);
     if (g_pulse_global_today_date[0] == '\0' || strcmp(g_pulse_global_today_date, today_str) != 0) {
         snprintf(g_pulse_global_today_date, sizeof(g_pulse_global_today_date), "%s", today_str);
         g_pulse_global_today_count = 0;
+        g_pulse_ctrl_global_today_count = 0;
+        g_pulse_corrupt_state = 0;
+        g_pulse_corrupt_bid[0] = '\0';
         for (int i = 0; i < g_npulse_app_states; i++) {
             g_pulse_app_states[i].day_count = 0;
+            g_pulse_app_states[i].ctrl_day_count = 0;
             g_pulse_app_states[i].tripped_today = 0;
             snprintf(g_pulse_app_states[i].day_date, sizeof(g_pulse_app_states[i].day_date), "%s", today_str);
         }
     }
+    pthread_mutex_unlock(&s_pulse_mutex);
 }
 
 static pulse_app_state_t *pulse_get_app_state(const char *bid, const char *today_str) {
@@ -3257,6 +3296,7 @@ static pulse_app_state_t *pulse_get_app_state(const char *bid, const char *today
         if (strcmp(g_pulse_app_states[i].bid, bid) == 0) {
             if (strcmp(g_pulse_app_states[i].day_date, today_str) != 0) {
                 g_pulse_app_states[i].day_count = 0;
+                g_pulse_app_states[i].ctrl_day_count = 0;
                 g_pulse_app_states[i].tripped_today = 0;
                 snprintf(g_pulse_app_states[i].day_date, sizeof(g_pulse_app_states[i].day_date), "%s", today_str);
             }
@@ -3300,14 +3340,17 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
     if (!rule->enabled) return 0;
     if (!pulse_is_supported_app(pid, path, rule->bid)) return 0;
 
+    /* 当前档位检查：必须在 0..95 档；其他值一律不处理 (M3 / C2-1) */
+    if (cur < 0 || cur > 95) return 0;
+
     /* 条件 2: 同一个 pid 连续在 0..95 档满 delay 分钟 */
     if (!st->in_bg || st->tracked_pid != pid || st->bg_start_mono <= 0) return 0;
     time_t elapsed_sec = now_mono - st->bg_start_mono;
     time_t delay_sec = (time_t)rule->delay_min * 60;
     if (elapsed_sec < delay_sec) return 0;
 
-    /* 每次进入后台最多做 1 次 pulse */
-    if (st->pulsed_this_bg) return 0;
+    /* 每次进入后台最多做 1 次 pulse (与对照组二选一) (M5 / Q2) */
+    if (st->pulsed_this_bg || st->ctrl_this_bg) return 0;
 
     /* 条件 3: 当前 fp > target */
     uint64_t fp_mb = 0;
@@ -3328,7 +3371,8 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
     /* 条件 7: 该 App 今天没有被熔断 */
     if (st->tripped_today) return 0;
 
-    /* 检查是否命中频控 (条件 4 和 5)：命中频控者可作为对照组采样来源 */
+    /* 检查是否命中频控 (条件 4 和 5)：命中频控者可作为对照组采样来源 (M5 / Q2) */
+    /* 条件 4: 距该 App 上一次 pulse 至少 n 分钟 (按 App 计，换 pid 也不清零；Hark-A 顺带裁定) */
     int cooldown_hit = 0;
     if (st->last_pulse_mono > 0 && (now_mono - st->last_pulse_mono) < (time_t)rule->n_min * 60) {
         cooldown_hit = 1;
@@ -3336,11 +3380,62 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
     int daymax_hit = (st->day_count >= rule->daymax);
     int global_hit = (g_pulse_global_today_count >= PULSE_GLOBAL_DAYMAX);
 
-    if (cooldown_hit || daymax_hit || global_hit) {
-        if (out_skip_ctrl) *out_skip_ctrl = 1;
+    if (cooldown_hit || daymax_hit) {
+        /* 满 delay 那一刻，因 n 或 daymax 跳过才记对照组；全局上限不记；每段后台最多 1 个 (Q2)
+         * 仅标记候选，不在此处置 ctrl_this_bg；只有真正启动采样时才标记 (C2R2-N1) */
+        if (!global_hit && !st->pulsed_this_bg && !st->ctrl_this_bg &&
+            st->ctrl_day_count < PULSE_CTRL_APP_DAYMAX &&
+            g_pulse_ctrl_global_today_count < PULSE_CTRL_GLOBAL_DAYMAX) {
+            if (out_skip_ctrl) *out_skip_ctrl = 1;
+        }
+        return 0;
+    }
+    if (global_hit) {
         return 0;
     }
 
+    return 1;
+}
+
+/* 出队与线程启动时的前置条件复核 (M2)
+ * 检查：规则是否还是 on、fp 是否还大于 target、fp 是否超过重启阈值、
+ * 是否已熔断、是否超过 daymax 或全局上限。任一不满足返回 0 */
+static int pulse_revalidate_conditions(pid_t pid, const char *bid, uint64_t *out_fp) {
+    if (pid <= 0 || !bid || bid[0] == '\0') return 0;
+
+    const pulse_rule_t *rule = NULL;
+    for (int i = 0; i < g_npulse_rules; i++) {
+        if (strcmp(g_pulse_rules[i].bid, bid) == 0) {
+            rule = &g_pulse_rules[i];
+            break;
+        }
+    }
+    if (!rule || !rule->enabled) return 0;
+
+    char today_str[16] = {0};
+    pulse_get_local_date_str(today_str, sizeof(today_str));
+
+    pthread_mutex_lock(&s_pulse_mutex);
+    pulse_app_state_t *st = pulse_get_app_state(bid, today_str);
+    int invalid = (!st || st->tripped_today || st->day_count >= rule->daymax ||
+                   g_pulse_global_today_count >= PULSE_GLOBAL_DAYMAX);
+    pthread_mutex_unlock(&s_pulse_mutex);
+    if (invalid) return 0;
+
+    uint64_t cur_fp = 0;
+    if (pulse_get_footprint_mb(pid, &cur_fp) != 0) return 0;
+    if (cur_fp <= (uint64_t)rule->target_mb) return 0;
+
+    for (int r = 0; r < g_nrestart_rules; r++) {
+        if (strcmp(g_restart_rules[r].bid, bid) == 0) {
+            if (cur_fp > (uint64_t)g_restart_rules[r].thr_mb) {
+                return 0;
+            }
+            break;
+        }
+    }
+
+    if (out_fp) *out_fp = cur_fp;
     return 1;
 }
 
@@ -3363,6 +3458,7 @@ static volatile pid_t g_pulse_current_pid = 0;
 static char           g_pulse_current_bid[128] = {0};
 static pthread_t      g_pulse_thread;
 static int            g_pulse_thread_running = 0;
+static int            g_pulse_thread_has_handle = 0;
 
 static void pulse_queue_remove_at(int idx) {
     if (idx < 0 || idx >= g_npulse_queue) return;
@@ -3585,6 +3681,10 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
 
 static void pulse_clear_state_file(pid_t pid) {
     (void)pid;
+    struct stat dir_st;
+    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
+        return;
+    }
     struct stat file_st;
     if (lstat(PULSE_STATE_PATH, &file_st) == 0) {
         if (!S_ISLNK(file_st.st_mode) && S_ISREG(file_st.st_mode) && file_st.st_uid == geteuid()) {
@@ -3643,7 +3743,7 @@ static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *i
     }
 
     if (pulse_save_state_file(st_out) != 0) {
-        return -1;
+        return -2;
     }
     return 0;
 }
@@ -3688,7 +3788,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
         mirror_reason = "untrusted";
     } else if (state.orig_inactive <= 0) {
         mirror_reason = "none";
-    } else if (state.suspect == 1) {
+    } else if (state.suspect != 0) {
         mirror_reason = "suspect";
     } else {
         uint64_t floor_1_2 = calc_restore_floor(fp_mb);
@@ -3726,6 +3826,8 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     int success = 0;
     int write_attempted = 0;
     int readback_mismatch = 0;
+    int ident_failed = 0;
+    int get_failed = 0;
 
     for (int attempt = 0; attempt < 4; attempt++) {
         if (attempt > 0) {
@@ -3734,11 +3836,13 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
 
         proc_identity_t check_ident;
         if (pulse_get_proc_identity(pid, &check_ident) != 0 || !pulse_compare_proc_identity(&ident, &check_ident)) {
+            ident_failed = 1;
             break;
         }
 
         memorystatus_memlimit_properties_t cur_active;
         if (pulse_get_memlimit_props(pid, &cur_active) != 0) {
+            get_failed = 1;
             continue;
         }
 
@@ -3783,8 +3887,9 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
 
     if (!success) {
         if (!write_attempted) {
-            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=ident");
-            JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+            const char *refused_reason = ident_failed ? "ident" : (get_failed ? "get" : "ident");
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=%s", refused_reason);
+            JPLOG(JP_INFO, "RESTORE_REFUSED reason=%s", refused_reason);
             return 1;
         }
         if (readback_mismatch) {
@@ -3811,20 +3916,58 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     return 0;
 }
 
-/* 崩溃恢复状态与启动校验 (v0.7.8 C2-5 / Q5) */
-static int g_pulse_corrupt_state = 0;
-static char g_pulse_corrupt_bid[128] = {0};
+/* 列出当天曾被 pulse 过的 App (S2) */
+static void pulse_log_today_pulsed_bids(void) {
+    char today_str[16] = {0};
+    pulse_get_local_date_str(today_str, sizeof(today_str));
 
+    char bids_summary[512] = {0};
+    int found_count = 0;
+
+    FILE *f = fopen(LOG_PATH, "r");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, today_str, strlen(today_str)) == 0) {
+                char *p = strstr(line, "PULSE app=");
+                if (p) {
+                    p += strlen("PULSE app=");
+                    char bid_buf[128] = {0};
+                    int bi = 0;
+                    while (*p && *p != ' ' && *p != '\n' && *p != '\r' && bi < (int)sizeof(bid_buf) - 1) {
+                        bid_buf[bi++] = *p++;
+                    }
+                    bid_buf[bi] = '\0';
+                    if (bid_buf[0] && !strstr(bids_summary, bid_buf)) {
+                        if (found_count > 0 && strlen(bids_summary) + strlen(bid_buf) + 2 < sizeof(bids_summary)) {
+                            strcat(bids_summary, ", ");
+                        }
+                        if (strlen(bids_summary) + strlen(bid_buf) < sizeof(bids_summary)) {
+                            strcat(bids_summary, bid_buf);
+                            found_count++;
+                        }
+                    }
+                }
+            }
+        }
+        fclose(f);
+    }
+
+    if (found_count > 0) {
+        JPLOG(JP_WARN, "%-6s corrupt_state unknown bid, today_pulsed_apps=[%s]", "PLS", bids_summary);
+    } else {
+        JPLOG(JP_WARN, "%-6s corrupt_state unknown bid, today_pulsed_apps=none", "PLS");
+    }
+}
+
+/* 崩溃恢复状态与启动校验 (v0.7.8 C2-5 / Q5) */
 static void pulse_startup_recovery(void) {
     struct stat dir_st;
     if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
-        struct stat file_st;
-        if (lstat(PULSE_STATE_PATH, &file_st) == 0) {
-            unlink(PULSE_STATE_PATH);
-            JPLOG(JP_WARN, "%-6s state_invalid reason=dir_symlink path=%s", "PLS", PULSE_STATE_PATH);
-            g_pulse_corrupt_state = 1;
-            snprintf(g_pulse_corrupt_bid, sizeof(g_pulse_corrupt_bid), "com.tencent.xin");
-        }
+        JPLOG(JP_WARN, "%-6s state_invalid reason=dir_symlink path=%s", "PLS", PULSE_STATE_PATH);
+        g_pulse_corrupt_state = 1;
+        g_pulse_corrupt_bid[0] = '\0';
+        pulse_log_today_pulsed_bids();
         return;
     }
 
@@ -3839,7 +3982,8 @@ static void pulse_startup_recovery(void) {
         unlink(PULSE_STATE_PATH);
         JPLOG(JP_WARN, "%-6s state_invalid reason=file_attr path=%s", "PLS", PULSE_STATE_PATH);
         g_pulse_corrupt_state = 1;
-        snprintf(g_pulse_corrupt_bid, sizeof(g_pulse_corrupt_bid), "com.tencent.xin");
+        g_pulse_corrupt_bid[0] = '\0';
+        pulse_log_today_pulsed_bids();
         return;
     }
 
@@ -3848,7 +3992,12 @@ static void pulse_startup_recovery(void) {
         unlink(PULSE_STATE_PATH);
         JPLOG(JP_WARN, "%-6s state_invalid reason=parse_fail path=%s", "PLS", PULSE_STATE_PATH);
         g_pulse_corrupt_state = 1;
-        snprintf(g_pulse_corrupt_bid, sizeof(g_pulse_corrupt_bid), "com.tencent.xin");
+        if (st.bid[0] != '\0') {
+            snprintf(g_pulse_corrupt_bid, sizeof(g_pulse_corrupt_bid), "%s", st.bid);
+        } else {
+            g_pulse_corrupt_bid[0] = '\0';
+            pulse_log_today_pulsed_bids();
+        }
         return;
     }
 
@@ -3900,6 +4049,12 @@ static void *pulse_worker_thread(void *arg) {
     pid_t pid = target->pid;
     const char *bid = target->bid;
 
+    /* 线程开始执行时重新检查条件 (M2) */
+    uint64_t reval_fp = 0;
+    if (!pulse_revalidate_conditions(pid, bid, &reval_fp)) {
+        goto thread_done;
+    }
+
     proc_identity_t ident;
     if (pulse_get_proc_identity(pid, &ident) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
@@ -3907,14 +4062,17 @@ static void *pulse_worker_thread(void *arg) {
     }
 
     pulse_saved_state_t state;
-    if (pulse_get_or_record_initial_state(pid, &ident, bid, &state) != 0) {
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+    int state_rc = pulse_get_or_record_initial_state(pid, &ident, bid, &state);
+    if (state_rc != 0) {
+        const char *ref_reason = (state_rc == -1) ? "get" : "state";
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=%s", ref_reason);
         goto thread_done;
     }
 
     uint64_t fp0 = 0;
     if (pulse_get_footprint_mb(pid, &fp0) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED reason=fp_unreadable");
+        pulse_clear_state_file(pid);
         goto thread_done;
     }
 
@@ -3925,6 +4083,7 @@ static void *pulse_worker_thread(void *arg) {
     memorystatus_memlimit_properties_t cur_props;
     if (pulse_get_memlimit_props(pid, &cur_props) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED reason=get");
+        pulse_clear_state_file(pid);
         goto thread_done;
     }
 
@@ -3935,17 +4094,19 @@ static void *pulse_worker_thread(void *arg) {
     proc_identity_t check_ident;
     if (pulse_get_proc_identity(pid, &check_ident) != 0 || !pulse_compare_proc_identity(&ident, &check_ident)) {
         JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+        pulse_clear_state_file(pid);
         goto thread_done;
     }
 
     if (pulse_set_memlimit_props(pid, &new_props) != 0) {
-        JPLOG(JP_INFO, "RESTORE_FAILED reason=retry");
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=set");
+        pulse_clear_state_file(pid);
         goto thread_done;
     }
 
     memorystatus_memlimit_properties_t readback;
     if (pulse_get_memlimit_props(pid, &readback) != 0) {
-        JPLOG(JP_INFO, "RESTORE_FAILED reason=readback");
+        JPLOG(JP_WARN, "PULSE_SET_MISMATCH reason=readback_fail pid=%d", (int)pid);
         pulse_do_restore(pid, bid, NULL, 0);
         goto thread_done;
     }
@@ -3961,7 +4122,7 @@ static void *pulse_worker_thread(void *arg) {
         rb_act_fatal != exp_act_fatal ||
         readback.memlimit_inactive != (int32_t)L ||
         rb_inactive_fatal != 0) {
-        JPLOG(JP_INFO, "RESTORE_FAILED reason=readback");
+        JPLOG(JP_WARN, "PULSE_SET_MISMATCH reason=mismatch pid=%d", (int)pid);
         pulse_do_restore(pid, bid, NULL, 0);
         goto thread_done;
     }
@@ -3993,9 +4154,21 @@ static void *pulse_worker_thread(void *arg) {
                 should_restore = 0;
                 break;
             }
-        }
-        if (!pulse_compare_proc_identity(&ident, &loop_ident)) {
-            JPLOG(JP_INFO, "PID_REUSED");
+            /* 进程还活着但身份读取失败：按「不确定」处理，照常 restore，打 Warn PULSE_ID_UNKNOWN (A3 / Q1) */
+            JPLOG(JP_WARN, "PULSE_ID_UNKNOWN pid=%d t=%d", (int)pid, sec);
+            end_reason = "ABORT";
+            should_restore = 1;
+            break;
+        } else if (!pulse_compare_proc_identity(&ident, &loop_ident)) {
+            /* 只有确认身份读取成功、但与原进程不一致时，才判定为 PID_REUSED */
+            memorystatus_memlimit_properties_t cur_p;
+            int cur_inact = -1, cur_inact_attr = 0;
+            if (pulse_get_memlimit_props(pid, &cur_p) == 0) {
+                cur_inact = cur_p.memlimit_inactive;
+                cur_inact_attr = cur_p.memlimit_inactive_attr;
+            }
+            JPLOG(JP_INFO, "PID_REUSED app=%s pid=%d inactive=%d/0x%x",
+                  bid, (int)pid, cur_inact, cur_inact_attr);
             end_reason = "PID_REUSED";
             should_restore = 0;
             break;
@@ -4011,6 +4184,9 @@ static void *pulse_worker_thread(void *arg) {
                 should_restore = 0;
                 break;
             }
+            JPLOG(JP_WARN, "PULSE_FP_FAIL pid=%d t=%d", (int)pid, sec);
+            end_reason = "ABORT";
+            t_reach = sec;
             should_restore = 1;
             break;
         }
@@ -4055,12 +4231,20 @@ static void *pulse_worker_thread(void *arg) {
         memorystatus_memlimit_properties_t pre_restore;
         if (pulse_get_memlimit_props(pid, &pre_restore) == 0 &&
             pre_restore.memlimit_inactive != (int32_t)L) {
-            JPLOG(JP_INFO, "OVERRIDDEN old=%llu now=%d",
-                  (unsigned long long)L, pre_restore.memlimit_inactive);
+            JPLOG(JP_INFO, "OVERRIDDEN app=%s pid=%d inactive=%d/0x%x",
+                  bid, (int)pid, pre_restore.memlimit_inactive, pre_restore.memlimit_inactive_attr);
             end_reason = "OVERRIDDEN";
-            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "NONE");
+            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "OVERRIDDEN");
+            pulse_clear_state_file(pid);
         } else {
             pulse_do_restore(pid, bid, restore_verdict_str, sizeof(restore_verdict_str));
+        }
+    } else {
+        pulse_clear_state_file(pid);
+        if (strcmp(end_reason, "PID_REUSED") == 0) {
+            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "PID_REUSED");
+        } else if (strcmp(end_reason, "GONE") == 0) {
+            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "PULSE_GONE");
         }
     }
 
@@ -4138,9 +4322,10 @@ static void *pulse_worker_thread(void *arg) {
           bid, (int)pid, (unsigned long long)fp0, (unsigned long long)L,
           t_reach_str, fp15_str, fp30_str, fp60_str, end_reason, restore_verdict_str);
 
-    /* 计次与状态更新 */
+    /* 计次与状态更新 (M6: 持锁保护) */
     char today_str[16] = {0};
     pulse_get_local_date_str(today_str, sizeof(today_str));
+    pthread_mutex_lock(&s_pulse_mutex);
     pulse_app_state_t *st = pulse_get_app_state(bid, today_str);
     if (st) {
         struct timespec ts;
@@ -4149,15 +4334,18 @@ static void *pulse_worker_thread(void *arg) {
         st->day_count++;
         st->total_pulses++;
 
-        /* 熔断判定 (C2-6): 窗口内或 restore 后 10 秒内 GONE */
-        if (strcmp(end_reason, "GONE") == 0 || gone_post_restore) {
+        /* 熔断判定 (C2-6): 窗口内或 restore 后 10 秒内 GONE；PID_REUSED 不计入熔断 (S7) */
+        if ((strcmp(end_reason, "GONE") == 0 || gone_post_restore) && strcmp(end_reason, "PID_REUSED") != 0) {
             st->tripped_today = 1;
             JPLOG(JP_WARN, "%-6s circuit_break app=%s pid=%d reason=gone", "PLS", bid, (int)pid);
         }
 
         /* 无响应判定 (C2-6): 若已完成 >= 2 次 pulse 且最近连续 2 次降幅均 <= 5MB，标记为无响应 (只标记，不停用) */
+        /* PID_REUSED、OVERRIDDEN、GONE 均不计入「没降」统计 (S7) */
         uint64_t fp_final = has_fp60 ? fp60 : (has_fp30 ? fp30 : (has_fp15 ? fp15 : fp0));
-        if (strcmp(end_reason, "GONE") != 0 && !gone_post_restore && strcmp(end_reason, "PID_REUSED") != 0) {
+        if (strcmp(end_reason, "GONE") != 0 && !gone_post_restore &&
+            strcmp(end_reason, "PID_REUSED") != 0 &&
+            strcmp(end_reason, "OVERRIDDEN") != 0) {
             if (fp_final + 5 >= fp0) {
                 st->no_drop_pulses++;
                 if (st->total_pulses >= 2 && st->no_drop_pulses >= 2) {
@@ -4174,6 +4362,7 @@ static void *pulse_worker_thread(void *arg) {
         }
     }
     g_pulse_global_today_count++;
+    pthread_mutex_unlock(&s_pulse_mutex);
 
 thread_done:
     g_pulse_in_progress = 0;
@@ -4184,8 +4373,99 @@ thread_done:
     return NULL;
 }
 
+/* 对照组工作线程参数 (M5 / Q2) */
+typedef struct {
+    char     bid[128];
+    pid_t    pid;
+    uint64_t fp0;
+} pulse_ctrl_arg_t;
+
+/* 对照组异步只读采样线程 (M5 / Q2)
+ * 从头到尾只读，不写任何档位/内存限制。秒级时钟采样，误差超过 +-2s 记 NA */
+static void *pulse_ctrl_worker_thread(void *arg) {
+    pulse_ctrl_arg_t *carg = (pulse_ctrl_arg_t *)arg;
+    if (!carg) return NULL;
+
+    pid_t pid = carg->pid;
+    char bid[128];
+    rst_str_copy(bid, sizeof(bid), carg->bid);
+    uint64_t fp0 = carg->fp0;
+    free(carg);
+
+    uint64_t fp15 = 0, fp30 = 0, fp60 = 0;
+    int has_fp15 = 0, has_fp30 = 0, has_fp60 = 0;
+
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+    for (int sec = 1; sec <= 60; sec++) {
+        usleep(1000 * 1000);
+        if (g_got_sigterm || g_pulse_stop_requested) break;
+
+        struct proc_bsdinfo bi;
+        if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != sizeof(bi)) {
+            break; /* 进程消失，停止采样 */
+        }
+
+        int32_t cur_prio = -1;
+        if (pulse_get_cur_priority(pid, &cur_prio) == 0 && (cur_prio == 100 || cur_prio == 120)) {
+            break; /* 回前台或后台音频，停止采样 */
+        }
+
+        struct timespec t_now;
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        int dt = (int)(t_now.tv_sec - t_start.tv_sec);
+
+        uint64_t cur_fp = 0;
+        int rerr = pulse_get_footprint_mb(pid, &cur_fp);
+        if (rerr == 0) {
+            if (sec == 15 && abs(dt - 15) <= 2) { fp15 = cur_fp; has_fp15 = 1; }
+            else if (sec == 30 && abs(dt - 30) <= 2) { fp30 = cur_fp; has_fp30 = 1; }
+            else if (sec == 60 && abs(dt - 60) <= 2) { fp60 = cur_fp; has_fp60 = 1; }
+        }
+    }
+
+    char s_fp15[32], s_fp30[32], s_fp60[32];
+    if (has_fp15) snprintf(s_fp15, sizeof(s_fp15), "%llu", (unsigned long long)fp15);
+    else snprintf(s_fp15, sizeof(s_fp15), "NA");
+
+    if (has_fp30) snprintf(s_fp30, sizeof(s_fp30), "%llu", (unsigned long long)fp30);
+    else snprintf(s_fp30, sizeof(s_fp30), "NA");
+
+    if (has_fp60) snprintf(s_fp60, sizeof(s_fp60), "%llu", (unsigned long long)fp60);
+    else snprintf(s_fp60, sizeof(s_fp60), "NA");
+
+    JPLOG(JP_INFO, "PULSE_SKIP_CTRL app=%s pid=%d fp0=%llu fp15=%s fp30=%s fp60=%s",
+          bid, (int)pid, (unsigned long long)fp0, s_fp15, s_fp30, s_fp60);
+
+    char today_str[16] = {0};
+    pulse_get_local_date_str(today_str, sizeof(today_str));
+    pthread_mutex_lock(&s_pulse_mutex);
+    pulse_app_state_t *st = pulse_get_app_state(bid, today_str);
+    if (st) {
+        st->ctrl_day_count++;
+    }
+    g_pulse_ctrl_global_today_count++;
+    pthread_mutex_unlock(&s_pulse_mutex);
+
+    g_pulse_in_progress = 0;
+    g_pulse_current_pid = 0;
+    g_pulse_current_bid[0] = '\0';
+    g_pulse_thread_running = 0;
+    return NULL;
+}
+
 static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     if (g_npulse_rules == 0 || g_pulse_cfg_file_absent) return;
+
+    /* 回收已结束的 pulse 工作线程 (M4) */
+    if (g_pulse_thread_has_handle && !g_pulse_thread_running) {
+        pthread_join(g_pulse_thread, NULL);
+        g_pulse_thread_has_handle = 0;
+    }
+
+    /* 取不到优先级列表时不要清空已有状态，跳过本轮即可 (S12) */
+    if (!list || count <= 0) return;
 
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
@@ -4197,57 +4477,9 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
 
     rst_ensure_app_procs(list, count);
 
-    /* 0. 推进对照组采样 (C2-4) */
-    for (int c = 0; c < PULSE_MAX_CTRL_TRACKERS; c++) {
-        pulse_ctrl_tracker_t *tr = &g_pulse_ctrl_trackers[c];
-        if (!tr->active) continue;
-
-        int found = 0;
-        int32_t pcur = -1;
-        for (int j = 0; j < s_napp_procs; j++) {
-            if (s_app_procs[j].pid == tr->pid) {
-                found = 1;
-                pcur = s_app_procs[j].priority;
-                break;
-            }
-        }
-
-        time_t dt = now_mono - tr->start_mono;
-        if (!found || pcur == 100 || pcur == 120) {
-            char s_fp15[32], s_fp30[32], s_fp60[32];
-            if (tr->has_fp15) snprintf(s_fp15, sizeof(s_fp15), "%llu", (unsigned long long)tr->fp15);
-            else snprintf(s_fp15, sizeof(s_fp15), "NA");
-            if (tr->has_fp30) snprintf(s_fp30, sizeof(s_fp30), "%llu", (unsigned long long)tr->fp30);
-            else snprintf(s_fp30, sizeof(s_fp30), "NA");
-            if (tr->has_fp60) snprintf(s_fp60, sizeof(s_fp60), "%llu", (unsigned long long)tr->fp60);
-            else snprintf(s_fp60, sizeof(s_fp60), "NA");
-
-            JPLOG(JP_INFO, "PULSE_SKIP_CTRL app=%s pid=%d fp0=%llu fp15=%s fp30=%s fp60=%s",
-                  tr->bid, (int)tr->pid, (unsigned long long)tr->fp0, s_fp15, s_fp30, s_fp60);
-            tr->active = 0;
-            continue;
-        }
-
-        uint64_t cur_fp = 0;
-        if (pulse_get_footprint_mb(tr->pid, &cur_fp) == 0) {
-            if (dt >= 15 && !tr->has_fp15) { tr->fp15 = cur_fp; tr->has_fp15 = 1; }
-            if (dt >= 30 && !tr->has_fp30) { tr->fp30 = cur_fp; tr->has_fp30 = 1; }
-            if (dt >= 60) {
-                tr->fp60 = cur_fp;
-                tr->has_fp60 = 1;
-                char s_fp15[32], s_fp30[32], s_fp60[32];
-                if (tr->has_fp15) snprintf(s_fp15, sizeof(s_fp15), "%llu", (unsigned long long)tr->fp15);
-                else snprintf(s_fp15, sizeof(s_fp15), "NA");
-                if (tr->has_fp30) snprintf(s_fp30, sizeof(s_fp30), "%llu", (unsigned long long)tr->fp30);
-                else snprintf(s_fp30, sizeof(s_fp30), "NA");
-                snprintf(s_fp60, sizeof(s_fp60), "%llu", (unsigned long long)tr->fp60);
-
-                JPLOG(JP_INFO, "PULSE_SKIP_CTRL app=%s pid=%d fp0=%llu fp15=%s fp30=%s fp60=%s",
-                      tr->bid, (int)tr->pid, (unsigned long long)tr->fp0, s_fp15, s_fp30, s_fp60);
-                tr->active = 0;
-            }
-        }
-    }
+    pid_t best_ctrl_pid = 0;
+    char best_ctrl_bid[128] = {0};
+    uint64_t best_ctrl_fp = 0;
 
     /* 1. 维护队列：若队列中的 App 已回前台 (cur == 100)、处于 120 档或进程消失，移出队列 */
     for (int q = g_npulse_queue - 1; q >= 0; q--) {
@@ -4271,7 +4503,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         }
     }
 
-    /* 2. 状态推进与候选 App 入队 */
+    /* 2. 状态推进与候选 App 入队 (持锁保护共享状态) */
+    pthread_mutex_lock(&s_pulse_mutex);
     for (int i = 0; i < g_npulse_rules; i++) {
         pulse_rule_t *rule = &g_pulse_rules[i];
         pulse_app_state_t *st = pulse_get_app_state(rule->bid, today_str);
@@ -4295,6 +4528,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->pulsed_this_bg = 0;
+            st->ctrl_this_bg = 0;
             continue;
         }
 
@@ -4303,10 +4537,12 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->pulsed_this_bg = 0;
+            st->ctrl_this_bg = 0;
             st->tracked_pid = main_pid;
         } else if (main_cur == 120) {
             st->in_bg = 0;
             st->bg_start_mono = 0;
+            st->ctrl_this_bg = 0;
             st->tracked_pid = main_pid;
         } else if (main_cur >= 0 && main_cur <= 95) {
             if (st->tracked_pid != main_pid) {
@@ -4314,10 +4550,16 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 st->in_bg = 1;
                 st->bg_start_mono = now_mono;
                 st->pulsed_this_bg = 0;
+                st->ctrl_this_bg = 0;
             } else if (!st->in_bg || st->bg_start_mono == 0) {
                 st->in_bg = 1;
                 st->bg_start_mono = now_mono;
             }
+        } else {
+            /* 其他值一律不处理：不在 0..95 档，不累计进入后台 delay 计时 (M3) */
+            st->in_bg = 0;
+            st->bg_start_mono = 0;
+            st->tracked_pid = main_pid;
         }
 
         /* 检查 7 项触发条件 */
@@ -4344,58 +4586,56 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 qe->enqueued_mono = now_mono;
             }
         } else if (skip_ctrl) {
-            /* 满足对照组启动条件：满足触发前置条件但因频控跳过，开始对照组采样 (C2-4) */
-            if (st->last_ctrl_start_mono == 0 || (now_mono - st->last_ctrl_start_mono >= 60)) {
-                int already_tracking = 0;
-                for (int c = 0; c < PULSE_MAX_CTRL_TRACKERS; c++) {
-                    if (g_pulse_ctrl_trackers[c].active && g_pulse_ctrl_trackers[c].pid == main_pid) {
-                        already_tracking = 1;
-                        break;
-                    }
-                }
-                if (!already_tracking) {
-                    for (int c = 0; c < PULSE_MAX_CTRL_TRACKERS; c++) {
-                        if (!g_pulse_ctrl_trackers[c].active) {
-                            pulse_ctrl_tracker_t *tr = &g_pulse_ctrl_trackers[c];
-                            tr->active = 1;
-                            rst_str_copy(tr->bid, sizeof(tr->bid), rule->bid);
-                            tr->pid = main_pid;
-                            tr->start_mono = now_mono;
-                            tr->fp0 = cand_fp;
-                            tr->fp15 = 0; tr->fp30 = 0; tr->fp60 = 0;
-                            tr->has_fp15 = 0; tr->has_fp30 = 0; tr->has_fp60 = 0;
-                            st->last_ctrl_start_mono = now_mono;
-                            break;
-                        }
-                    }
-                }
+            /* 满 delay 时因 n 或 daymax 跳过，记录对照组候选 (M5 / Q2) */
+            if (best_ctrl_pid == 0 || cand_fp > best_ctrl_fp) {
+                best_ctrl_pid = main_pid;
+                rst_str_copy(best_ctrl_bid, sizeof(best_ctrl_bid), rule->bid);
+                best_ctrl_fp = cand_fp;
             }
         }
     }
+    pthread_mutex_unlock(&s_pulse_mutex);
 
     /* 3. 对队列按 fp 从大到小排序 */
     pulse_sort_queue();
 
     /* 4. 若全局无 pulse 正在进行，且队列非空，弹出最大者并启动异步线程 */
-    if (!g_pulse_in_progress && g_npulse_queue > 0) {
+    while (!g_pulse_in_progress && g_npulse_queue > 0) {
         pulse_queue_entry_t target = g_pulse_queue[0];
         pulse_queue_remove_at(0);
 
+        /* 出队启动线程时重新检查条件 (M2) */
+        uint64_t reval_fp = 0;
+        if (!pulse_revalidate_conditions(target.pid, target.bid, &reval_fp)) {
+            continue; /* 条件不满足，放弃这次 pulse，尝试队列中下一个 */
+        }
+        target.fp_mb = reval_fp;
+
+        pthread_mutex_lock(&s_pulse_mutex);
         pulse_app_state_t *st = pulse_get_app_state(target.bid, today_str);
         if (st) {
             st->pulsed_this_bg = 1; /* 每次进入后台最多 1 次 */
+        }
+        pthread_mutex_unlock(&s_pulse_mutex);
+
+        if (g_got_sigterm || g_pulse_stop_requested) {
+            return;
         }
 
         g_pulse_in_progress = 1;
         g_pulse_current_pid = target.pid;
         rst_str_copy(g_pulse_current_bid, sizeof(g_pulse_current_bid), target.bid);
-        g_pulse_stop_requested = 0;
 
         pulse_queue_entry_t *thread_arg = (pulse_queue_entry_t *)malloc(sizeof(pulse_queue_entry_t));
         if (thread_arg) {
             *thread_arg = target;
+            if (g_pulse_thread_has_handle && !g_pulse_thread_running) {
+                pthread_join(g_pulse_thread, NULL);
+                g_pulse_thread_has_handle = 0;
+            }
             if (pthread_create(&g_pulse_thread, NULL, pulse_worker_thread, thread_arg) == 0) {
                 g_pulse_thread_running = 1;
+                g_pulse_thread_has_handle = 1;
             } else {
                 free(thread_arg);
                 g_pulse_in_progress = 0;
@@ -4406,6 +4646,46 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             g_pulse_in_progress = 0;
             g_pulse_current_pid = 0;
             g_pulse_current_bid[0] = '\0';
+        }
+        break;
+    }
+
+    /* 5. 若全局无 pulse 正在进行且队列为空，可启动对照组只读采样线程 (M5 / Q2)
+     * 跟 pulse 共用「全局同时只做 1 个」名额，排队时 pulse 优先 */
+    if (!g_pulse_in_progress && g_npulse_queue == 0 && best_ctrl_pid > 0) {
+        if (g_got_sigterm || g_pulse_stop_requested) {
+            return;
+        }
+
+        pulse_ctrl_arg_t *carg = (pulse_ctrl_arg_t *)malloc(sizeof(pulse_ctrl_arg_t));
+        if (carg) {
+            rst_str_copy(carg->bid, sizeof(carg->bid), best_ctrl_bid);
+            carg->pid = best_ctrl_pid;
+            carg->fp0 = best_ctrl_fp;
+
+            g_pulse_in_progress = 1;
+            g_pulse_current_pid = best_ctrl_pid;
+            rst_str_copy(g_pulse_current_bid, sizeof(g_pulse_current_bid), best_ctrl_bid);
+
+            if (g_pulse_thread_has_handle && !g_pulse_thread_running) {
+                pthread_join(g_pulse_thread, NULL);
+                g_pulse_thread_has_handle = 0;
+            }
+            if (pthread_create(&g_pulse_thread, NULL, pulse_ctrl_worker_thread, carg) == 0) {
+                g_pulse_thread_running = 1;
+                g_pulse_thread_has_handle = 1;
+                pthread_mutex_lock(&s_pulse_mutex);
+                pulse_app_state_t *cst = pulse_get_app_state(best_ctrl_bid, today_str);
+                if (cst) {
+                    cst->ctrl_this_bg = 1;
+                }
+                pthread_mutex_unlock(&s_pulse_mutex);
+            } else {
+                free(carg);
+                g_pulse_in_progress = 0;
+                g_pulse_current_pid = 0;
+                g_pulse_current_bid[0] = '\0';
+            }
         }
     }
 }
@@ -6270,8 +6550,12 @@ int main(void) {
     if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
 
     setsid();  /* 脱离拉起它的 App 会话 */
-    signal(SIGTERM, sigterm_handler);
-    signal(SIGINT, sigterm_handler);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigterm_handler;
+    sa.sa_flags = 0; /* 不要 SA_RESTART，确保 select/sleep 被信号打断后立即退出 */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     init_loglevel();  /* 从启动第一行起按配置 loglevel 过滤 (P1) */
     lockmon_init();  /* 锁屏监听（失败则保持常速轮询，不影响保护） */
@@ -6314,8 +6598,10 @@ int main(void) {
             bf = fopen(BANDS_TMP_PATH, "w");
             if (bf) {
                 time_t bt = time(NULL);
+                struct tm btm;
+                localtime_r(&bt, &btm);
                 char bts[64];
-                strftime(bts, sizeof(bts), "%Y-%m-%d %H:%M:%S", localtime(&bt));
+                strftime(bts, sizeof(bts), "%Y-%m-%d %H:%M:%S", &btm);
                 fprintf(bf, "req=%s\nupdated=%s\n", bands_token, bts);
             }
         }
@@ -6543,6 +6829,8 @@ int main(void) {
         write_status(protected_now, demoted_pids, plist, nplist, dlist, ndlist);
         mempressure_write_state();
 
+        if (should_stop() || g_got_sigterm) break;
+
         if (g_locked) {
             /* 刚锁屏的前两轮用 10 秒间隔，盖住系统降档的窗口；之后 60 秒 */
             int secs = (g_locked_passes < 2) ? 10 : 60;
@@ -6561,11 +6849,24 @@ int main(void) {
         g_pulse_stop_requested = 1;
         pthread_join(g_pulse_thread, NULL);
         g_pulse_thread_running = 0;
+        g_pulse_thread_has_handle = 0;
+    } else if (g_pulse_thread_has_handle) {
+        pthread_join(g_pulse_thread, NULL);
+        g_pulse_thread_has_handle = 0;
     }
 
     act_dedup_flush_all();
     JPLOG(JP_INFO, "STOP");
-    unlink(PID_PATH);
+    FILE *pf = fopen(PID_PATH, "r");
+    if (pf) {
+        int cur_pid = 0;
+        if (fscanf(pf, "%d", &cur_pid) == 1 && cur_pid == (int)getpid()) {
+            fclose(pf);
+            unlink(PID_PATH);
+        } else {
+            fclose(pf);
+        }
+    }
     fprintf(stderr, "[JetPilot] 收到停止信号，退出\n");
     return 0;
 }

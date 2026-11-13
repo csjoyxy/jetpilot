@@ -24,6 +24,42 @@ extern int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t *, uid_t);
 extern int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *, uid_t);
 extern char **environ;
 
+#if __has_include(<libproc.h>)
+#include <libproc.h>
+#endif
+
+#ifndef PROC_PIDTBSDINFO
+#define PROC_PIDTBSDINFO 3
+#endif
+
+#ifndef _SYS_PROC_INFO_H
+struct proc_bsdinfo {
+    uint32_t pbi_flags;
+    uint32_t pbi_status;
+    uint32_t pbi_xstatus;
+    uint32_t pbi_pid;
+    uint32_t pbi_ppid;
+    uid_t    pbi_uid;
+    gid_t    pbi_gid;
+    uid_t    pbi_ruid;
+    gid_t    pbi_rgid;
+    uid_t    pbi_svuid;
+    gid_t    pbi_svgid;
+    uint32_t rfu_1;
+    char     pbi_comm[16];
+    char     pbi_name[32];
+    uint32_t pbi_nfiles;
+    uint32_t pbi_pgid;
+    uint32_t pbi_pjobc;
+    uint32_t e_tdev;
+    uint32_t e_tpgid;
+    int32_t  pbi_nice;
+    uint64_t pbi_start_tvsec;
+    uint64_t pbi_start_tvusec;
+};
+#endif
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
+
 #ifndef JP_COMMIT
 #define JP_COMMIT "dev"
 #endif
@@ -46,6 +82,9 @@ static NSString *const kMemPressureFloor     = @"/var/mobile/Library/JetPilot/me
 
 static NSString *const kRestartConfig        = @"/var/mobile/Library/JetPilot/restart.txt";
 static NSString *const kRestartState         = @"/var/mobile/Library/JetPilot/restart_state.txt";
+
+static NSString *const kPulseConfig          = @"/var/mobile/Library/JetPilot/pulse.txt";
+static NSString *const kPulseState           = @"/var/mobile/Library/JetPilot/pulse.state";
 
 static NSString *const kBandsReqPath    = @"/var/mobile/Library/JetPilot/bands.req";
 static NSString *const kBandsReqTmpPath = @"/var/mobile/Library/JetPilot/bands.req.tmp";
@@ -100,7 +139,7 @@ static NSString *const kBandsPath       = @"/var/mobile/Library/JetPilot/bands.t
     NSString *line0 = lines[0];
     if (![line0 hasPrefix:@"req="]) return nil;
     NSString *token = [line0 substringFromIndex:4];
-    if (![token isEqualToString:expectedToken]) return nil;
+    if (expectedToken.length > 0 && ![token isEqualToString:expectedToken]) return nil;
 
     JPBandsSnapshot *snap = [JPBandsSnapshot new];
     snap.reqToken = token;
@@ -288,6 +327,16 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @implementation JPProtectedApp
 @end
 
+@interface JPPulseAppState : NSObject
+@property (nonatomic, copy) NSString *bid;
+@property (nonatomic, assign) NSInteger dayCount;
+@property (nonatomic, assign) BOOL trippedToday;
+@property (nonatomic, assign) BOOL unresponsive;
+@end
+
+@implementation JPPulseAppState
+@end
+
 @interface JPStatusInfo : NSObject
 @property (nonatomic, copy) NSString *updated;
 @property (nonatomic, assign) NSInteger protectRules;
@@ -301,6 +350,12 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
 @property (nonatomic, assign) BOOL hasDemotedAppLines;
 @property (nonatomic, assign) BOOL bidSupport;      /* 守护进程是否支持 bid: 规则 */
 @property (nonatomic, assign) BOOL restartSupport;  /* 守护进程是否支持超内存重启 (restart.txt) */
+@property (nonatomic, assign) BOOL pulseSupport;    /* 守护进程是否支持后台释放 (pulse.txt) */
+@property (nonatomic, assign) NSInteger pulseToday; /* 当天全局 pulse 次数 (v0.7.8 C2-7) */
+@property (nonatomic, assign) NSInteger pulseCfgBad;/* pulse.txt 无效行数 (v0.7.8 C2-7) */
+@property (nonatomic, assign) BOOL pulseCorrupt;    /* pulse 状态文件恢复异常 (v0.7.8 C2-5/Q5) */
+@property (nonatomic, copy) NSString *pulseCorruptBid;
+@property (nonatomic, copy) NSDictionary<NSString *, JPPulseAppState *> *pulseAppStates;
 @property (nonatomic, copy) NSString *version;       /* 守护进程版本号 (v0.7.8 C1-V) */
 @property (nonatomic, copy) NSString *commit;        /* 守护进程 commit 哈希 (v0.7.8 C1-V) */
 @property (nonatomic, assign) NSInteger cfgBad;      /* restart.txt 无效行数 (v0.7.8 C1-N6) */
@@ -388,6 +443,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     NSMutableArray<JPProtectedApp *> *demotedApps = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, NSString *> *labels = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSNumber *, NSString *> *bids = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, JPPulseAppState *> *pulseAppStates = [NSMutableDictionary dictionary];
     NSArray<NSString *> *lines = [raw componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
     for (NSString *line in lines) {
         if ([line hasPrefix:@"updated="]) {
@@ -402,6 +458,27 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
             st.bidSupport = ([[line substringFromIndex:12] intValue] == 1);
         } else if ([line hasPrefix:@"restart_support="]) {
             st.restartSupport = ([[line substringFromIndex:16] intValue] == 1);
+        } else if ([line hasPrefix:@"pulse_support="]) {
+            st.pulseSupport = ([[line substringFromIndex:14] intValue] == 1);
+        } else if ([line hasPrefix:@"pulse_today="]) {
+            st.pulseToday = [[line substringFromIndex:12] integerValue];
+        } else if ([line hasPrefix:@"pulse_cfg_bad="]) {
+            st.pulseCfgBad = [[line substringFromIndex:14] integerValue];
+        } else if ([line hasPrefix:@"pulse_corrupt="]) {
+            st.pulseCorrupt = ([[line substringFromIndex:14] intValue] == 1);
+        } else if ([line hasPrefix:@"pulse_corrupt_bid="]) {
+            st.pulseCorruptBid = [[line substringFromIndex:18] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        } else if ([line hasPrefix:@"pulse_app="]) {
+            NSString *val = [line substringFromIndex:10];
+            NSArray<NSString *> *parts = [val componentsSeparatedByString:@"|"];
+            if (parts.count >= 4) {
+                JPPulseAppState *ast = [JPPulseAppState new];
+                ast.bid = parts[0];
+                ast.dayCount = [parts[1] integerValue];
+                ast.trippedToday = ([parts[2] intValue] == 1);
+                ast.unresponsive = ([parts[3] intValue] == 1);
+                pulseAppStates[ast.bid] = ast;
+            }
         } else if ([line hasPrefix:@"protect_rules="]) {
             st.protectRules = [[line substringFromIndex:14] integerValue];
         } else if ([line hasPrefix:@"demote_rules="]) {
@@ -502,6 +579,7 @@ typedef NS_ENUM(NSInteger, JPRuleType) {
     }
     st.protectedApps = [apps copy];
     st.demotedApps = [demotedApps copy];
+    st.pulseAppStates = [pulseAppStates copy];
     return st;
 }
 
@@ -1541,6 +1619,359 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
         }
     }
     return 0;
+}
+
+@end
+
+#pragma mark - Pulse Models (v0.7.8 C2-7)
+
+@interface JPPulseRule : NSObject
+@property (nonatomic, copy) NSString *bid;
+@property (nonatomic, assign) BOOL enabled;      // YES: on, NO: off
+@property (nonatomic, assign) NSInteger target;  // MB: 300 ~ 1500
+@property (nonatomic, assign) NSInteger n;       // min: 5 ~ 60
+@property (nonatomic, assign) NSInteger daymax;  // times: 1 ~ 100
+@property (nonatomic, assign) NSInteger delay;   // min: 1 ~ 60
+@property (nonatomic, copy) NSString *displayName;
+@property (nonatomic, assign) NSInteger lineIndex;
+@property (nonatomic, assign) BOOL isDuplicate;     // 重复规则标记
+@end
+
+@implementation JPPulseRule
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _lineIndex = -1;
+        _enabled = NO; // 手动新加规则默认关闭 (Q6 / C2-7)
+        _target = 550;
+        _n = 10;
+        _daymax = 30;
+        _delay = 10;
+    }
+    return self;
+}
+@end
+
+@interface JPPulseLine : NSObject
+@property (nonatomic, copy) NSString *rawText;
+@property (nonatomic, strong) JPPulseRule *rule;
+@property (nonatomic, assign) BOOL isUnknownOrComment;
+- (BOOL)isCommentOrEmpty;
+@end
+
+@implementation JPPulseLine
+- (BOOL)isCommentOrEmpty {
+    if (!self.isUnknownOrComment) return NO;
+    NSString *trimmed = [self.rawText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    return (trimmed.length == 0 || [trimmed hasPrefix:@"#"]);
+}
+@end
+
+@interface JPPulseConfig : NSObject
+@property (nonatomic, assign) BOOL hasTrailingNewline;
+@property (nonatomic, strong) NSMutableArray<JPPulseLine *> *lines;
+@property (nonatomic, strong) NSMutableArray<JPPulseRule *> *rules;
++ (instancetype)loadFromPath:(NSString *)path;
+- (BOOL)saveToPath:(NSString *)path error:(NSError **)error;
+- (JPPulseRule *)ruleForBundleId:(NSString *)bid;
+- (void)setRule:(JPPulseRule *)rule forBundleId:(NSString *)bid;
+- (JPPulseLine *)lineForRule:(JPPulseRule *)rule;
+- (void)removeLine:(JPPulseLine *)line;
+- (void)updateDuplicateRules;
+@end
+
+@implementation JPPulseConfig
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _lines = [NSMutableArray array];
+        _rules = [NSMutableArray array];
+        _hasTrailingNewline = YES;
+    }
+    return self;
+}
+
++ (instancetype)loadFromPath:(NSString *)path {
+    JPPulseConfig *cfg = [JPPulseConfig new];
+    cfg.hasTrailingNewline = YES;
+    if (!path || path.length == 0) return cfg;
+
+    NSString *raw = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    if (!raw || raw.length == 0) return cfg;
+
+    BOOL hasTrailingNewline = [raw hasSuffix:@"\n"] || [raw hasSuffix:@"\r"];
+    NSString *normalized = [raw stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"];
+    normalized = [normalized stringByReplacingOccurrencesOfString:@"\r" withString:@"\n"];
+    cfg.hasTrailingNewline = hasTrailingNewline;
+
+    NSString *toSplit = hasTrailingNewline ? [normalized substringToIndex:normalized.length - 1] : normalized;
+    NSArray<NSString *> *rawLines = [toSplit componentsSeparatedByString:@"\n"];
+
+    for (NSString *rawLine in rawLines) {
+        NSString *trimmed = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if ([trimmed hasSuffix:@"\r"]) {
+            trimmed = [trimmed substringToIndex:trimmed.length - 1];
+            trimmed = [trimmed stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        }
+
+        if (trimmed.length == 0 || [trimmed hasPrefix:@"#"]) {
+            JPPulseLine *l = [JPPulseLine new];
+            l.isUnknownOrComment = YES;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        NSArray<NSString *> *rawTokens = [trimmed componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@" \t\r"]];
+        NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+        for (NSString *t in rawTokens) {
+            if (t.length > 0) [tokens addObject:t];
+        }
+
+        // pulse.txt 格式: bid:<bid> on|off target=<MB> n=<分钟> daymax=<次> delay=<分钟> (恰好 6 个 token)
+        if (tokens.count != 6 || ![tokens[0] hasPrefix:@"bid:"]) {
+            JPPulseLine *l = [JPPulseLine new];
+            l.isUnknownOrComment = YES;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        NSString *bid = [tokens[0] substringFromIndex:4];
+        if (bid.length == 0 || JPIsRestartBlockedBundleId(bid)) {
+            JPPulseLine *l = [JPPulseLine new];
+            l.isUnknownOrComment = YES;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        NSString *stateTok = tokens[1];
+        BOOL isEnabled = NO;
+        if ([stateTok isEqualToString:@"on"]) {
+            isEnabled = YES;
+        } else if ([stateTok isEqualToString:@"off"]) {
+            isEnabled = NO;
+        } else {
+            JPPulseLine *l = [JPPulseLine new];
+            l.isUnknownOrComment = YES;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        BOOL hasTarget = NO, hasN = NO, hasDaymax = NO, hasDelay = NO;
+        NSInteger valTarget = 0, valN = 0, valDaymax = 0, valDelay = 0;
+        BOOL bad = NO;
+
+        for (int k = 2; k < 6; k++) {
+            NSString *tok = tokens[k];
+            NSRange eq = [tok rangeOfString:@"="];
+            if (eq.location == NSNotFound || eq.location == 0 || eq.location == tok.length - 1) {
+                bad = YES;
+                break;
+            }
+            NSString *key = [tok substringToIndex:eq.location];
+            NSString *valStr = [tok substringFromIndex:eq.location + 1];
+
+            NSScanner *scanner = [NSScanner scannerWithString:valStr];
+            long long v = 0;
+            if (![scanner scanLongLong:&v] || ![scanner isAtEnd]) {
+                bad = YES;
+                break;
+            }
+
+            if ([key isEqualToString:@"target"]) {
+                if (hasTarget || v < 300 || v > 1500) { bad = YES; break; }
+                valTarget = (NSInteger)v;
+                hasTarget = YES;
+            } else if ([key isEqualToString:@"n"]) {
+                if (hasN || v < 5 || v > 60) { bad = YES; break; }
+                valN = (NSInteger)v;
+                hasN = YES;
+            } else if ([key isEqualToString:@"daymax"]) {
+                if (hasDaymax || v < 1 || v > 100) { bad = YES; break; }
+                valDaymax = (NSInteger)v;
+                hasDaymax = YES;
+            } else if ([key isEqualToString:@"delay"]) {
+                if (hasDelay || v < 1 || v > 60) { bad = YES; break; }
+                valDelay = (NSInteger)v;
+                hasDelay = YES;
+            } else {
+                bad = YES;
+                break;
+            }
+        }
+
+        if (bad || !hasTarget || !hasN || !hasDaymax || !hasDelay) {
+            JPPulseLine *l = [JPPulseLine new];
+            l.isUnknownOrComment = YES;
+            l.rawText = rawLine;
+            [cfg.lines addObject:l];
+            continue;
+        }
+
+        JPPulseRule *r = [JPPulseRule new];
+        r.bid = bid;
+        r.enabled = isEnabled;
+        r.target = valTarget;
+        r.n = valN;
+        r.daymax = valDaymax;
+        r.delay = valDelay;
+        r.lineIndex = (NSInteger)cfg.lines.count;
+
+        JPPulseLine *l = [JPPulseLine new];
+        l.rule = r;
+        l.rawText = rawLine;
+        l.isUnknownOrComment = NO;
+        [cfg.lines addObject:l];
+        [cfg.rules addObject:r];
+    }
+
+    [cfg updateDuplicateRules];
+    return cfg;
+}
+
+- (void)updateDuplicateRules {
+    NSMutableSet<NSString *> *seenBids = [NSMutableSet set];
+    for (JPPulseLine *line in self.lines) {
+        if (!line.isUnknownOrComment && line.rule) {
+            NSString *b = line.rule.bid;
+            if ([seenBids containsObject:b]) {
+                line.rule.isDuplicate = YES;
+            } else {
+                line.rule.isDuplicate = NO;
+                [seenBids addObject:b];
+            }
+        }
+    }
+}
+
+- (JPPulseRule *)ruleForBundleId:(NSString *)bid {
+    if (bid.length == 0) return nil;
+    for (JPPulseLine *l in self.lines) {
+        if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:bid]) {
+            return l.rule;
+        }
+    }
+    return nil;
+}
+
+- (void)setRule:(JPPulseRule *)rule forBundleId:(NSString *)bid {
+    if (bid.length == 0 || !rule) return;
+    rule.bid = bid;
+
+    for (NSUInteger i = 0; i < self.lines.count; i++) {
+        JPPulseLine *l = self.lines[i];
+        if (!l.isUnknownOrComment && l.rule == rule) {
+            rule.lineIndex = (NSInteger)i;
+            l.rawText = nil;
+            [self updateDuplicateRules];
+            return;
+        }
+    }
+
+    if (rule.lineIndex >= 0 && (NSUInteger)rule.lineIndex < self.lines.count) {
+        JPPulseLine *l = self.lines[(NSUInteger)rule.lineIndex];
+        if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:bid]) {
+            NSUInteger idx = [self.rules indexOfObject:l.rule];
+            if (idx != NSNotFound) {
+                self.rules[idx] = rule;
+            }
+            l.rule = rule;
+            l.rawText = nil;
+            [self updateDuplicateRules];
+            return;
+        }
+    }
+
+    JPPulseLine *singleMatch = nil;
+    int matchCount = 0;
+    for (JPPulseLine *l in self.lines) {
+        if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:bid]) {
+            singleMatch = l;
+            matchCount++;
+        }
+    }
+    if (matchCount == 1 && singleMatch) {
+        NSUInteger idx = [self.rules indexOfObject:singleMatch.rule];
+        if (idx != NSNotFound) {
+            self.rules[idx] = rule;
+        }
+        singleMatch.rule = rule;
+        singleMatch.rawText = nil;
+        rule.lineIndex = (NSInteger)[self.lines indexOfObject:singleMatch];
+        [self updateDuplicateRules];
+        return;
+    }
+
+    // 新建规则行
+    JPPulseLine *newLine = [JPPulseLine new];
+    newLine.rule = rule;
+    newLine.rawText = nil;
+    newLine.isUnknownOrComment = NO;
+    rule.lineIndex = (NSInteger)self.lines.count;
+    [self.lines addObject:newLine];
+    [self.rules addObject:rule];
+    [self updateDuplicateRules];
+}
+
+- (JPPulseLine *)lineForRule:(JPPulseRule *)rule {
+    if (!rule) return nil;
+    for (JPPulseLine *l in self.lines) {
+        if (!l.isUnknownOrComment && l.rule == rule) return l;
+    }
+    if (rule.lineIndex >= 0 && (NSUInteger)rule.lineIndex < self.lines.count) {
+        JPPulseLine *l = self.lines[(NSUInteger)rule.lineIndex];
+        if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:rule.bid]) {
+            return l;
+        }
+    }
+    return nil;
+}
+
+- (void)removeLine:(JPPulseLine *)line {
+    if (!line) return;
+    if (line.rule) {
+        [self.rules removeObject:line.rule];
+    }
+    [self.lines removeObject:line];
+    for (NSUInteger i = 0; i < self.lines.count; i++) {
+        JPPulseLine *l = self.lines[i];
+        if (!l.isUnknownOrComment && l.rule) {
+            l.rule.lineIndex = (NSInteger)i;
+        }
+    }
+    [self updateDuplicateRules];
+}
+
+- (BOOL)saveToPath:(NSString *)path error:(NSError **)error {
+    if (!path || path.length == 0) return NO;
+
+    NSMutableArray<NSString *> *outputLines = [NSMutableArray array];
+    for (JPPulseLine *l in self.lines) {
+        if (l.isUnknownOrComment || !l.rule) {
+            [outputLines addObject:l.rawText ?: @""];
+        } else {
+            JPPulseRule *r = l.rule;
+            NSString *rLine = [NSString stringWithFormat:@"bid:%@ %@ target=%ld n=%ld daymax=%ld delay=%ld",
+                               r.bid, r.enabled ? @"on" : @"off",
+                               (long)r.target, (long)r.n, (long)r.daymax, (long)r.delay];
+            [outputLines addObject:rLine];
+            l.rawText = rLine;
+        }
+    }
+
+    NSMutableString *outStr = [NSMutableString string];
+    if (outputLines.count > 0) {
+        [outStr appendString:[outputLines componentsJoinedByString:@"\n"]];
+        if (self.hasTrailingNewline) {
+            [outStr appendString:@"\n"];
+        }
+    }
+
+    return [outStr writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
 }
 
 @end
@@ -2847,6 +3278,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, copy) NSArray<JPRule *> *existingRules;
 @property (nonatomic, assign) BOOL userAppsOnly;
 @property (nonatomic, assign) BOOL isRestartPicker;
+@property (nonatomic, assign) BOOL isPulsePicker;
 @property (nonatomic, copy) BOOL (^isAppExistingBlock)(JPInstalledApp *app);
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UISearchController *searchController;
@@ -2854,6 +3286,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 @property (nonatomic, strong) JPBandsSnapshot *bandsSnapshot;
 @property (nonatomic, copy) void (^onSelectApp)(NSString *pathFragment, NSString *displayName);
 @property (nonatomic, copy) void (^onSelectRestartBid)(NSString *bid, NSString *displayName);
+@property (nonatomic, copy) void (^onSelectPulseBid)(NSString *bid, NSString *displayName);
 @property (nonatomic, copy) void (^onManualAdd)(NSString *pathFragment, JPRuleType type, NSInteger band);
 @end
 
@@ -2864,7 +3297,21 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     self.title = @"添加规则";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
 
-    if (self.isRestartPicker) {
+    if (self.isPulsePicker) {
+        NSMutableArray<JPInstalledApp *> *validApps = [NSMutableArray array];
+        for (JPInstalledApp *app in self.allApps) {
+            if (app.bundleId.length > 0 &&
+                !JPIsRestartBlockedBundleId(app.bundleId) &&
+                ![app.bundleId isEqualToString:@"com.apple.mobilesafari"]) {
+                [validApps addObject:app];
+            }
+        }
+        self.filteredApps = validApps;
+        self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"手动输入"
+                                                                                 style:UIBarButtonItemStylePlain
+                                                                                target:self
+                                                                                action:@selector(showManualPulseBidInputDialog)];
+    } else if (self.isRestartPicker) {
         NSMutableArray<JPInstalledApp *> *validApps = [NSMutableArray array];
         for (JPInstalledApp *app in self.allApps) {
             if (app.bundleId.length > 0 && !JPIsRestartBlockedBundleId(app.bundleId)) {
@@ -2961,7 +3408,10 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     UIButton *manualBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     manualBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    if (self.isRestartPicker) {
+    if (self.isPulsePicker) {
+        [manualBtn setTitle:@"手动输入 Bundle ID" forState:UIControlStateNormal];
+        [manualBtn addTarget:self action:@selector(showManualPulseBidInputDialog) forControlEvents:UIControlEventTouchUpInside];
+    } else if (self.isRestartPicker) {
         [manualBtn setTitle:@"手动输入 Bundle ID" forState:UIControlStateNormal];
         [manualBtn addTarget:self action:@selector(showManualRestartBidInputDialog) forControlEvents:UIControlEventTouchUpInside];
     } else {
@@ -2972,7 +3422,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 
     [self.emptyView addSubview:icon];
     [self.emptyView addSubview:tip];
-    if (!self.userAppsOnly || self.isRestartPicker) {
+    if (!self.userAppsOnly || self.isRestartPicker || self.isPulsePicker) {
         [self.emptyView addSubview:manualBtn];
     }
 
@@ -3027,7 +3477,17 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
     NSString *term = [searchController.searchBar.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
     if (term.length == 0) {
-        if (self.isRestartPicker) {
+        if (self.isPulsePicker) {
+            NSMutableArray<JPInstalledApp *> *validApps = [NSMutableArray array];
+            for (JPInstalledApp *app in self.allApps) {
+                if (app.bundleId.length > 0 &&
+                    !JPIsRestartBlockedBundleId(app.bundleId) &&
+                    ![app.bundleId isEqualToString:@"com.apple.mobilesafari"]) {
+                    [validApps addObject:app];
+                }
+            }
+            self.filteredApps = validApps;
+        } else if (self.isRestartPicker) {
             NSMutableArray<JPInstalledApp *> *validApps = [NSMutableArray array];
             for (JPInstalledApp *app in self.allApps) {
                 if (app.bundleId.length > 0 && !JPIsRestartBlockedBundleId(app.bundleId)) {
@@ -3041,7 +3501,13 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     } else {
         [self.filteredApps removeAllObjects];
         for (JPInstalledApp *app in self.allApps) {
-            if (self.isRestartPicker) {
+            if (self.isPulsePicker) {
+                if (!app.bundleId || app.bundleId.length == 0 ||
+                    JPIsRestartBlockedBundleId(app.bundleId) ||
+                    [app.bundleId isEqualToString:@"com.apple.mobilesafari"]) {
+                    continue;
+                }
+            } else if (self.isRestartPicker) {
                 if (!app.bundleId || app.bundleId.length == 0 || JPIsRestartBlockedBundleId(app.bundleId)) {
                     continue;
                 }
@@ -3105,7 +3571,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     NSString *procDesc = matchedProc ? [matchedProc bandDescription] : nil;
 
     BOOL added = [self isAppAlreadyAdded:app];
-    if (self.isRestartPicker) {
+    if (self.isRestartPicker || self.isPulsePicker) {
         if (added) {
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · 已在规则中（点此编辑）", app.bundleId];
             cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
@@ -3145,6 +3611,25 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     JPInstalledApp *app = self.filteredApps[indexPath.row];
     NSString *bid = app.bundleId;
+
+    if (self.isPulsePicker) {
+        if (!bid || bid.length == 0 || JPIsRestartBlockedBundleId(bid) || [bid isEqualToString:@"com.apple.mobilesafari"]) {
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"不支持添加"
+                                                                           message:@"系统 App 不支持后台释放"
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+            return;
+        }
+        void (^callback)(NSString *, NSString *) = self.onSelectPulseBid;
+        NSString *dispName = app.displayName ?: bid;
+        [self jp_dismissThen:^{
+            if (callback) {
+                callback(bid, dispName);
+            }
+        }];
+        return;
+    }
 
     if (self.isRestartPicker) {
         if (!bid || bid.length == 0 || JPIsRestartBlockedBundleId(bid)) {
@@ -3319,6 +3804,71 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         }
 
         void (^callback)(NSString *, NSString *) = weakSelf.onSelectRestartBid;
+        [weakSelf jp_dismissThen:^{
+            if (callback) {
+                callback(bid, dispName);
+            }
+        }];
+    }]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)showManualPulseBidInputDialog {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"手动添加释放规则"
+                                                                   message:@"请输入以 bid: 开头的 Bundle ID（例如 bid:com.example.app）"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.placeholder = @"bid:com.example.app";
+        textField.autocorrectionType = UITextAutocorrectionTypeNo;
+        textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+
+    __weak typeof(alert) weakAlert = alert;
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        NSString *text = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (![text hasPrefix:@"bid:"]) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"格式错误"
+                                                                         message:@"后台释放规则仅支持 Bundle ID，必须以 \"bid:\" 开头（不接受路径片段或 web:）"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
+
+        NSString *bid = [text substringFromIndex:4];
+        if (bid.length == 0 || JPIsRestartBlockedBundleId(bid)) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"无效的 Bundle ID"
+                                                                         message:@"该 Bundle ID 不合法或在系统禁止名单中"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
+
+        JPInstalledApp *matchedApp = nil;
+        for (JPInstalledApp *app in weakSelf.allApps) {
+            if ([app.bundleId isEqualToString:bid]) {
+                matchedApp = app;
+                break;
+            }
+        }
+
+        /* 系统 App 与 Safari 彻底排除 (S1 / Hark-A Q3) */
+        if (!matchedApp || [bid isEqualToString:@"com.apple.mobilesafari"]) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"不支持添加"
+                                                                         message:@"系统 App 不支持后台释放"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
+
+        NSString *dispName = matchedApp.displayName ?: bid;
+
+        void (^callback)(NSString *, NSString *) = weakSelf.onSelectPulseBid;
         [weakSelf jp_dismissThen:^{
             if (callback) {
                 callback(bid, dispName);
@@ -4071,14 +4621,16 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             [entries addObject:@{@"name": @"daemon.log", @"data": logData}];
         }
 
-        // 2. 附带文件：mempressure.txt、mempressure_floor.txt、config.txt、status.txt、restart.txt、restart_state.txt
+        // 2. 附带文件：mempressure.txt、mempressure_floor.txt、config.txt、status.txt、restart.txt、restart_state.txt、pulse.txt、pulse.state
         NSArray<NSArray<NSString *> *> *attachFiles = @[
             @[kMemPressureConfig, @"mempressure.txt"],
             @[kMemPressureFloor,  @"mempressure_floor.txt"],
             @[kConfig,            @"config.txt"],
             @[kStatus,            @"status.txt"],
             @[kRestartConfig,     @"restart.txt"],
-            @[kRestartState,      @"restart_state.txt"]
+            @[kRestartState,      @"restart_state.txt"],
+            @[kPulseConfig,        @"pulse.txt"],
+            @[kPulseState,         @"pulse.state"]
         ];
 
         for (NSArray<NSString *> *pair in attachFiles) {
@@ -4719,6 +5271,33 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @property (nonatomic, assign) BOOL migrationAttemptedThisSession;
 @property (nonatomic, strong) JPStatusInfo *lastLoadedStatus;
 @end
+
+static BOOL JPWaitForDaemonExit(pid_t pid) {
+    if (pid <= 0) return YES;
+    for (int attempts = 0; attempts < 300; attempts++) {
+        errno = 0;
+        struct proc_bsdinfo bi;
+        int rc = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi));
+        if (rc <= 0) {
+            if (errno == ESRCH) {
+                return YES;
+            }
+            // 非 ESRCH 失败时（如 mobile 查 root 进程权限未知）不得当作进程已走，
+            // 须用 pid 文件判断旧进程退出：旧守护进程退出时仅当 pid 文件里还是自己的 pid 才 unlink，
+            // 所以 pid 文件消失或内容变化即说明旧进程已走。
+            NSString *curPidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
+            if (curPidStr == nil) {
+                return YES;
+            }
+            NSString *trimmed = [curPidStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (trimmed.length == 0 || trimmed.intValue != pid) {
+                return YES;
+            }
+        }
+        usleep(100000);
+    }
+    return NO;
+}
 
 @implementation MainViewController
 
@@ -5563,10 +6142,24 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     if (pid > 0) {
         kill(pid, SIGTERM);
     }
-    [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [weakSelf startDaemon];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (!JPWaitForDaemonExit(pid)) {
+            [@"run" writeToFile:kFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf refreshStatus];
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重启失败"
+                                                                               message:@"旧守护进程未退出，请稍后再试"
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [weakSelf presentViewController:alert animated:YES completion:nil];
+            });
+            return;
+        }
+        [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf startDaemon];
+        });
     });
 }
 
@@ -8039,6 +8632,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             [self presentViewController:err animated:YES completion:nil];
             return;
         }
+
     }
 
     self.rule.thr = self.currentThr;
@@ -8383,10 +8977,785 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @end
 
 
+#pragma mark - Views: Pulse Rule Card (v0.7.8 C2-7)
+
+@class JPPulseRuleCardView;
+
+@protocol JPPulseRuleCardViewDelegate <NSObject>
+@optional
+- (void)pulseRuleCardViewDidTap:(JPPulseRuleCardView *)card;
+- (void)pulseRuleCardViewDidToggle:(JPPulseRuleCardView *)card enabled:(BOOL)enabled;
+- (void)pulseRuleCardViewDidRequestDelete:(JPPulseRuleCardView *)card;
+@end
+
+@interface JPPulseRuleCardView : UIView
+@property (nonatomic, strong) JPPulseRule *rule;
+@property (nonatomic, weak) id<JPPulseRuleCardViewDelegate> delegate;
+@property (nonatomic, strong) UIImageView *iconImageView;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *fragLabel;
+@property (nonatomic, strong) UILabel *paramLabel;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UILabel *thrLabel;
+@property (nonatomic, strong) UISwitch *toggleSwitch;
+@property (nonatomic, strong) UIButton *deleteButton;
+
+- (instancetype)initWithRule:(JPPulseRule *)rule
+                    delegate:(id<JPPulseRuleCardViewDelegate>)delegate
+               installedApps:(NSArray<JPInstalledApp *> *)apps
+                    appState:(JPPulseAppState *)appState;
+@end
+
+@implementation JPPulseRuleCardView
+
+- (instancetype)initWithRule:(JPPulseRule *)rule
+                    delegate:(id<JPPulseRuleCardViewDelegate>)delegate
+               installedApps:(NSArray<JPInstalledApp *> *)apps
+                    appState:(JPPulseAppState *)appState {
+    self = [super initWithFrame:CGRectZero];
+    if (self) {
+        _rule = rule;
+        _delegate = delegate;
+        [self setupUIWithApps:apps appState:appState];
+    }
+    return self;
+}
+
+- (void)setupUIWithApps:(NSArray<JPInstalledApp *> *)apps appState:(JPPulseAppState *)appState {
+    self.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    self.layer.cornerRadius = 14;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    self.clipsToBounds = YES;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.iconImageView = [UIImageView new];
+    self.iconImageView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.iconImageView.layer.cornerRadius = 8;
+    self.iconImageView.layer.cornerCurve = kCACornerCurveContinuous;
+    self.iconImageView.clipsToBounds = YES;
+    self.iconImageView.contentMode = UIViewContentModeScaleAspectFit;
+    self.iconImageView.image = JPIconForFragment([NSString stringWithFormat:@"bid:%@", self.rule.bid], apps);
+    [self addSubview:self.iconImageView];
+
+    NSString *name = ResolveDisplayNameHelper([NSString stringWithFormat:@"bid:%@", self.rule.bid], apps);
+    if (name.length == 0) name = self.rule.displayName.length > 0 ? self.rule.displayName : self.rule.bid;
+
+    self.titleLabel = [UILabel new];
+    self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    self.titleLabel.textColor = UIColor.labelColor;
+    self.titleLabel.text = name;
+    [self addSubview:self.titleLabel];
+
+    self.fragLabel = [UILabel new];
+    self.fragLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.fragLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    self.fragLabel.textColor = UIColor.secondaryLabelColor;
+    self.fragLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    self.fragLabel.text = self.rule.bid;
+    [self addSubview:self.fragLabel];
+
+    self.paramLabel = [UILabel new];
+    self.paramLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.paramLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    self.paramLabel.textColor = UIColor.secondaryLabelColor;
+    self.paramLabel.numberOfLines = 1;
+    self.paramLabel.text = [NSString stringWithFormat:@"目标 %ld MB · 等待 %ld 分 · 间隔 %ld 分 · 每天 %ld 次",
+                            (long)self.rule.target, (long)self.rule.delay, (long)self.rule.n, (long)self.rule.daymax];
+    [self addSubview:self.paramLabel];
+
+    self.statusLabel = [UILabel new];
+    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    self.statusLabel.numberOfLines = 1;
+
+    JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
+    JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
+    BOOL targetTooHigh = (self.rule.enabled && rst && rst.isEnabled && rst.thr > 0 && self.rule.target > rst.thr - 200);
+
+    if (!self.rule.enabled) {
+        self.statusLabel.text = @"规则已关闭";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        self.alpha = 0.65;
+    } else if (self.rule.isDuplicate) {
+        self.statusLabel.text = @"⚠️ 重复，只有第一条生效";
+        self.statusLabel.textColor = UIColor.systemRedColor;
+        self.alpha = 1.0;
+    } else if (appState.trippedToday) {
+        self.statusLabel.text = @"⚠️ 今日已熔断（切后台后异常退出）";
+        self.statusLabel.textColor = UIColor.systemRedColor;
+        self.alpha = 1.0;
+    } else if (targetTooHigh) {
+        self.statusLabel.text = @"目标高于重启阈值 − 200，释放可能来不及";
+        self.statusLabel.textColor = UIColor.systemOrangeColor;
+        self.alpha = 1.0;
+    } else if (appState.unresponsive) {
+        self.statusLabel.text = @"⚠️ 此 App 对释放无响应";
+        self.statusLabel.textColor = UIColor.systemOrangeColor;
+        self.alpha = 1.0;
+    } else if (appState.dayCount > 0) {
+        self.statusLabel.text = [NSString stringWithFormat:@"今日已释放 %ld 次", (long)appState.dayCount];
+        self.statusLabel.textColor = UIColor.systemGreenColor;
+        self.alpha = 1.0;
+    } else {
+        self.statusLabel.text = @"后台满足条件时自动释放";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        self.alpha = 1.0;
+    }
+    [self addSubview:self.statusLabel];
+
+    self.thrLabel = [UILabel new];
+    self.thrLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.thrLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+    self.thrLabel.textAlignment = NSTextAlignmentRight;
+    self.thrLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.rule.target];
+    [self addSubview:self.thrLabel];
+
+    self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.deleteButton setImage:[UIImage systemImageNamed:@"trash"] forState:UIControlStateNormal];
+    self.deleteButton.tintColor = UIColor.systemRedColor;
+    [self.deleteButton addTarget:self action:@selector(deleteTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.deleteButton];
+
+    self.toggleSwitch = [UISwitch new];
+    self.toggleSwitch.translatesAutoresizingMaskIntoConstraints = NO;
+    self.toggleSwitch.on = self.rule.enabled;
+    [self.toggleSwitch addTarget:self action:@selector(switchToggled:) forControlEvents:UIControlEventValueChanged];
+    [self addSubview:self.toggleSwitch];
+
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    chevron.translatesAutoresizingMaskIntoConstraints = NO;
+    chevron.tintColor = UIColor.tertiaryLabelColor;
+    chevron.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:chevron];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.iconImageView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+        [self.iconImageView.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.iconImageView.widthAnchor constraintEqualToConstant:40],
+        [self.iconImageView.heightAnchor constraintEqualToConstant:40],
+
+        [chevron.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
+        [chevron.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [chevron.widthAnchor constraintEqualToConstant:8],
+        [chevron.heightAnchor constraintEqualToConstant:13],
+
+        [self.deleteButton.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-4],
+        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.deleteButton.widthAnchor constraintEqualToConstant:32],
+        [self.deleteButton.heightAnchor constraintEqualToConstant:32],
+
+        [self.toggleSwitch.trailingAnchor constraintEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.toggleSwitch.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+
+        [self.thrLabel.trailingAnchor constraintEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-8],
+        [self.thrLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+        [self.thrLabel.widthAnchor constraintGreaterThanOrEqualToConstant:60],
+
+        [self.titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+        [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.thrLabel.leadingAnchor constant:-8],
+
+        [self.fragLabel.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:2],
+        [self.fragLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.fragLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.thrLabel.leadingAnchor constant:-8],
+
+        [self.paramLabel.topAnchor constraintEqualToAnchor:self.fragLabel.bottomAnchor constant:3],
+        [self.paramLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.paramLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-8],
+
+        [self.statusLabel.topAnchor constraintEqualToAnchor:self.paramLabel.bottomAnchor constant:3],
+        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-8],
+        [self.statusLabel.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12]
+    ]];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(cardTapped:)];
+    [self addGestureRecognizer:tap];
+    self.userInteractionEnabled = YES;
+}
+
+- (void)cardTapped:(UITapGestureRecognizer *)sender {
+    CGPoint pt = [sender locationInView:self];
+    if (CGRectContainsPoint(self.deleteButton.frame, pt) || CGRectContainsPoint(self.toggleSwitch.frame, pt)) {
+        return;
+    }
+    if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidTap:)]) {
+        [self.delegate pulseRuleCardViewDidTap:self];
+    }
+}
+
+- (void)switchToggled:(UISwitch *)sender {
+    self.rule.enabled = sender.isOn;
+    self.alpha = sender.isOn ? 1.0 : 0.65;
+    if (!sender.isOn) {
+        self.statusLabel.text = @"规则已关闭";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+    } else {
+        JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
+        JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
+        if (rst && rst.isEnabled && rst.thr > 0 && self.rule.target > rst.thr - 200) {
+            self.statusLabel.text = @"目标高于重启阈值 − 200，释放可能来不及";
+            self.statusLabel.textColor = UIColor.systemOrangeColor;
+        } else {
+            self.statusLabel.text = @"后台满足条件时自动释放";
+            self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        }
+    }
+    if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidToggle:enabled:)]) {
+        [self.delegate pulseRuleCardViewDidToggle:self enabled:sender.isOn];
+    }
+}
+
+- (void)deleteTapped {
+    if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidRequestDelete:)]) {
+        [self.delegate pulseRuleCardViewDidRequestDelete:self];
+    }
+}
+
+@end
+
+#pragma mark - Views: Pulse Unknown Line Card (v0.7.8 C2-7)
+
+@class JPPulseUnknownLineCardView;
+
+@protocol JPPulseUnknownLineCardViewDelegate <NSObject>
+@optional
+- (void)pulseUnknownLineCardViewDidRequestDelete:(JPPulseLine *)line;
+@end
+
+@interface JPPulseUnknownLineCardView : UIView
+@property (nonatomic, strong) JPPulseLine *line;
+@property (nonatomic, weak) id<JPPulseUnknownLineCardViewDelegate> delegate;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *contentLabel;
+@property (nonatomic, strong) UIButton *deleteButton;
+- (instancetype)initWithLine:(JPPulseLine *)line delegate:(id<JPPulseUnknownLineCardViewDelegate>)delegate;
+@end
+
+@implementation JPPulseUnknownLineCardView
+
+- (instancetype)initWithLine:(JPPulseLine *)line delegate:(id<JPPulseUnknownLineCardViewDelegate>)delegate {
+    self = [super initWithFrame:CGRectZero];
+    if (self) {
+        _line = line;
+        _delegate = delegate;
+        [self setupUI];
+    }
+    return self;
+}
+
+- (void)setupUI {
+    self.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    self.layer.cornerRadius = 14;
+    self.layer.cornerCurve = kCACornerCurveContinuous;
+    self.clipsToBounds = YES;
+    self.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.titleLabel = [UILabel new];
+    self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    self.titleLabel.textColor = UIColor.systemOrangeColor;
+    self.titleLabel.text = @"无效配置行（点击右侧删除）";
+    [self addSubview:self.titleLabel];
+
+    self.contentLabel = [UILabel new];
+    self.contentLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.contentLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    self.contentLabel.textColor = UIColor.secondaryLabelColor;
+    self.contentLabel.numberOfLines = 0;
+    self.contentLabel.text = self.line.rawText ?: @"";
+    [self addSubview:self.contentLabel];
+
+    self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.deleteButton setImage:[UIImage systemImageNamed:@"trash"] forState:UIControlStateNormal];
+    self.deleteButton.tintColor = UIColor.systemRedColor;
+    [self.deleteButton addTarget:self action:@selector(deleteTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:self.deleteButton];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.deleteButton.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-14],
+        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.deleteButton.widthAnchor constraintEqualToConstant:32],
+        [self.deleteButton.heightAnchor constraintEqualToConstant:32],
+
+        [self.titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
+        [self.titleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+        [self.titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+
+        [self.contentLabel.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:4],
+        [self.contentLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:14],
+        [self.contentLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.contentLabel.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12]
+    ]];
+}
+
+- (void)deleteTapped {
+    if ([self.delegate respondsToSelector:@selector(pulseUnknownLineCardViewDidRequestDelete:)]) {
+        [self.delegate pulseUnknownLineCardViewDidRequestDelete:self.line];
+    }
+}
+
+@end
+
+#pragma mark - Controllers: Pulse Rule Edit (v0.7.8 C2-7)
+
+@class JPPulseRuleEditViewController;
+
+@protocol JPPulseRuleEditViewControllerDelegate <NSObject>
+- (BOOL)pulseRuleEditViewControllerDidSave:(JPPulseRule *)rule error:(NSError **)error;
+- (BOOL)pulseRuleEditViewControllerDidDelete:(JPPulseRule *)rule error:(NSError **)error;
+@end
+
+@interface JPPulseRuleEditViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) JPPulseRule *rule;
+@property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
+@property (nonatomic, assign) BOOL isNewRule;
+@property (nonatomic, weak) id<JPPulseRuleEditViewControllerDelegate> delegate;
+
+@property (nonatomic, strong) UITableView *tableView;
+@property (nonatomic, assign) NSInteger currentTarget;
+@property (nonatomic, assign) NSInteger currentDelay;
+@property (nonatomic, assign) NSInteger currentN;
+@property (nonatomic, assign) NSInteger currentDaymax;
+@property (nonatomic, assign) BOOL isEnabled;
+@property (nonatomic, copy) NSString *currentDisplayName;
+@end
+
+@implementation JPPulseRuleEditViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = self.isNewRule ? @"添加释放规则" : @"编辑释放规则";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+
+    self.currentTarget = (self.rule.target >= 300 && self.rule.target <= 1500) ? self.rule.target : 550;
+    self.currentDelay = (self.rule.delay >= 1 && self.rule.delay <= 60) ? self.rule.delay : 10;
+    self.currentN = (self.rule.n >= 5 && self.rule.n <= 60) ? self.rule.n : 10;
+    self.currentDaymax = (self.rule.daymax >= 1 && self.rule.daymax <= 100) ? self.rule.daymax : 30;
+    self.isEnabled = self.rule.enabled;
+    self.currentDisplayName = self.rule.displayName ?: @"";
+
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"取消"
+                                                                             style:UIBarButtonItemStylePlain
+                                                                            target:self
+                                                                            action:@selector(cancelTapped)];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"保存"
+                                                                              style:UIBarButtonItemStyleDone
+                                                                             target:self
+                                                                             action:@selector(saveTapped)];
+
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.tableView.dataSource = self;
+    self.tableView.delegate = self;
+    self.tableView.estimatedSectionFooterHeight = 44.0;
+    self.tableView.sectionFooterHeight = UITableViewAutomaticDimension;
+    [self.view addSubview:self.tableView];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.tableView.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [self.tableView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.tableView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.tableView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor]
+    ]];
+}
+
+- (void)cancelTapped {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)saveTapped {
+    if (self.isEnabled) {
+        if (self.currentTarget < 300 || self.currentTarget > 1500) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"目标值超出范围"
+                                                                         message:@"目标内存必须在 300 到 1500 MB 之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:err animated:YES completion:nil];
+            return;
+        }
+        if (self.currentDelay < 1 || self.currentDelay > 60) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"等待时间超出范围"
+                                                                         message:@"后台等待时间必须在 1 到 60 分钟之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:err animated:YES completion:nil];
+            return;
+        }
+        if (self.currentN < 5 || self.currentN > 60) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"间隔超出范围"
+                                                                         message:@"释放最小间隔必须在 5 到 60 分钟之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:err animated:YES completion:nil];
+            return;
+        }
+        if (self.currentDaymax < 1 || self.currentDaymax > 100) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"上限超出范围"
+                                                                         message:@"每天释放上限必须在 1 到 100 次之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:err animated:YES completion:nil];
+            return;
+        }
+
+        // 有重启规则的才做 target <= 阈值 - 200 校验 (Q14)
+        JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
+        JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
+        if (rst && rst.thr > 0) {
+            if (self.currentTarget > rst.thr - 200) {
+                UIAlertController *err = [UIAlertController alertControllerWithTitle:@"目标值过高"
+                                                                             message:[NSString stringWithFormat:@"目标值必须比该 App 的超内存重启阈值（%ld MB）低至少 200 MB。当前重启阈值为 %ld MB，目标值最高只能设为 %ld MB。", (long)rst.thr, (long)rst.thr, (long)(rst.thr - 200)]
+                                                                      preferredStyle:UIAlertControllerStyleAlert];
+                [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:err animated:YES completion:nil];
+                return;
+            }
+        }
+    }
+
+    self.rule.target = self.currentTarget;
+    self.rule.delay = self.currentDelay;
+    self.rule.n = self.currentN;
+    self.rule.daymax = self.currentDaymax;
+    self.rule.enabled = self.isEnabled;
+    self.rule.displayName = self.currentDisplayName;
+
+    NSError *error = nil;
+    BOOL ok = YES;
+    if ([self.delegate respondsToSelector:@selector(pulseRuleEditViewControllerDidSave:error:)]) {
+        ok = [self.delegate pulseRuleEditViewControllerDidSave:self.rule error:&error];
+    }
+    if (!ok) {
+        NSString *errMsg = error ? error.localizedDescription : @"未知错误";
+        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"保存配置失败"
+                                                                         message:[NSString stringWithFormat:@"写入 pulse.txt 失败：%@", errMsg]
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+        [errAlert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:errAlert animated:YES completion:nil];
+        return;
+    }
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+#pragma mark - Table View
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return self.isNewRule ? 3 : 4;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (section == 0) return 2;
+    if (section == 1) return 1;
+    if (section == 2) return 4;
+    if (section == 3) return 1;
+    return 0;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (section == 0) return @"应用信息";
+    if (section == 1) return @"功能开关";
+    if (section == 2) return @"释放参数设置";
+    return nil;
+}
+
+- (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
+    if (section == 1) {
+        UIView *footer = [UIView new];
+        UILabel *label = [UILabel new];
+        label.translatesAutoresizingMaskIntoConstraints = NO;
+        label.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        label.numberOfLines = 0;
+        label.textColor = UIColor.secondaryLabelColor;
+        label.text = @"切到后台时提示 App 释放内存，不会结束 App。";
+        [footer addSubview:label];
+        [NSLayoutConstraint activateConstraints:@[
+            [label.topAnchor constraintEqualToAnchor:footer.topAnchor constant:6],
+            [label.leadingAnchor constraintEqualToAnchor:footer.leadingAnchor constant:16],
+            [label.trailingAnchor constraintEqualToAnchor:footer.trailingAnchor constant:-16],
+            [label.bottomAnchor constraintEqualToAnchor:footer.bottomAnchor constant:-6]
+        ]];
+        return footer;
+    }
+    if (section == 2) {
+        UIView *footer = [UIView new];
+        UILabel *label = [UILabel new];
+        label.translatesAutoresizingMaskIntoConstraints = NO;
+        label.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        label.numberOfLines = 0;
+        label.textColor = UIColor.secondaryLabelColor;
+        label.text = @"后台等待时间：切到后台多久后再释放。\n目标内存：当进入后台且物理内存达到此值时尝试释放。";
+        [footer addSubview:label];
+        [NSLayoutConstraint activateConstraints:@[
+            [label.topAnchor constraintEqualToAnchor:footer.topAnchor constant:6],
+            [label.leadingAnchor constraintEqualToAnchor:footer.leadingAnchor constant:16],
+            [label.trailingAnchor constraintEqualToAnchor:footer.trailingAnchor constant:-16],
+            [label.bottomAnchor constraintEqualToAnchor:footer.bottomAnchor constant:-6]
+        ]];
+        return footer;
+    }
+    return nil;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForFooterInSection:(NSInteger)section {
+    return UITableViewAutomaticDimension;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section == 0) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        if (indexPath.row == 0) {
+            cell.textLabel.text = @"App 名称";
+            NSString *dName = ResolveDisplayNameHelper([NSString stringWithFormat:@"bid:%@", self.rule.bid], self.installedApps);
+            if (dName.length == 0) dName = self.currentDisplayName.length > 0 ? self.currentDisplayName : self.rule.bid;
+            cell.detailTextLabel.text = dName;
+            cell.imageView.image = JPIconForFragment([NSString stringWithFormat:@"bid:%@", self.rule.bid], self.installedApps);
+        } else if (indexPath.row == 1) {
+            cell.textLabel.text = @"Bundle ID";
+            cell.detailTextLabel.text = self.rule.bid;
+            cell.detailTextLabel.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+        }
+        return cell;
+    } else if (indexPath.section == 1) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.text = @"启用后台释放";
+        UISwitch *sw = [UISwitch new];
+        sw.on = self.isEnabled;
+        [sw addTarget:self action:@selector(masterSwitchToggled:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = sw;
+        return cell;
+    } else if (indexPath.section == 2) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+        if (!self.isEnabled) {
+            cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+            cell.textLabel.textColor = UIColor.secondaryLabelColor;
+            cell.accessoryType = UITableViewCellAccessoryNone;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else {
+            cell.detailTextLabel.textColor = UIColor.labelColor;
+            cell.textLabel.textColor = UIColor.labelColor;
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        }
+
+        if (indexPath.row == 0) {
+            cell.textLabel.text = @"目标内存";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.currentTarget];
+            if (self.isEnabled) cell.detailTextLabel.textColor = UIColor.systemBlueColor;
+        } else if (indexPath.row == 1) {
+            cell.textLabel.text = @"后台等待时间";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 分钟", (long)self.currentDelay];
+        } else if (indexPath.row == 2) {
+            cell.textLabel.text = @"释放最小间隔";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 分钟", (long)self.currentN];
+        } else {
+            cell.textLabel.text = @"每天释放上限";
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 次", (long)self.currentDaymax];
+        }
+        return cell;
+    } else {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+        cell.textLabel.text = @"删除规则";
+        cell.textLabel.textColor = UIColor.systemRedColor;
+        cell.textLabel.textAlignment = NSTextAlignmentCenter;
+        return cell;
+    }
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section == 2) {
+        if (!self.isEnabled) return;
+        if (indexPath.row == 0) {
+            [self promptEditTarget];
+        } else if (indexPath.row == 1) {
+            [self promptEditDelay];
+        } else if (indexPath.row == 2) {
+            [self promptEditN];
+        } else if (indexPath.row == 3) {
+            [self promptEditDaymax];
+        }
+    } else if (indexPath.section == 3) {
+        [self confirmDelete];
+    }
+}
+
+- (void)masterSwitchToggled:(UISwitch *)sender {
+    self.isEnabled = sender.isOn;
+    [self.tableView reloadData];
+}
+
+- (void)promptEditTarget {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置目标内存"
+                                                                   message:@"请输入 300 到 1500 MB 之间的数值"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+        textField.placeholder = @"MB (300 - 1500)";
+        textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentTarget];
+    }];
+
+    __weak typeof(alert) weakAlert = alert;
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSInteger val = [txt integerValue];
+        if (txt.length == 0 || val < 300 || val > 1500) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
+                                                                         message:@"目标内存必须在 300 到 1500 MB 之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
+        weakSelf.currentTarget = val;
+        [weakSelf.tableView reloadData];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)promptEditDelay {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置后台等待时间"
+                                                                   message:@"切到后台多久后再释放。请输入 1 到 60 之间的分钟数"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+        textField.placeholder = @"分钟 (1 - 60)";
+        textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentDelay];
+    }];
+
+    __weak typeof(alert) weakAlert = alert;
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSInteger val = [txt integerValue];
+        if (txt.length == 0 || val < 1 || val > 60) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
+                                                                         message:@"后台等待时间必须在 1 到 60 分钟之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
+        weakSelf.currentDelay = val;
+        [weakSelf.tableView reloadData];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)promptEditN {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置释放最小间隔"
+                                                                   message:@"两次释放之间的最小间隔时间。请输入 5 到 60 之间的分钟数"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+        textField.placeholder = @"分钟 (5 - 60)";
+        textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentN];
+    }];
+
+    __weak typeof(alert) weakAlert = alert;
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSInteger val = [txt integerValue];
+        if (txt.length == 0 || val < 5 || val > 60) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
+                                                                         message:@"释放最小间隔必须在 5 到 60 分钟之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
+        weakSelf.currentN = val;
+        [weakSelf.tableView reloadData];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)promptEditDaymax {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置每天释放上限"
+                                                                   message:@"每个 App 每天最多释放次数。请输入 1 到 100 之间的次数"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+        textField.placeholder = @"次数 (1 - 100)";
+        textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentDaymax];
+    }];
+
+    __weak typeof(alert) weakAlert = alert;
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSInteger val = [txt integerValue];
+        if (txt.length == 0 || val < 1 || val > 100) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
+                                                                         message:@"每天释放上限必须在 1 到 100 次之间"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [weakSelf presentViewController:err animated:YES completion:nil];
+            return;
+        }
+        weakSelf.currentDaymax = val;
+        [weakSelf.tableView reloadData];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)confirmDelete {
+    NSString *dName = ResolveDisplayNameHelper([NSString stringWithFormat:@"bid:%@", self.rule.bid], self.installedApps);
+    if (dName.length == 0) dName = self.currentDisplayName.length > 0 ? self.currentDisplayName : self.rule.bid;
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除规则"
+                                                                   message:[NSString stringWithFormat:@"确定要移除对「%@」的后台释放规则吗？", dName]
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"移除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSError *error = nil;
+        BOOL ok = YES;
+        if ([strongSelf.delegate respondsToSelector:@selector(pulseRuleEditViewControllerDidDelete:error:)]) {
+            ok = [strongSelf.delegate pulseRuleEditViewControllerDidDelete:strongSelf.rule error:&error];
+        }
+        if (!ok) {
+            NSString *title = @"删除规则失败";
+            NSString *msg = @"未知错误";
+            if (error) {
+                msg = error.localizedDescription;
+            }
+            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:title
+                                                                             message:msg
+                                                                      preferredStyle:UIAlertControllerStyleAlert];
+            [errAlert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [strongSelf presentViewController:errAlert animated:YES completion:nil];
+            });
+            return;
+        }
+        [strongSelf dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+@end
+
+
 #pragma mark - Controllers: Restart ViewController
 
-@interface JPRestartViewController : UIViewController <JPRestartRuleCardViewDelegate, JPRestartRuleEditViewControllerDelegate, JPRestartUnknownLineCardViewDelegate>
+@interface JPRestartViewController : UIViewController <JPRestartRuleCardViewDelegate, JPRestartRuleEditViewControllerDelegate, JPRestartUnknownLineCardViewDelegate, JPPulseRuleCardViewDelegate, JPPulseRuleEditViewControllerDelegate, JPPulseUnknownLineCardViewDelegate>
 @property (nonatomic, strong) JPRestartConfig *config;
+@property (nonatomic, strong) JPPulseConfig *pulseConfig;
 @property (nonatomic, copy) NSArray<JPInstalledApp *> *installedApps;
 
 @property (nonatomic, strong) UIScrollView *scrollView;
@@ -8394,16 +9763,23 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 @property (nonatomic, strong) UIButton *deadBanner;
 @property (nonatomic, strong) UIButton *versionWarningBanner;
+@property (nonatomic, strong) UIView *pulseCorruptBanner;
+@property (nonatomic, strong) UILabel *pulseCorruptLabel;
 @property (nonatomic, strong) UILabel *moduleStatusLabel;
 @property (nonatomic, strong) UILabel *rulesSectionHeaderLabel;
 @property (nonatomic, strong) UIStackView *rulesStackView;
 @property (nonatomic, strong) UIView *addRuleCard;
+
+@property (nonatomic, strong) UILabel *pulseSectionHeaderLabel;
+@property (nonatomic, strong) UIStackView *pulseRulesStackView;
+@property (nonatomic, strong) UIView *addPulseRuleCard;
 
 @property (nonatomic, strong) UIView *saveNoticeToast;
 @property (nonatomic, strong) NSTimer *saveNoticeTimer;
 @property (nonatomic, strong) NSTimer *pollingTimer;
 @property (nonatomic, assign) CFAbsoluteTime lastSpawnTime;
 @property (nonatomic, assign) BOOL restartSupport;
+@property (nonatomic, assign) BOOL pulseSupport;
 @end
 
 @implementation JPRestartViewController
@@ -8423,6 +9799,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [self setupSaveNoticeToast];
     [self loadConfig];
     [self rebuildRulesCards];
+    [self rebuildPulseCards];
     [self refreshStatus];
 
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -8439,6 +9816,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [super viewWillAppear:animated];
     [self loadConfig];
     [self rebuildRulesCards];
+    [self rebuildPulseCards];
     [self refreshStatus];
     [self startPollingTimer];
 }
@@ -8524,6 +9902,31 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     self.versionWarningBanner.hidden = YES;
     [self.contentStackView addArrangedSubview:self.versionWarningBanner];
 
+    // Pulse Corrupt Banner (v0.7.8 C2-5 / Q5)
+    self.pulseCorruptBanner = [UIView new];
+    self.pulseCorruptBanner.translatesAutoresizingMaskIntoConstraints = NO;
+    self.pulseCorruptBanner.backgroundColor = UIColor.systemOrangeColor;
+    self.pulseCorruptBanner.layer.cornerRadius = 12;
+    self.pulseCorruptBanner.layer.cornerCurve = kCACornerCurveContinuous;
+    self.pulseCorruptBanner.clipsToBounds = YES;
+
+    self.pulseCorruptLabel = [UILabel new];
+    self.pulseCorruptLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.pulseCorruptLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    self.pulseCorruptLabel.textColor = UIColor.whiteColor;
+    self.pulseCorruptLabel.textAlignment = NSTextAlignmentCenter;
+    self.pulseCorruptLabel.numberOfLines = 0;
+    [self.pulseCorruptBanner addSubview:self.pulseCorruptLabel];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.pulseCorruptLabel.topAnchor constraintEqualToAnchor:self.pulseCorruptBanner.topAnchor constant:10],
+        [self.pulseCorruptLabel.bottomAnchor constraintEqualToAnchor:self.pulseCorruptBanner.bottomAnchor constant:-10],
+        [self.pulseCorruptLabel.leadingAnchor constraintEqualToAnchor:self.pulseCorruptBanner.leadingAnchor constant:14],
+        [self.pulseCorruptLabel.trailingAnchor constraintEqualToAnchor:self.pulseCorruptBanner.trailingAnchor constant:-14],
+    ]];
+    self.pulseCorruptBanner.hidden = YES;
+    [self.contentStackView addArrangedSubview:self.pulseCorruptBanner];
+
     // Status Card
     UIView *statusCard = [self createStatusCard];
     [self.contentStackView addArrangedSubview:statusCard];
@@ -8538,7 +9941,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     [self.contentStackView addArrangedSubview:note];
 
     // Rules Section
-    self.rulesSectionHeaderLabel = [self createSectionHeader:@"规则列表"];
+    self.rulesSectionHeaderLabel = [self createSectionHeader:@"超内存重启规则"];
     self.rulesStackView = [UIStackView new];
     self.rulesStackView.translatesAutoresizingMaskIntoConstraints = NO;
     self.rulesStackView.axis = UILayoutConstraintAxisVertical;
@@ -8550,6 +9953,27 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     // Add Rule Card
     self.addRuleCard = [self createAddRuleCard];
     [self.contentStackView addArrangedSubview:self.addRuleCard];
+
+    // Pulse Section (后台释放 - v0.7.8 C2-7 / Q14)
+    self.pulseSectionHeaderLabel = [self createSectionHeader:@"后台释放"];
+    [self.contentStackView addArrangedSubview:self.pulseSectionHeaderLabel];
+
+    UILabel *pulseNote = [UILabel new];
+    pulseNote.translatesAutoresizingMaskIntoConstraints = NO;
+    pulseNote.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    pulseNote.textColor = UIColor.secondaryLabelColor;
+    pulseNote.numberOfLines = 0;
+    pulseNote.text = @"切到后台时提示 App 释放内存，不会结束 App。不支持应用扩展（PlugIns）、系统应用及 Safari 网页进程。";
+    [self.contentStackView addArrangedSubview:pulseNote];
+
+    self.pulseRulesStackView = [UIStackView new];
+    self.pulseRulesStackView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.pulseRulesStackView.axis = UILayoutConstraintAxisVertical;
+    self.pulseRulesStackView.spacing = 12;
+    [self.contentStackView addArrangedSubview:self.pulseRulesStackView];
+
+    self.addPulseRuleCard = [self createAddPulseRuleCard];
+    [self.contentStackView addArrangedSubview:self.addPulseRuleCard];
 
     // Footer
     UILabel *footer = [UILabel new];
@@ -8742,6 +10166,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 - (void)loadConfig {
     self.config = [JPRestartConfig loadFromPath:kRestartConfig];
+    self.pulseConfig = [JPPulseConfig loadFromPath:kPulseConfig];
     self.installedApps = [JPInstalledApp scanInstalledApps];
 }
 
@@ -8833,7 +10258,65 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         }
     }
 
-    self.rulesSectionHeaderLabel.text = [NSString stringWithFormat:@"规则列表 (%lu)", (unsigned long)self.config.rules.count];
+    self.rulesSectionHeaderLabel.text = [NSString stringWithFormat:@"超内存重启 (%lu)", (unsigned long)self.config.rules.count];
+}
+
+- (void)rebuildPulseCards {
+    [self.pulseConfig updateDuplicateRules];
+
+    for (UIView *v in self.pulseRulesStackView.arrangedSubviews) {
+        [self.pulseRulesStackView removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+
+    NSUInteger visibleCardsCount = 0;
+    for (JPPulseLine *line in self.pulseConfig.lines) {
+        if (!line.isUnknownOrComment && line.rule) {
+            visibleCardsCount++;
+        } else if (line.isUnknownOrComment && ![line isCommentOrEmpty]) {
+            visibleCardsCount++;
+        }
+    }
+
+    if (visibleCardsCount == 0) {
+        UIView *emptyCard = [UIView new];
+        emptyCard.translatesAutoresizingMaskIntoConstraints = NO;
+        emptyCard.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+        emptyCard.layer.cornerRadius = 14;
+        emptyCard.layer.cornerCurve = kCACornerCurveContinuous;
+
+        UILabel *emptyLabel = [UILabel new];
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        emptyLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightRegular];
+        emptyLabel.textColor = UIColor.secondaryLabelColor;
+        emptyLabel.text = @"暂无后台释放规则，点击下方「添加释放规则」进行配置";
+        emptyLabel.textAlignment = NSTextAlignmentCenter;
+        [emptyCard addSubview:emptyLabel];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [emptyLabel.centerXAnchor constraintEqualToAnchor:emptyCard.centerXAnchor],
+            [emptyLabel.centerYAnchor constraintEqualToAnchor:emptyCard.centerYAnchor],
+            [emptyCard.heightAnchor constraintEqualToConstant:64]
+        ]];
+        [self.pulseRulesStackView addArrangedSubview:emptyCard];
+    } else {
+        JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
+        for (JPPulseLine *line in self.pulseConfig.lines) {
+            if (!line.isUnknownOrComment && line.rule) {
+                JPPulseAppState *ast = st.pulseAppStates[line.rule.bid];
+                JPPulseRuleCardView *card = [[JPPulseRuleCardView alloc] initWithRule:line.rule
+                                                                             delegate:self
+                                                                        installedApps:self.installedApps
+                                                                             appState:ast];
+                [self.pulseRulesStackView addArrangedSubview:card];
+            } else if (line.isUnknownOrComment && ![line isCommentOrEmpty]) {
+                JPPulseUnknownLineCardView *card = [[JPPulseUnknownLineCardView alloc] initWithLine:line delegate:self];
+                [self.pulseRulesStackView addArrangedSubview:card];
+            }
+        }
+    }
+
+    self.pulseSectionHeaderLabel.text = [NSString stringWithFormat:@"后台释放 (%lu)", (unsigned long)self.pulseConfig.rules.count];
 }
 
 - (void)refreshStatus {
@@ -8843,17 +10326,33 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     self.restartSupport = running && st.restartSupport;
+    self.pulseSupport = running && st.pulseSupport;
 
     NSString *appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.7.8";
     NSString *appCommit = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"JPGitCommit"] ?: @"";
-    BOOL isOutdated = running && (!st.restartSupport || JPCheckVersionOrCommitMismatch(st, appVersion, appCommit));
+    BOOL isOutdated = running && (!st.restartSupport || !st.pulseSupport || JPCheckVersionOrCommitMismatch(st, appVersion, appCommit));
     self.versionWarningBanner.hidden = !isOutdated;
+
+    if (running && st.pulseCorrupt) {
+        if (st.pulseCorruptBid.length > 0) {
+            NSString *appName = ResolveDisplayNameHelper([NSString stringWithFormat:@"bid:%@", st.pulseCorruptBid], self.installedApps);
+            if (appName.length == 0) appName = st.pulseCorruptBid;
+            self.pulseCorruptLabel.text = [NSString stringWithFormat:@"建议强制关闭「%@」一次（后台释放异常恢复）", appName];
+        } else {
+            self.pulseCorruptLabel.text = @"请强制关闭最近被后台释放的 App（后台释放异常恢复）";
+        }
+        self.pulseCorruptBanner.hidden = NO;
+    } else {
+        self.pulseCorruptBanner.hidden = YES;
+    }
 
     if (!running) {
         self.moduleStatusLabel.text = @"守护进程未运行";
         self.moduleStatusLabel.textColor = UIColor.systemRedColor;
         self.addRuleCard.alpha = 0.5;
         self.addRuleCard.userInteractionEnabled = NO;
+        self.addPulseRuleCard.alpha = 0.5;
+        self.addPulseRuleCard.userInteractionEnabled = NO;
         return;
     }
 
@@ -8862,16 +10361,29 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         self.moduleStatusLabel.textColor = UIColor.systemOrangeColor;
         self.addRuleCard.alpha = 0.5;
         self.addRuleCard.userInteractionEnabled = NO;
-    } else if (st.cfgBad > 0) {
-        self.moduleStatusLabel.text = [NSString stringWithFormat:@"配置有 %ld 行无效", (long)st.cfgBad];
+        self.addPulseRuleCard.alpha = 0.5;
+        self.addPulseRuleCard.userInteractionEnabled = NO;
+    } else if (st.cfgBad > 0 || st.pulseCfgBad > 0) {
+        NSMutableArray<NSString *> *badParts = [NSMutableArray array];
+        if (st.cfgBad > 0) [badParts addObject:[NSString stringWithFormat:@"重启配置 %ld 行无效", (long)st.cfgBad]];
+        if (st.pulseCfgBad > 0) [badParts addObject:[NSString stringWithFormat:@"释放配置 %ld 行无效", (long)st.pulseCfgBad]];
+        self.moduleStatusLabel.text = [badParts componentsJoinedByString:@" · "];
         self.moduleStatusLabel.textColor = UIColor.systemOrangeColor;
         self.addRuleCard.alpha = 1.0;
         self.addRuleCard.userInteractionEnabled = YES;
+        self.addPulseRuleCard.alpha = 1.0;
+        self.addPulseRuleCard.userInteractionEnabled = YES;
     } else {
-        self.moduleStatusLabel.text = @"模块状态：正常运行中";
+        if (st.pulseToday > 0) {
+            self.moduleStatusLabel.text = [NSString stringWithFormat:@"模块状态：正常运行中 · 今日释放 %ld 次", (long)st.pulseToday];
+        } else {
+            self.moduleStatusLabel.text = @"模块状态：正常运行中";
+        }
         self.moduleStatusLabel.textColor = UIColor.systemGreenColor;
         self.addRuleCard.alpha = 1.0;
         self.addRuleCard.userInteractionEnabled = YES;
+        self.addPulseRuleCard.alpha = 1.0;
+        self.addPulseRuleCard.userInteractionEnabled = YES;
     }
 }
 
@@ -8887,11 +10399,30 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 
 - (void)restartDaemon {
     [JPDaemonManager stopDaemon];
-    usleep(300000);
-    CFAbsoluteTime t = 0;
-    int rc = [JPDaemonManager startDaemonWithLastSpawnTime:&t];
-    if (rc == 0) self.lastSpawnTime = t;
-    [self refreshStatus];
+    NSString *pidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
+    pid_t pid = (pid_t)[pidStr intValue];
+    if (pid > 0) {
+        kill(pid, SIGTERM);
+    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (!JPWaitForDaemonExit(pid)) {
+            [@"run" writeToFile:kFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf refreshStatus];
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重启失败"
+                                                                               message:@"旧守护进程未退出，请稍后再试"
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [weakSelf presentViewController:alert animated:YES completion:nil];
+            });
+            return;
+        }
+        [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf startDaemon];
+        });
+    });
 }
 
 #pragma mark - Actions
@@ -9017,7 +10548,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         alert.popoverPresentationController.sourceView = card;
         alert.popoverPresentationController.sourceRect = card.bounds;
     }
-    [self presentViewController:alert animated:YES completion:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 #pragma mark - JPRestartUnknownLineCardViewDelegate
@@ -9033,7 +10566,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
         [weakSelf rebuildRulesCards];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:alert animated:YES completion:nil];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 #pragma mark - JPRestartRuleEditViewControllerDelegate
@@ -9055,6 +10590,293 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     }
     [self.config removeLine:line];
     return [self saveConfigWithError:error];
+}
+
+- (UIView *)createAddPulseRuleCard {
+    UIView *card = [UIView new];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    card.layer.cornerRadius = 14;
+    card.layer.cornerCurve = kCACornerCurveContinuous;
+    card.clipsToBounds = YES;
+
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"plus.circle.fill"]];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.tintColor = UIColor.systemBlueColor;
+
+    UILabel *title = [UILabel new];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    title.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    title.textColor = UIColor.systemBlueColor;
+    title.text = @"添加释放规则";
+
+    UIImageView *chev = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    chev.translatesAutoresizingMaskIntoConstraints = NO;
+    chev.tintColor = UIColor.tertiaryLabelColor;
+
+    [card addSubview:icon];
+    [card addSubview:title];
+    [card addSubview:chev];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [icon.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+        [icon.widthAnchor constraintEqualToConstant:22],
+        [icon.heightAnchor constraintEqualToConstant:22],
+
+        [title.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:10],
+        [title.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+
+        [chev.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-16],
+        [chev.centerYAnchor constraintEqualToAnchor:card.centerYAnchor],
+        [chev.widthAnchor constraintEqualToConstant:12],
+        [chev.heightAnchor constraintEqualToConstant:14],
+
+        [card.heightAnchor constraintEqualToConstant:52]
+    ]];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(showAddPulseRuleSheet)];
+    [card addGestureRecognizer:tap];
+    card.userInteractionEnabled = YES;
+    return card;
+}
+
+- (void)showAddPulseRuleSheet {
+    if (!self.pulseSupport) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"守护进程版本过旧"
+                                                                       message:@"当前守护进程不支持后台释放，请先重启守护进程"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    if (self.pulseConfig.rules.count >= 32) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"规则已达上限"
+                                                                       message:@"最多支持添加 32 条后台释放规则"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    JPAppPickerViewController *picker = [JPAppPickerViewController new];
+    picker.userAppsOnly = YES;
+    picker.isPulsePicker = YES;
+    picker.allApps = self.installedApps;
+    __weak typeof(self) weakSelf = self;
+    picker.isAppExistingBlock = ^BOOL(JPInstalledApp *app) {
+        for (JPPulseRule *r in weakSelf.pulseConfig.rules) {
+            if ([r.bid isEqualToString:app.bundleId]) return YES;
+        }
+        return NO;
+    };
+
+    picker.onSelectPulseBid = ^(NSString *bid, NSString *displayName) {
+        JPPulseRule *existing = [weakSelf.pulseConfig ruleForBundleId:bid];
+        if (existing) {
+            [weakSelf openEditPulseRuleController:existing isNew:NO];
+            return;
+        }
+
+        NSInteger defTarget = 400;
+        if ([bid isEqualToString:@"com.tencent.xin"]) {
+            defTarget = 550;
+        } else {
+            NSString *bContent = [NSString stringWithContentsOfFile:kBandsPath encoding:NSUTF8StringEncoding error:nil];
+            if (bContent.length > 0) {
+                JPBandsSnapshot *snap = [JPBandsSnapshot parseSnapshotContent:bContent expectedToken:nil];
+                JPBandsProcess *p = [snap bestProcessForBundleId:bid];
+                if (p && p.hasFp && p.fpMb > 0) {
+                    defTarget = MAX(300, p.fpMb + 100);
+                }
+            }
+        }
+        if (defTarget > 1500) defTarget = 1500;
+        if (defTarget < 300) defTarget = 300;
+
+        JPRestartRule *rst = [weakSelf.config ruleForBundleId:bid];
+        if (rst && rst.thr > 0 && defTarget > rst.thr - 200) {
+            defTarget = MAX(300, rst.thr - 200);
+        }
+
+        JPPulseRule *newRule = [JPPulseRule new];
+        newRule.bid = bid;
+        newRule.displayName = displayName;
+        newRule.target = defTarget;
+        newRule.delay = 10;
+        newRule.n = 10;
+        newRule.daymax = 30;
+        newRule.enabled = NO; // 手动新加规则默认关闭 (Q6 / C2-7)
+
+        [weakSelf openEditPulseRuleController:newRule isNew:YES];
+    };
+
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
+    if (@available(iOS 15.0, *)) {
+        UISheetPresentationController *sheet = nav.sheetPresentationController;
+        sheet.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+        sheet.prefersGrabberVisible = YES;
+    }
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)openEditPulseRuleController:(JPPulseRule *)rule isNew:(BOOL)isNew {
+    if (!self.pulseSupport) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"守护进程版本过旧"
+                                                                       message:@"当前守护进程不支持后台释放，编辑项不可用，请先重启守护进程"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+
+    JPPulseRuleEditViewController *vc = [JPPulseRuleEditViewController new];
+    vc.rule = rule;
+    vc.installedApps = self.installedApps;
+    vc.isNewRule = isNew;
+    vc.delegate = self;
+
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)deletePulseRule:(JPPulseRule *)rule {
+    JPPulseLine *line = [self.pulseConfig lineForRule:rule];
+    if (!line) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                       message:@"规则已变化，请刷新后重试"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentViewController:alert animated:YES completion:nil];
+        });
+        return;
+    }
+    [self.pulseConfig removeLine:line];
+    [self savePulseConfig];
+    [self rebuildPulseCards];
+}
+
+- (BOOL)savePulseConfig {
+    NSError *err = nil;
+    BOOL ok = [self savePulseConfigWithError:&err];
+    if (!ok) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"保存配置失败"
+                                                                       message:[NSString stringWithFormat:@"写入 pulse.txt 失败：%@", err ? err.localizedDescription : @"未知错误"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf presentViewController:alert animated:YES completion:nil];
+        });
+    }
+    return ok;
+}
+
+- (BOOL)savePulseConfigWithError:(NSError **)error {
+    NSError *err = nil;
+    BOOL ok = [self.pulseConfig saveToPath:kPulseConfig error:&err];
+    if (error && err) {
+        *error = err;
+    }
+    if (!ok) {
+        [self loadConfig];
+        [self rebuildPulseCards];
+        return NO;
+    }
+    [self loadConfig];
+    [self rebuildPulseCards];
+    [self showSaveNotice];
+    return YES;
+}
+
+#pragma mark - JPPulseRuleCardViewDelegate
+
+- (void)pulseRuleCardViewDidTap:(JPPulseRuleCardView *)card {
+    [self openEditPulseRuleController:card.rule isNew:NO];
+}
+
+- (void)pulseRuleCardViewDidToggle:(JPPulseRuleCardView *)card enabled:(BOOL)enabled {
+    if (enabled) {
+        JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
+        JPRestartRule *rst = [restartCfg ruleForBundleId:card.rule.bid];
+        if (rst && rst.thr > 0 && card.rule.target > rst.thr - 200) {
+            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"目标值过高"
+                                                                         message:[NSString stringWithFormat:@"目标值必须比该 App 的超内存重启阈值（%ld MB）低至少 200 MB。当前重启阈值为 %ld MB，目标值最高只能设为 %ld MB。", (long)rst.thr, (long)rst.thr, (long)(rst.thr - 200)]
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:err animated:YES completion:nil];
+            [self rebuildPulseCards];
+            return;
+        }
+    }
+    card.rule.enabled = enabled;
+    [self savePulseConfig];
+    [self rebuildPulseCards];
+}
+
+- (void)pulseRuleCardViewDidRequestDelete:(JPPulseRuleCardView *)card {
+    JPPulseRule *rule = card.rule;
+    NSString *name = ResolveDisplayNameHelper([NSString stringWithFormat:@"bid:%@", rule.bid], self.installedApps);
+    if (name.length == 0) name = rule.displayName.length > 0 ? rule.displayName : rule.bid;
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除规则"
+                                                                   message:[NSString stringWithFormat:@"确定要移除对「%@」的后台释放规则吗？", name]
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"移除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        [weakSelf deletePulseRule:rule];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    if (alert.popoverPresentationController) {
+        alert.popoverPresentationController.sourceView = card;
+        alert.popoverPresentationController.sourceRect = card.bounds;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+#pragma mark - JPPulseUnknownLineCardViewDelegate
+
+- (void)pulseUnknownLineCardViewDidRequestDelete:(JPPulseLine *)line {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除无效配置行"
+                                                                   message:[NSString stringWithFormat:@"确定要移除此无效配置行吗？\n\n%@", line.rawText ?: @""]
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"移除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        [weakSelf.pulseConfig removeLine:line];
+        [weakSelf savePulseConfig];
+        [weakSelf rebuildPulseCards];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+#pragma mark - JPPulseRuleEditViewControllerDelegate
+
+- (BOOL)pulseRuleEditViewControllerDidSave:(JPPulseRule *)rule error:(NSError **)error {
+    [self.pulseConfig setRule:rule forBundleId:rule.bid];
+    return [self savePulseConfigWithError:error];
+}
+
+- (BOOL)pulseRuleEditViewControllerDidDelete:(JPPulseRule *)rule error:(NSError **)error {
+    JPPulseLine *line = [self.pulseConfig lineForRule:rule];
+    if (!line) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"JetPilot"
+                                         code:1001
+                                     userInfo:@{NSLocalizedDescriptionKey: @"规则已变化，请刷新后重试"}];
+        }
+        return NO;
+    }
+    [self.pulseConfig removeLine:line];
+    return [self savePulseConfigWithError:error];
 }
 
 @end
