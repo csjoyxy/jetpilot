@@ -3198,6 +3198,7 @@ typedef struct {
     int     in_bg;              /* 1: 当前处于 0..95 档 */
     time_t  bg_start_mono;      /* 进入 0..95 档的单调时间 (秒) */
     time_t  last_pulse_mono;    /* 上次完成 pulse 的单调时间 (秒) */
+    time_t  last_ctrl_start_mono; /* 上次启动对照组采样的单调时间 (秒) */
     int     pulsed_this_bg;     /* 1: 本次进入后台期间已触发过 pulse (每次进入后台最多 1 次) */
     int     day_count;          /* 当天已触发 pulse 次数 */
     char    day_date[16];       /* YYYY-MM-DD 本地日期 */
@@ -3206,6 +3207,24 @@ typedef struct {
     int     total_pulses;       /* 累计 pulse 次数 */
     int     no_drop_pulses;     /* 降幅 <= 5MB 的 pulse 次数 */
 } pulse_app_state_t;
+
+/* 对照组采样追踪器 (C2-4) */
+typedef struct {
+    char     bid[128];
+    pid_t    pid;
+    time_t   start_mono;
+    uint64_t fp0;
+    uint64_t fp15;
+    uint64_t fp30;
+    uint64_t fp60;
+    int      has_fp15;
+    int      has_fp30;
+    int      has_fp60;
+    int      active;
+} pulse_ctrl_tracker_t;
+
+#define PULSE_MAX_CTRL_TRACKERS 8
+static pulse_ctrl_tracker_t g_pulse_ctrl_trackers[PULSE_MAX_CTRL_TRACKERS];
 
 static pulse_app_state_t g_pulse_app_states[PULSE_MAX_RULES];
 static int g_npulse_app_states = 0;
@@ -3779,6 +3798,22 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     return 0;
 }
 
+static int pulse_get_cur_priority(pid_t pid, int32_t *prio_out) {
+    int count = 0;
+    memorystatus_priority_entry_t *list = get_list(&count);
+    if (!list) return -1;
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (list[i].pid == pid) {
+            if (prio_out) *prio_out = list[i].priority;
+            found = 1;
+            break;
+        }
+    }
+    free(list);
+    return found ? 0 : ESRCH;
+}
+
 static void *pulse_worker_thread(void *arg) {
     pulse_queue_entry_t *target = (pulse_queue_entry_t *)arg;
     if (!target) return NULL;
@@ -3858,7 +3893,8 @@ static void *pulse_worker_thread(void *arg) {
     const char *end_reason = "WINDOW_END";
     int should_restore = 1;
     int t_reach = -1;
-    (void)t_reach;
+    uint64_t fp15 = 0, fp30 = 0, fp60 = 0;
+    int has_fp15 = 0, has_fp30 = 0, has_fp60 = 0;
 
     for (int sec = 1; sec <= 60; sec++) {
         usleep(1000 * 1000);
@@ -3899,6 +3935,10 @@ static void *pulse_worker_thread(void *arg) {
             should_restore = 1;
             break;
         }
+
+        if (sec == 15) { fp15 = cur_fp; has_fp15 = 1; }
+        else if (sec == 30) { fp30 = cur_fp; has_fp30 = 1; }
+        else if (sec == 60) { fp60 = cur_fp; has_fp60 = 1; }
 
         JPLOG(JP_DEBUG, "t=%ds fp=%llu L=%llu (%.1f%%)",
               sec, (unsigned long long)cur_fp, (unsigned long long)L,
@@ -3944,8 +3984,72 @@ static void *pulse_worker_thread(void *arg) {
             pulse_do_restore(pid, bid, restore_verdict_str, sizeof(restore_verdict_str));
         }
     }
-    (void)end_reason;
-    (void)restore_verdict_str;
+
+    /* 提前结束 (TARGET_REACHED 或 ABORT) 时，restore 完成后继续只读采样到 60 秒 (C2-4 / Q4) */
+    if ((strcmp(end_reason, "TARGET_REACHED") == 0 || strcmp(end_reason, "ABORT") == 0) &&
+        t_reach > 0 && t_reach < 60 && !g_pulse_stop_requested) {
+        for (int sec = t_reach + 1; sec <= 60; sec++) {
+            usleep(1000 * 1000);
+            if (g_pulse_stop_requested) break;
+
+            proc_identity_t post_ident;
+            if (pulse_get_proc_identity(pid, &post_ident) != 0 ||
+                !pulse_compare_proc_identity(&ident, &post_ident)) {
+                break;
+            }
+
+            int32_t cur_prio = -1;
+            if (pulse_get_cur_priority(pid, &cur_prio) == 0 && cur_prio == 100) {
+                break; /* 采样期间回到前台，停止采样 */
+            }
+
+            uint64_t post_fp = 0;
+            if (pulse_get_footprint_mb(pid, &post_fp) != 0) {
+                break;
+            }
+
+            if (sec == 15) { fp15 = post_fp; has_fp15 = 1; }
+            else if (sec == 30) { fp30 = post_fp; has_fp30 = 1; }
+            else if (sec == 60) { fp60 = post_fp; has_fp60 = 1; }
+        }
+    }
+
+    /* 汇总行输出 (C2-4) */
+    char t_reach_str[32], fp15_str[32], fp30_str[32], fp60_str[32];
+    if (t_reach > 0) snprintf(t_reach_str, sizeof(t_reach_str), "%d", t_reach);
+    else snprintf(t_reach_str, sizeof(t_reach_str), "NA");
+
+    if (has_fp15) snprintf(fp15_str, sizeof(fp15_str), "%llu", (unsigned long long)fp15);
+    else snprintf(fp15_str, sizeof(fp15_str), "NA");
+
+    if (has_fp30) snprintf(fp30_str, sizeof(fp30_str), "%llu", (unsigned long long)fp30);
+    else snprintf(fp30_str, sizeof(fp30_str), "NA");
+
+    if (has_fp60) snprintf(fp60_str, sizeof(fp60_str), "%llu", (unsigned long long)fp60);
+    else snprintf(fp60_str, sizeof(fp60_str), "NA");
+
+    JPLOG(JP_INFO, "PULSE app=%s pid=%d fp0=%llu L=%llu t_reach=%s fp15=%s fp30=%s fp60=%s end=%s restore=%s",
+          bid, (int)pid, (unsigned long long)fp0, (unsigned long long)L,
+          t_reach_str, fp15_str, fp30_str, fp60_str, end_reason, restore_verdict_str);
+
+    /* 计次与状态更新 */
+    char today_str[16] = {0};
+    pulse_get_local_date_str(today_str, sizeof(today_str));
+    pulse_app_state_t *st = pulse_get_app_state(bid, today_str);
+    if (st) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        st->last_pulse_mono = ts.tv_sec;
+        st->day_count++;
+        st->total_pulses++;
+        if (has_fp60 && fp60 + 5 >= fp0) {
+            st->no_drop_pulses++;
+            if (st->total_pulses >= 2 && st->no_drop_pulses == st->total_pulses) {
+                st->unresponsive = 1;
+            }
+        }
+    }
+    g_pulse_global_today_count++;
 
 thread_done:
     g_pulse_in_progress = 0;
@@ -3968,6 +4072,58 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     pulse_check_date_reset(today_str);
 
     rst_ensure_app_procs(list, count);
+
+    /* 0. 推进对照组采样 (C2-4) */
+    for (int c = 0; c < PULSE_MAX_CTRL_TRACKERS; c++) {
+        pulse_ctrl_tracker_t *tr = &g_pulse_ctrl_trackers[c];
+        if (!tr->active) continue;
+
+        int found = 0;
+        int32_t pcur = -1;
+        for (int j = 0; j < s_napp_procs; j++) {
+            if (s_app_procs[j].pid == tr->pid) {
+                found = 1;
+                pcur = s_app_procs[j].priority;
+                break;
+            }
+        }
+
+        time_t dt = now_mono - tr->start_mono;
+        if (!found || pcur == 100 || pcur == 120) {
+            char s_fp15[32], s_fp30[32], s_fp60[32];
+            if (tr->has_fp15) snprintf(s_fp15, sizeof(s_fp15), "%llu", (unsigned long long)tr->fp15);
+            else snprintf(s_fp15, sizeof(s_fp15), "NA");
+            if (tr->has_fp30) snprintf(s_fp30, sizeof(s_fp30), "%llu", (unsigned long long)tr->fp30);
+            else snprintf(s_fp30, sizeof(s_fp30), "NA");
+            if (tr->has_fp60) snprintf(s_fp60, sizeof(s_fp60), "%llu", (unsigned long long)tr->fp60);
+            else snprintf(s_fp60, sizeof(s_fp60), "NA");
+
+            JPLOG(JP_INFO, "PULSE_SKIP_CTRL app=%s pid=%d fp0=%llu fp15=%s fp30=%s fp60=%s",
+                  tr->bid, (int)tr->pid, (unsigned long long)tr->fp0, s_fp15, s_fp30, s_fp60);
+            tr->active = 0;
+            continue;
+        }
+
+        uint64_t cur_fp = 0;
+        if (pulse_get_footprint_mb(tr->pid, &cur_fp) == 0) {
+            if (dt >= 15 && !tr->has_fp15) { tr->fp15 = cur_fp; tr->has_fp15 = 1; }
+            if (dt >= 30 && !tr->has_fp30) { tr->fp30 = cur_fp; tr->has_fp30 = 1; }
+            if (dt >= 60) {
+                tr->fp60 = cur_fp;
+                tr->has_fp60 = 1;
+                char s_fp15[32], s_fp30[32], s_fp60[32];
+                if (tr->has_fp15) snprintf(s_fp15, sizeof(s_fp15), "%llu", (unsigned long long)tr->fp15);
+                else snprintf(s_fp15, sizeof(s_fp15), "NA");
+                if (tr->has_fp30) snprintf(s_fp30, sizeof(s_fp30), "%llu", (unsigned long long)tr->fp30);
+                else snprintf(s_fp30, sizeof(s_fp30), "NA");
+                snprintf(s_fp60, sizeof(s_fp60), "%llu", (unsigned long long)tr->fp60);
+
+                JPLOG(JP_INFO, "PULSE_SKIP_CTRL app=%s pid=%d fp0=%llu fp15=%s fp30=%s fp60=%s",
+                      tr->bid, (int)tr->pid, (unsigned long long)tr->fp0, s_fp15, s_fp30, s_fp60);
+                tr->active = 0;
+            }
+        }
+    }
 
     /* 1. 维护队列：若队列中的 App 已回前台 (cur == 100)、处于 120 档或进程消失，移出队列 */
     for (int q = g_npulse_queue - 1; q >= 0; q--) {
@@ -4062,6 +4218,33 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 qe->pid = main_pid;
                 qe->fp_mb = cand_fp;
                 qe->enqueued_mono = now_mono;
+            }
+        } else if (skip_ctrl) {
+            /* 满足对照组启动条件：满足触发前置条件但因频控跳过，开始对照组采样 (C2-4) */
+            if (st->last_ctrl_start_mono == 0 || (now_mono - st->last_ctrl_start_mono >= 60)) {
+                int already_tracking = 0;
+                for (int c = 0; c < PULSE_MAX_CTRL_TRACKERS; c++) {
+                    if (g_pulse_ctrl_trackers[c].active && g_pulse_ctrl_trackers[c].pid == main_pid) {
+                        already_tracking = 1;
+                        break;
+                    }
+                }
+                if (!already_tracking) {
+                    for (int c = 0; c < PULSE_MAX_CTRL_TRACKERS; c++) {
+                        if (!g_pulse_ctrl_trackers[c].active) {
+                            pulse_ctrl_tracker_t *tr = &g_pulse_ctrl_trackers[c];
+                            tr->active = 1;
+                            rst_str_copy(tr->bid, sizeof(tr->bid), rule->bid);
+                            tr->pid = main_pid;
+                            tr->start_mono = now_mono;
+                            tr->fp0 = cand_fp;
+                            tr->fp15 = 0; tr->fp30 = 0; tr->fp60 = 0;
+                            tr->has_fp15 = 0; tr->has_fp30 = 0; tr->has_fp60 = 0;
+                            st->last_ctrl_start_mono = now_mono;
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
