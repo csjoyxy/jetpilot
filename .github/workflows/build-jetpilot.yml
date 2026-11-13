@@ -70,11 +70,29 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: JetPilot
-          path: src/JetPilot.tipa
+          path: |
+            src/JetPilot.tipa
+            src/JetPilot.tipa.verification
 
       # 打 tag（如 v0.1.1）并 push 后，自动把 .tipa 挂到对应 Release 下
-      - name: Attach to GitHub Release
+      - name: Check package verification status before release
         if: startsWith(github.ref, 'refs/tags/')
+        id: check_release
+        run: |
+          STATUS_FILE="src/JetPilot.tipa.verification"
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo "::error::Missing verification status file: $STATUS_FILE. Refusing to release unverified package."
+            echo "skip_release=true" >> $GITHUB_OUTPUT
+          elif grep -q "^STATUS: UNVERIFIED" "$STATUS_FILE"; then
+            echo "::error::Package signature verification failed (UNVERIFIED)! Refusing to attach to GitHub Release."
+            echo "skip_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "Package verification confirmed VERIFIED. Eligible for Release."
+            echo "skip_release=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') && steps.check_release.outputs.skip_release != 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: src/JetPilot.tipa
