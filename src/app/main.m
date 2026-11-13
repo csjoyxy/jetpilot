@@ -60,6 +60,11 @@ struct proc_bsdinfo {
 #endif
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 
+#ifndef PROC_PIDPATHINFO_MAXSIZE
+#define PROC_PIDPATHINFO_MAXSIZE (4 * 1024)
+#endif
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
 #ifndef JP_COMMIT
 #define JP_COMMIT "dev"
 #endif
@@ -5270,29 +5275,39 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 @property (nonatomic, assign) CFAbsoluteTime lastSpawnTime;
 @property (nonatomic, assign) BOOL migrationAttemptedThisSession;
 @property (nonatomic, strong) JPStatusInfo *lastLoadedStatus;
+@property (nonatomic, assign) BOOL restartInProgress;
 @end
+
+static BOOL s_restartInProgress = NO;
+
+static BOOL JPIsPidJetpilotd(pid_t pid) {
+    if (pid <= 0) return NO;
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    memset(path, 0, sizeof(path));
+    if (proc_pidpath(pid, path, sizeof(path)) <= 0) {
+        return NO;
+    }
+    const char *slash = strrchr(path, '/');
+    const char *name = slash ? slash + 1 : path;
+    return (strcmp(name, "jetpilotd") == 0);
+}
 
 static BOOL JPWaitForDaemonExit(pid_t pid) {
     if (pid <= 0) return YES;
     for (int attempts = 0; attempts < 300; attempts++) {
-        errno = 0;
-        struct proc_bsdinfo bi;
-        int rc = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi));
-        if (rc <= 0) {
-            if (errno == ESRCH) {
-                return YES;
-            }
-            // 非 ESRCH 失败时（如 mobile 查 root 进程权限未知）不得当作进程已走，
-            // 须用 pid 文件判断旧进程退出：旧守护进程退出时仅当 pid 文件里还是自己的 pid 才 unlink，
-            // 所以 pid 文件消失或内容变化即说明旧进程已走。
-            NSString *curPidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
-            if (curPidStr == nil) {
-                return YES;
-            }
-            NSString *trimmed = [curPidStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            if (trimmed.length == 0 || trimmed.intValue != pid) {
-                return YES;
-            }
+        if (!JPIsPidJetpilotd(pid)) {
+            return YES;
+        }
+        // 非 ESRCH/proc_pidpath 失败时（如 mobile 查 root 进程权限未知）不得当作进程已走，
+        // 须用 pid 文件判断旧进程退出：旧守护进程退出时仅当 pid 文件里还是自己的 pid 才 unlink，
+        // 所以 pid 文件消失或内容变化即说明旧进程已走。
+        NSString *curPidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
+        if (curPidStr == nil) {
+            return YES;
+        }
+        NSString *trimmed = [curPidStr stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length == 0 || trimmed.intValue != pid) {
+            return YES;
         }
         usleep(100000);
     }
@@ -6136,17 +6151,28 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 }
 
 - (void)restartDaemon {
+    if (self.restartInProgress || s_restartInProgress) return;
+    self.restartInProgress = YES;
+    s_restartInProgress = YES;
+    self.versionWarningBanner.enabled = NO;
+
     [self stopDaemon];
     NSString *pidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
     pid_t pid = (pid_t)[pidStr intValue];
-    if (pid > 0) {
+    if (pid > 0 && JPIsPidJetpilotd(pid)) {
         kill(pid, SIGTERM);
+    } else {
+        [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
+        pid = 0;
     }
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         if (!JPWaitForDaemonExit(pid)) {
             [@"run" writeToFile:kFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
             dispatch_async(dispatch_get_main_queue(), ^{
+                weakSelf.restartInProgress = NO;
+                s_restartInProgress = NO;
+                weakSelf.versionWarningBanner.enabled = YES;
                 [weakSelf refreshStatus];
                 UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重启失败"
                                                                                message:@"旧守护进程未退出，请稍后再试"
@@ -6158,6 +6184,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         }
         [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
         dispatch_async(dispatch_get_main_queue(), ^{
+            weakSelf.restartInProgress = NO;
+            s_restartInProgress = NO;
+            weakSelf.versionWarningBanner.enabled = YES;
             [weakSelf startDaemon];
         });
     });
@@ -9780,6 +9809,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 @property (nonatomic, assign) CFAbsoluteTime lastSpawnTime;
 @property (nonatomic, assign) BOOL restartSupport;
 @property (nonatomic, assign) BOOL pulseSupport;
+@property (nonatomic, assign) BOOL restartInProgress;
 @end
 
 @implementation JPRestartViewController
@@ -10398,17 +10428,28 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 }
 
 - (void)restartDaemon {
+    if (self.restartInProgress || s_restartInProgress) return;
+    self.restartInProgress = YES;
+    s_restartInProgress = YES;
+    self.versionWarningBanner.enabled = NO;
+
     [JPDaemonManager stopDaemon];
     NSString *pidStr = [NSString stringWithContentsOfFile:kPidFile encoding:NSUTF8StringEncoding error:nil];
     pid_t pid = (pid_t)[pidStr intValue];
-    if (pid > 0) {
+    if (pid > 0 && JPIsPidJetpilotd(pid)) {
         kill(pid, SIGTERM);
+    } else {
+        [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
+        pid = 0;
     }
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         if (!JPWaitForDaemonExit(pid)) {
             [@"run" writeToFile:kFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
             dispatch_async(dispatch_get_main_queue(), ^{
+                weakSelf.restartInProgress = NO;
+                s_restartInProgress = NO;
+                weakSelf.versionWarningBanner.enabled = YES;
                 [weakSelf refreshStatus];
                 UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重启失败"
                                                                                message:@"旧守护进程未退出，请稍后再试"
@@ -10420,6 +10461,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         }
         [NSFileManager.defaultManager removeItemAtPath:kPidFile error:nil];
         dispatch_async(dispatch_get_main_queue(), ^{
+            weakSelf.restartInProgress = NO;
+            s_restartInProgress = NO;
+            weakSelf.versionWarningBanner.enabled = YES;
             [weakSelf startDaemon];
         });
     });

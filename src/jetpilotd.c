@@ -3777,31 +3777,31 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
 
     char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
     if (proc_pidpath(pid, path, sizeof(path)) <= 0 || !pulse_is_supported_app(pid, path, bid)) {
-        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=validate");
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=validate");
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=validate", bid, (int)pid);
         return 1;
     }
 
     uint64_t fp_mb = 0;
     int fp_err = pulse_get_footprint_mb(pid, &fp_mb);
     if (fp_err != 0) {
-        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=fp_unreadable");
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=fp_unreadable");
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=fp_unreadable", bid, (int)pid);
         return 1;
     }
 
     proc_identity_t ident;
     if (pulse_get_proc_identity(pid, &ident) != 0) {
-        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=ident");
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=ident", bid, (int)pid);
         return 1;
     }
 
     memorystatus_memlimit_properties_t cur_props;
     int cur_err = pulse_get_memlimit_props(pid, &cur_props);
     if (cur_err != 0) {
-        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=get");
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=get");
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=get", bid, (int)pid);
         return 1;
     }
 
@@ -3835,8 +3835,8 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
         uint64_t floor_1_2 = calc_restore_floor(fp_mb);
         if (cur_props.memlimit_active <= 0 ||
             (uint64_t)cur_props.memlimit_active <= floor_1_2) {
-            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=active_low");
-            JPLOG(JP_INFO, "RESTORE_REFUSED reason=active_low");
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
+            JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=active_low", bid, (int)pid);
             return 1;
         }
         target_inactive = cur_props.memlimit_active;
@@ -3911,17 +3911,17 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (!success) {
         if (!write_attempted) {
             const char *refused_reason = ident_failed ? "ident" : (get_failed ? "get" : "ident");
-            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=%s", refused_reason);
-            JPLOG(JP_INFO, "RESTORE_REFUSED reason=%s", refused_reason);
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
+            JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=%s", bid, (int)pid, refused_reason);
             return 1;
         }
         if (readback_mismatch) {
-            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED reason=readback");
-            JPLOG(JP_INFO, "RESTORE_FAILED reason=readback");
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED");
+            JPLOG(JP_INFO, "RESTORE_FAILED app=%s pid=%d reason=readback", bid, (int)pid);
             return 1;
         } else {
-            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED reason=retry");
-            JPLOG(JP_INFO, "RESTORE_FAILED reason=retry");
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED");
+            JPLOG(JP_INFO, "RESTORE_FAILED app=%s pid=%d reason=retry", bid, (int)pid);
             return 1;
         }
     }
@@ -3929,13 +3929,13 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     pulse_clear_state_file(pid);
 
     if (mirror_reason != NULL) {
-        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_MIRROR reason=%s", mirror_reason);
-        JPLOG(JP_INFO, "RESTORE_MIRROR reason=%s", mirror_reason);
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_MIRROR");
+        JPLOG(JP_INFO, "RESTORE_MIRROR app=%s pid=%d reason=%s", bid, (int)pid, mirror_reason);
         return 0;
     }
 
     if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_OK");
-    JPLOG(JP_INFO, "RESTORE_OK");
+    JPLOG(JP_INFO, "RESTORE_OK app=%s pid=%d", bid, (int)pid);
     return 0;
 }
 
@@ -4080,7 +4080,7 @@ static void *pulse_worker_thread(void *arg) {
 
     proc_identity_t ident;
     if (pulse_get_proc_identity(pid, &ident) != 0) {
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=ident", bid, (int)pid);
         goto thread_done;
     }
 
@@ -4088,13 +4088,13 @@ static void *pulse_worker_thread(void *arg) {
     int state_rc = pulse_get_or_record_initial_state(pid, &ident, bid, &state);
     if (state_rc != 0) {
         const char *ref_reason = (state_rc == -1) ? "get" : "state";
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=%s", ref_reason);
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=%s", bid, (int)pid, ref_reason);
         goto thread_done;
     }
 
     uint64_t fp0 = 0;
     if (pulse_get_footprint_mb(pid, &fp0) != 0) {
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=fp_unreadable");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=fp_unreadable", bid, (int)pid);
         pulse_clear_state_file(pid);
         goto thread_done;
     }
@@ -4105,7 +4105,7 @@ static void *pulse_worker_thread(void *arg) {
 
     memorystatus_memlimit_properties_t cur_props;
     if (pulse_get_memlimit_props(pid, &cur_props) != 0) {
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=get");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=get", bid, (int)pid);
         pulse_clear_state_file(pid);
         goto thread_done;
     }
@@ -4116,13 +4116,13 @@ static void *pulse_worker_thread(void *arg) {
 
     proc_identity_t check_ident;
     if (pulse_get_proc_identity(pid, &check_ident) != 0 || !pulse_compare_proc_identity(&ident, &check_ident)) {
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=ident", bid, (int)pid);
         pulse_clear_state_file(pid);
         goto thread_done;
     }
 
     if (pulse_set_memlimit_props(pid, &new_props) != 0) {
-        JPLOG(JP_INFO, "RESTORE_REFUSED reason=set");
+        JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=set", bid, (int)pid);
         pulse_clear_state_file(pid);
         goto thread_done;
     }
@@ -4172,7 +4172,7 @@ static void *pulse_worker_thread(void *arg) {
         if (pulse_get_proc_identity(pid, &loop_ident) != 0) {
             struct proc_bsdinfo bi;
             if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != sizeof(bi)) {
-                JPLOG(JP_INFO, "PULSE_GONE L=%llu t=%d", (unsigned long long)L, sec);
+                JPLOG(JP_INFO, "PULSE_GONE app=%s pid=%d", bid, (int)pid);
                 end_reason = "GONE";
                 should_restore = 0;
                 break;
@@ -4202,7 +4202,7 @@ static void *pulse_worker_thread(void *arg) {
         if (rerr != 0) {
             struct proc_bsdinfo bi;
             if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != sizeof(bi)) {
-                JPLOG(JP_INFO, "PULSE_GONE L=%llu t=%d", (unsigned long long)L, sec);
+                JPLOG(JP_INFO, "PULSE_GONE app=%s pid=%d", bid, (int)pid);
                 end_reason = "GONE";
                 should_restore = 0;
                 break;
@@ -4400,7 +4400,6 @@ thread_done:
 typedef struct {
     char     bid[128];
     pid_t    pid;
-    uint64_t fp0;
 } pulse_ctrl_arg_t;
 
 /* 对照组异步只读采样线程 (M5 / Q2)
@@ -4412,12 +4411,22 @@ static void *pulse_ctrl_worker_thread(void *arg) {
     pid_t pid = carg->pid;
     char bid[128];
     rst_str_copy(bid, sizeof(bid), carg->bid);
-    uint64_t fp0 = carg->fp0;
     free(carg);
+
+    /* 对照线程开始时现读 fp0；读失败就放弃这组、不记录 (C2F2-N1) */
+    uint64_t fp0 = 0;
+    if (pulse_get_footprint_mb(pid, &fp0) != 0) {
+        g_pulse_in_progress = 0;
+        g_pulse_current_pid = 0;
+        g_pulse_current_bid[0] = '\0';
+        g_pulse_thread_running = 0;
+        return NULL;
+    }
 
     uint64_t fp15 = 0, fp30 = 0, fp60 = 0;
     int has_fp15 = 0, has_fp30 = 0, has_fp60 = 0;
 
+    /* 两组都从这一刻开始计时 (C2F2-N1) */
     struct timespec t_start;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
@@ -4700,7 +4709,6 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         if (carg) {
             rst_str_copy(carg->bid, sizeof(carg->bid), best_ctrl_bid);
             carg->pid = best_ctrl_pid;
-            carg->fp0 = best_ctrl_fp;
 
             g_pulse_in_progress = 1;
             g_pulse_current_pid = best_ctrl_pid;
