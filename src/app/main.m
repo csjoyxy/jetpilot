@@ -1135,7 +1135,7 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
 - (BOOL)saveToPath:(NSString *)path error:(NSError **)error;
 - (JPRestartRule *)ruleForBundleId:(NSString *)bid;
 - (void)setRule:(JPRestartRule *)rule forBundleId:(NSString *)bid;
-- (void)removeRuleForBundleId:(NSString *)bid;
+- (JPRestartLine *)lineForRule:(JPRestartRule *)rule;
 - (void)removeLine:(JPRestartLine *)line;
 - (void)updateDuplicateRules;
 + (NSDictionary<NSString *, NSNumber *> *)loadAll7DayRestartCounts;
@@ -1374,25 +1374,25 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
     [self updateDuplicateRules];
 }
 
-- (void)removeRuleForBundleId:(NSString *)bid {
-    if (bid.length == 0) return;
-    NSMutableArray<JPRestartLine *> *linesToRemove = [NSMutableArray array];
-    NSMutableArray<JPRestartRule *> *rulesToRemove = [NSMutableArray array];
+- (JPRestartLine *)lineForRule:(JPRestartRule *)rule {
+    if (!rule) return nil;
+
+    // 1. 在 self.lines 里找 l.rule == rule 的行（按对象指针）
     for (JPRestartLine *l in self.lines) {
-        if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:bid]) {
-            [linesToRemove addObject:l];
-            if (l.rule) [rulesToRemove addObject:l.rule];
+        if (!l.isUnknownOrComment && l.rule == rule) {
+            return l;
         }
     }
-    [self.lines removeObjectsInArray:linesToRemove];
-    [self.rules removeObjectsInArray:rulesToRemove];
-    for (NSUInteger i = 0; i < self.lines.count; i++) {
-        JPRestartLine *l = self.lines[i];
-        if (!l.isUnknownOrComment && l.rule) {
-            l.rule.lineIndex = (NSInteger)i;
+
+    // 2. 找不到时，按 rule.lineIndex 取那一行，并核对 bid 一致
+    if (rule.lineIndex >= 0 && (NSUInteger)rule.lineIndex < self.lines.count) {
+        JPRestartLine *l = self.lines[(NSUInteger)rule.lineIndex];
+        if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:rule.bid]) {
+            return l;
         }
     }
-    [self updateDuplicateRules];
+
+    return nil;
 }
 
 - (void)removeLine:(JPRestartLine *)line {
@@ -8359,9 +8359,14 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             ok = [strongSelf.delegate restartRuleEditViewControllerDidDelete:strongSelf.rule error:&error];
         }
         if (!ok) {
-            NSString *errMsg = error ? error.localizedDescription : @"未知错误";
-            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"删除配置失败"
-                                                                             message:[NSString stringWithFormat:@"写入 restart.txt 失败：%@", errMsg]
+            NSString *title = @"删除配置失败";
+            NSString *msg = [NSString stringWithFormat:@"写入 restart.txt 失败：%@", error ? error.localizedDescription : @"未知错误"];
+            if ([error.domain isEqualToString:@"JetPilot"] && error.code == 1001) {
+                title = @"提示";
+                msg = error.localizedDescription;
+            }
+            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:title
+                                                                             message:msg
                                                                       preferredStyle:UIAlertControllerStyleAlert];
             [errAlert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -8971,7 +8976,16 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 }
 
 - (void)deleteRule:(JPRestartRule *)rule {
-    [self.config removeRuleForBundleId:rule.bid];
+    JPRestartLine *line = [self.config lineForRule:rule];
+    if (!line) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
+                                                                       message:@"规则已变化，请刷新后重试"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    [self.config removeLine:line];
     [self saveConfig];
     [self rebuildRulesCards];
 }
@@ -9028,7 +9042,16 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
 }
 
 - (BOOL)restartRuleEditViewControllerDidDelete:(JPRestartRule *)rule error:(NSError **)error {
-    [self.config removeRuleForBundleId:rule.bid];
+    JPRestartLine *line = [self.config lineForRule:rule];
+    if (!line) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"JetPilot"
+                                         code:1001
+                                     userInfo:@{NSLocalizedDescriptionKey: @"规则已变化，请刷新后重试"}];
+        }
+        return NO;
+    }
+    [self.config removeLine:line];
     return [self saveConfigWithError:error];
 }
 
