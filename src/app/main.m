@@ -8250,7 +8250,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         label.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
         label.numberOfLines = 0;
         label.textColor = UIColor.secondaryLabelColor;
-        label.text = @"后台等待时间：切后台满这么多秒后释放一次；回前台前不会再动。\n目标内存：当进入后台且物理内存达到此值时尝试释放。";
+        label.text = [NSString stringWithFormat:@"后台等待时间：切到后台大约 %ld 秒后释放一次（可能提前几秒）；回前台以前不会再动。\n目标内存：当进入后台且物理内存达到此值时尝试释放。", (long)self.currentDelay];
         [footer addSubview:label];
         [NSLayoutConstraint activateConstraints:@[
             [label.topAnchor constraintEqualToAnchor:footer.topAnchor constant:6],

@@ -1068,10 +1068,12 @@ static void write_status(int protected_now, int demoted_pids,
     g_last_write = now.tv_sec;
 }
 
-static int g_locked = 0;
+static volatile sig_atomic_t g_locked = 0;
 static int g_lock_token = -1;
 static int g_lock_fd = -1;
 
+/* 规则：lock_refresh() 只允许在 lockmon_init() 和 wait_lock_change() 里调用，
+ * 别处一律不得调用。其余代码，不论哪个线程，都只读 g_locked。 */
 static void lock_refresh(void) {
     uint64_t st = 0;
     if (g_lock_token >= 0 &&
@@ -3310,6 +3312,8 @@ typedef struct {
     pid_t   tracked_pid;
     int     in_bg;              /* 1: 当前处于 0..95 档 */
     time_t  bg_start_mono;      /* 进入 0..95 档的单调时间 (秒) */
+    time_t  last_fg_seen_mono;  /* 上次在前台(100档)看到的单调时间 (秒) (D1-a) */
+    time_t  bg_lag;             /* 切后台时的估计延迟秒数，src=now 时为 -1 (NA) (D1-a) */
     time_t  last_pulse_mono;    /* 上次完成 pulse 的单调时间 (秒) */
     time_t  last_ctrl_start_mono; /* 上次启动对照组采样的单调时间 (秒) */
     int     pulsed_this_bg;     /* 1: 本次进入后台期间已触发过 pulse (每次进入后台最多 1 次) */
@@ -3396,6 +3400,7 @@ static pulse_app_state_t *pulse_get_app_state(const char *bid, const char *today
     if (g_npulse_app_states < PULSE_MAX_RULES) {
         pulse_app_state_t *st = &g_pulse_app_states[g_npulse_app_states++];
         memset(st, 0, sizeof(*st));
+        st->bg_lag = -1;
         rst_str_copy(st->bid, sizeof(st->bid), bid);
         snprintf(st->day_date, sizeof(st->day_date), "%s", today_str);
         return st;
@@ -3457,11 +3462,11 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
         }
     }
 
-    /* 截止时间检查 (Place 1 入队前检查)：bg_start + 25 秒之前才能真正开始 (C2-T) */
+    /* 截止时间检查 (Place 1 入队前检查)：bg_start + 25 秒之前才能真正开始 (C2-T / D1-a) */
     if (elapsed_sec >= PULSE_DEADLINE_BG_SEC) {
         if (!st->pulse_late_this_bg) {
             st->pulse_late_this_bg = 1;
-            JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld", rule->bid, (int)pid, (long)elapsed_sec);
+            JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld locked=%d", rule->bid, (int)pid, (long)elapsed_sec, g_locked);
         }
         return 0;
     }
@@ -3526,7 +3531,7 @@ static int pulse_revalidate_conditions(pid_t pid, const char *bid, uint64_t *out
         return 0;
     }
 
-    /* 截止时间检查 (Place 2 出队复核)：bg_start + 25 秒之前才能真正开始 (C2-T) */
+    /* 截止时间检查 (Place 2 出队复核)：bg_start + 25 秒之前才能真正开始 (C2-T / D1-a) */
     if (!st->in_bg || st->tracked_pid != pid || st->bg_start_mono <= 0) {
         pthread_mutex_unlock(&s_pulse_mutex);
         return 0;
@@ -3535,7 +3540,7 @@ static int pulse_revalidate_conditions(pid_t pid, const char *bid, uint64_t *out
     if (elapsed_sec >= PULSE_DEADLINE_BG_SEC) {
         if (!st->pulse_late_this_bg) {
             st->pulse_late_this_bg = 1;
-            JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld", bid, (int)pid, (long)elapsed_sec);
+            JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld locked=%d", bid, (int)pid, (long)elapsed_sec, g_locked);
         }
         pthread_mutex_unlock(&s_pulse_mutex);
         return 0;
@@ -3567,6 +3572,8 @@ typedef struct {
     pid_t    pid;
     uint64_t fp_mb;
     time_t   enqueued_mono;
+    time_t   bg_lag;
+    int      locked;
 } pulse_queue_entry_t;
 
 #define PULSE_MAX_QUEUE 32
@@ -4227,8 +4234,9 @@ static void *pulse_worker_thread(void *arg) {
 
     pid_t pid = target->pid;
     const char *bid = target->bid;
+    int was_locked = target->locked;
 
-    /* 截止时间检查 (Place 3 worker 开头)：bg_start + 25 秒之前才能真正开始 (C2-T) */
+    /* 截止时间检查 (Place 3 worker 开头)：bg_start + 25 秒之前才能真正开始 (C2-T / D1-a) */
     char today_str[16] = {0};
     pulse_get_local_date_str(today_str, sizeof(today_str));
 
@@ -4246,7 +4254,7 @@ static void *pulse_worker_thread(void *arg) {
     if (elapsed_start >= PULSE_DEADLINE_BG_SEC) {
         if (!st_init->pulse_late_this_bg) {
             st_init->pulse_late_this_bg = 1;
-            JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld", bid, (int)pid, (long)elapsed_start);
+            JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld locked=%d", bid, (int)pid, (long)elapsed_start, g_locked);
         }
         pthread_mutex_unlock(&s_pulse_mutex);
         goto thread_done;
@@ -4346,6 +4354,7 @@ static void *pulse_worker_thread(void *arg) {
 
     for (int sec = 1; sec <= 60; sec++) {
         usleep(1000 * 1000);
+        if (g_locked) was_locked = 1;
 
         if (g_pulse_stop_requested) {
             end_reason = "WINDOW_END";
@@ -4529,8 +4538,8 @@ static void *pulse_worker_thread(void *arg) {
         }
     }
 
-    /* 汇总行输出 (C2-4 / M1) */
-    char t_reach_str[32], fp15_str[32], fp30_str[32], fp60_str[32], cpu_ms_str[32];
+    /* 汇总行输出 (C2-4 / M1 / D1-a) */
+    char t_reach_str[32], fp15_str[32], fp30_str[32], fp60_str[32], cpu_ms_str[32], bg_lag_str[32];
     if (t_reach > 0) snprintf(t_reach_str, sizeof(t_reach_str), "%d", t_reach);
     else snprintf(t_reach_str, sizeof(t_reach_str), "NA");
 
@@ -4546,9 +4555,15 @@ static void *pulse_worker_thread(void *arg) {
     if (cpu_calc_ok) snprintf(cpu_ms_str, sizeof(cpu_ms_str), "%llu", (unsigned long long)cpu_ms);
     else snprintf(cpu_ms_str, sizeof(cpu_ms_str), "NA");
 
-    JPLOG(JP_INFO, "PULSE app=%s pid=%d fp0=%llu L=%llu t_reach=%s fp15=%s fp30=%s fp60=%s cpu_ms=%s end=%s restore=%s",
+    if (target->bg_lag >= 0) snprintf(bg_lag_str, sizeof(bg_lag_str), "%ld", (long)target->bg_lag);
+    else snprintf(bg_lag_str, sizeof(bg_lag_str), "NA");
+
+    if (g_locked) was_locked = 1;
+
+    JPLOG(JP_INFO, "PULSE app=%s pid=%d fp0=%llu L=%llu t_reach=%s fp15=%s fp30=%s fp60=%s cpu_ms=%s end=%s restore=%s bg_lag=%s locked=%d",
           bid, (int)pid, (unsigned long long)fp0, (unsigned long long)L,
-          t_reach_str, fp15_str, fp30_str, fp60_str, cpu_ms_str, end_reason, restore_verdict_str);
+          t_reach_str, fp15_str, fp30_str, fp60_str, cpu_ms_str, end_reason, restore_verdict_str,
+          bg_lag_str, was_locked);
 
     /* 计次与状态更新 (M6: 持锁保护) */
     pulse_get_local_date_str(today_str, sizeof(today_str));
@@ -4610,6 +4625,8 @@ thread_done:
 typedef struct {
     char     bid[128];
     pid_t    pid;
+    time_t   bg_lag;
+    int      locked;
 } pulse_ctrl_arg_t;
 
 /* 对照组异步只读采样线程 (M5 / Q2)
@@ -4621,9 +4638,11 @@ static void *pulse_ctrl_worker_thread(void *arg) {
     pid_t pid = carg->pid;
     char bid[128];
     rst_str_copy(bid, sizeof(bid), carg->bid);
+    time_t carg_bg_lag = carg->bg_lag;
+    int was_locked = carg->locked;
     free(carg);
 
-    /* 截止时间检查 (对照组同等截止时间：bg_start + 25 秒之前才能开始采样) (C2-T) */
+    /* 截止时间检查 (对照组同等截止时间：bg_start + 25 秒之前才能开始采样) (C2-T / D1-a) */
     char today_str[16] = {0};
     pulse_get_local_date_str(today_str, sizeof(today_str));
 
@@ -4641,7 +4660,7 @@ static void *pulse_ctrl_worker_thread(void *arg) {
     if (elapsed_ctrl >= PULSE_DEADLINE_BG_SEC) {
         if (!st_ctrl_chk->pulse_late_this_bg) {
             st_ctrl_chk->pulse_late_this_bg = 1;
-            JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld", bid, (int)pid, (long)elapsed_ctrl);
+            JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld locked=%d", bid, (int)pid, (long)elapsed_ctrl, g_locked);
         }
         pthread_mutex_unlock(&s_pulse_mutex);
         goto ctrl_done;
@@ -4667,6 +4686,7 @@ static void *pulse_ctrl_worker_thread(void *arg) {
 
     for (int sec = 1; sec <= 60; sec++) {
         usleep(1000 * 1000);
+        if (g_locked) was_locked = 1;
         if (g_got_sigterm || g_pulse_stop_requested) break;
 
         struct proc_bsdinfo bi;
@@ -4702,7 +4722,7 @@ static void *pulse_ctrl_worker_thread(void *arg) {
         ctrl_cpu_calc_ok = 1;
     }
 
-    char s_fp15[32], s_fp30[32], s_fp60[32], s_ctrl_cpu_ms[32];
+    char s_fp15[32], s_fp30[32], s_fp60[32], s_ctrl_cpu_ms[32], s_bg_lag[32];
     if (has_fp15) snprintf(s_fp15, sizeof(s_fp15), "%llu", (unsigned long long)fp15);
     else snprintf(s_fp15, sizeof(s_fp15), "NA");
 
@@ -4715,8 +4735,14 @@ static void *pulse_ctrl_worker_thread(void *arg) {
     if (ctrl_cpu_calc_ok) snprintf(s_ctrl_cpu_ms, sizeof(s_ctrl_cpu_ms), "%llu", (unsigned long long)ctrl_cpu_ms);
     else snprintf(s_ctrl_cpu_ms, sizeof(s_ctrl_cpu_ms), "NA");
 
-    JPLOG(JP_INFO, "PULSE_SKIP_CTRL app=%s pid=%d fp0=%llu fp15=%s fp30=%s fp60=%s cpu_ms=%s",
-          bid, (int)pid, (unsigned long long)fp0, s_fp15, s_fp30, s_fp60, s_ctrl_cpu_ms);
+    if (carg_bg_lag >= 0) snprintf(s_bg_lag, sizeof(s_bg_lag), "%ld", (long)carg_bg_lag);
+    else snprintf(s_bg_lag, sizeof(s_bg_lag), "NA");
+
+    if (g_locked) was_locked = 1;
+
+    JPLOG(JP_INFO, "PULSE_SKIP_CTRL app=%s pid=%d fp0=%llu fp15=%s fp30=%s fp60=%s cpu_ms=%s bg_lag=%s locked=%d",
+          bid, (int)pid, (unsigned long long)fp0, s_fp15, s_fp30, s_fp60, s_ctrl_cpu_ms,
+          s_bg_lag, was_locked);
 
     pthread_mutex_lock(&s_pulse_mutex);
     pulse_app_state_t *st = pulse_get_app_state(bid, today_str);
@@ -4775,6 +4801,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     pid_t best_ctrl_pid = 0;
     char best_ctrl_bid[128] = {0};
     uint64_t best_ctrl_fp = 0;
+    time_t best_ctrl_lag = -1;
 
     /* 1. 维护队列：若队列中的 App 已回前台 (cur == 100)、处于 120 档或进程消失，移出队列 */
     for (int q = g_npulse_queue - 1; q >= 0; q--) {
@@ -4822,16 +4849,20 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->tracked_pid = 0;
             st->in_bg = 0;
             st->bg_start_mono = 0;
+            st->last_fg_seen_mono = 0;
+            st->bg_lag = -1;
             st->pulsed_this_bg = 0;
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
             continue;
         }
 
-        /* 档位状态推进与 delay 计时 (Q2 / delay 裁定) */
+        /* 档位状态推进与 delay 计时 (Q2 / delay 裁定 / D1-a) */
         if (main_cur == 100) {
             st->in_bg = 0;
             st->bg_start_mono = 0;
+            st->last_fg_seen_mono = now_mono;
+            st->bg_lag = -1;
             st->pulsed_this_bg = 0;
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
@@ -4839,6 +4870,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         } else if (main_cur == 120) {
             st->in_bg = 0;
             st->bg_start_mono = 0;
+            st->last_fg_seen_mono = 0;
+            st->bg_lag = -1;
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
             st->tracked_pid = main_pid;
@@ -4847,18 +4880,31 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 st->tracked_pid = main_pid;
                 st->in_bg = 1;
                 st->bg_start_mono = now_mono;
+                st->last_fg_seen_mono = 0;
+                st->bg_lag = -1;
                 st->pulsed_this_bg = 0;
                 st->ctrl_this_bg = 0;
                 st->pulse_late_this_bg = 0;
+                JPLOG(JP_INFO, "PULSE_BG_EST app=%s src=now", rule->bid);
             } else if (!st->in_bg || st->bg_start_mono == 0) {
                 st->in_bg = 1;
-                st->bg_start_mono = now_mono;
                 st->pulse_late_this_bg = 0;
+                if (st->last_fg_seen_mono > 0 && (now_mono - st->last_fg_seen_mono) <= 15) {
+                    st->bg_start_mono = st->last_fg_seen_mono;
+                    st->bg_lag = now_mono - st->last_fg_seen_mono;
+                    JPLOG(JP_INFO, "PULSE_BG_EST app=%s src=fg lag=%ld", rule->bid, (long)st->bg_lag);
+                } else {
+                    st->bg_start_mono = now_mono;
+                    st->bg_lag = -1;
+                    JPLOG(JP_INFO, "PULSE_BG_EST app=%s src=now", rule->bid);
+                }
             }
         } else {
             /* 其他值一律不处理：不在 0..95 档，不累计进入后台 delay 计时 (M3) */
             st->in_bg = 0;
             st->bg_start_mono = 0;
+            st->last_fg_seen_mono = 0;
+            st->bg_lag = -1;
             st->pulse_late_this_bg = 0;
             st->tracked_pid = main_pid;
         }
@@ -4885,6 +4931,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 qe->pid = main_pid;
                 qe->fp_mb = cand_fp;
                 qe->enqueued_mono = now_mono;
+                qe->bg_lag = st->bg_lag;
+                qe->locked = g_locked;
             }
         } else if (skip_ctrl) {
             /* 满 delay 时因 n 或 daymax 跳过，记录对照组候选 (M5 / Q2) */
@@ -4892,6 +4940,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 best_ctrl_pid = main_pid;
                 rst_str_copy(best_ctrl_bid, sizeof(best_ctrl_bid), rule->bid);
                 best_ctrl_fp = cand_fp;
+                best_ctrl_lag = st->bg_lag;
             }
         }
     }
@@ -4962,6 +5011,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         if (carg) {
             rst_str_copy(carg->bid, sizeof(carg->bid), best_ctrl_bid);
             carg->pid = best_ctrl_pid;
+            carg->bg_lag = best_ctrl_lag;
+            carg->locked = g_locked;
 
             g_pulse_in_progress = 1;
             g_pulse_current_pid = best_ctrl_pid;
