@@ -1247,6 +1247,47 @@ typedef struct {
     int32_t delay_min;      /* 1..60 */
 } pulse_rule_t;
 
+#ifndef MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES
+#define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES  7
+#endif
+#ifndef MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES
+#define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES  8
+#endif
+#ifndef MEMORYSTATUS_MEMLIMIT_ATTR_FATAL
+#define MEMORYSTATUS_MEMLIMIT_ATTR_FATAL          0x1
+#endif
+
+typedef struct memorystatus_memlimit_properties {
+    int32_t  memlimit_active;        /* 前台限额 MB */
+    uint32_t memlimit_active_attr;   /* 前台属性 (0x1=FATAL) */
+    int32_t  memlimit_inactive;      /* 后台限额 MB */
+    uint32_t memlimit_inactive_attr; /* 后台属性 (0x1=FATAL) */
+} memorystatus_memlimit_properties_t;
+
+_Static_assert(sizeof(memorystatus_memlimit_properties_t) == 16,
+               "memorystatus_memlimit_properties_t layout mismatch");
+
+typedef struct {
+    pid_t    pid;
+    uint64_t uniqueid;
+    uint64_t start_sec;
+    uint64_t start_usec;
+    char     path[PROC_PIDPATHINFO_MAXSIZE];
+} proc_identity_t;
+
+typedef struct {
+    pid_t    pid;
+    uint64_t start_sec;
+    uint64_t start_usec;
+    uint64_t uniqueid;
+    char     path[PROC_PIDPATHINFO_MAXSIZE];
+    int32_t  orig_active;
+    uint32_t orig_active_attr;
+    int32_t  orig_inactive;
+    uint32_t orig_inactive_attr;
+    int      suspect;
+} pulse_saved_state_t;
+
 static pulse_rule_t g_pulse_rules[PULSE_MAX_RULES];
 static int g_npulse_rules = 0;
 static int g_pulse_cfg_file_absent = 1;
@@ -3323,12 +3364,590 @@ static void pulse_sort_queue(void) {
     }
 }
 
+/* =========================================================================
+ * 后台内存释放：Pulse 写入、回读校验与统一 Restore 实现 (v0.7.8 C2-3)
+ * ========================================================================= */
+static inline uint64_t calc_hard_guard_limit(uint64_t fp_mb) {
+    return (fp_mb * 11 + 9) / 10;   /* ceil(fp * 1.1) */
+}
+
+static inline uint64_t calc_pulse_limit(uint64_t fp_mb) {
+    return (fp_mb * 100 + 84) / 85; /* ceil(fp / 0.85) */
+}
+
+static inline uint64_t calc_restore_floor(uint64_t fp_mb) {
+    return (fp_mb * 12 + 9) / 10;   /* ceil(fp * 1.2) */
+}
+
+static int pulse_get_proc_identity(pid_t pid, proc_identity_t *ident) {
+    if (!ident || pid <= 0) return -1;
+    memset(ident, 0, sizeof(*ident));
+    ident->pid = pid;
+
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    memset(path, 0, sizeof(path));
+    if (proc_pidpath(pid, path, sizeof(path)) <= 0) {
+        return -1;
+    }
+    snprintf(ident->path, sizeof(ident->path), "%s", path);
+
+    struct proc_bsdinfo bsdinfo;
+    memset(&bsdinfo, 0, sizeof(bsdinfo));
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdinfo, sizeof(bsdinfo)) == sizeof(bsdinfo)) {
+        ident->uniqueid = bsdinfo.pbi_uniqueid;
+        ident->start_sec = bsdinfo.pbi_start_tvsec;
+        ident->start_usec = bsdinfo.pbi_start_tvusec;
+        return 0;
+    }
+    return -1;
+}
+
+static int pulse_compare_proc_identity(const proc_identity_t *a, const proc_identity_t *b) {
+    if (!a || !b) return 0;
+    if (a->pid != b->pid) return 0;
+    if (a->uniqueid != 0 && b->uniqueid != 0 && a->uniqueid != b->uniqueid) return 0;
+    if (a->start_sec != 0 && b->start_sec != 0 &&
+        (a->start_sec != b->start_sec || a->start_usec != b->start_usec)) return 0;
+    if (strcmp(a->path, b->path) != 0) return 0;
+    return 1;
+}
+
+static int pulse_get_memlimit_props(pid_t pid, memorystatus_memlimit_properties_t *props_out) {
+    if (!props_out) return EINVAL;
+    memset(props_out, 0, sizeof(*props_out));
+    int rc = memorystatus_control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES, pid, 0,
+                                  props_out, sizeof(*props_out));
+    if (rc != 0) {
+        return errno != 0 ? errno : -1;
+    }
+    return 0;
+}
+
+static int pulse_set_memlimit_props(pid_t pid, const memorystatus_memlimit_properties_t *props) {
+    if (!props) return EINVAL;
+    int rc = memorystatus_control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, pid, 0,
+                                  (void *)props, sizeof(*props));
+    if (rc != 0) {
+        return errno != 0 ? errno : -1;
+    }
+    return 0;
+}
+
+static int pulse_save_state_file(const pulse_saved_state_t *st) {
+    if (!st || st->pid <= 0) return -1;
+
+    struct stat dir_st;
+    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
+        return -1;
+    }
+
+    int fd = open(PULSE_STATE_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    fchmod(fd, 0600);
+
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(PULSE_STATE_TMP_PATH);
+        return -1;
+    }
+    fprintf(f, "pid=%d\n", st->pid);
+    fprintf(f, "start_sec=%llu\n", (unsigned long long)st->start_sec);
+    fprintf(f, "start_usec=%llu\n", (unsigned long long)st->start_usec);
+    fprintf(f, "uniqueid=%llu\n", (unsigned long long)st->uniqueid);
+    fprintf(f, "path=%s\n", st->path);
+    fprintf(f, "orig_active=%d\n", st->orig_active);
+    fprintf(f, "orig_active_attr=%u\n", st->orig_active_attr);
+    fprintf(f, "orig_inactive=%d\n", st->orig_inactive);
+    fprintf(f, "orig_inactive_attr=%u\n", st->orig_inactive_attr);
+    fprintf(f, "suspect=%d\n", st->suspect);
+    fclose(f);
+
+    if (rename(PULSE_STATE_TMP_PATH, PULSE_STATE_PATH) != 0) {
+        unlink(PULSE_STATE_TMP_PATH);
+        return -1;
+    }
+    return 0;
+}
+
+static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident, pulse_saved_state_t *st_out) {
+    if (!st_out || pid <= 0) return -1;
+    memset(st_out, 0, sizeof(*st_out));
+
+    struct stat dir_st;
+    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
+        return -1;
+    }
+
+    struct stat file_st;
+    if (lstat(PULSE_STATE_PATH, &file_st) != 0) return -1;
+    if (S_ISLNK(file_st.st_mode) || !S_ISREG(file_st.st_mode)) return -1;
+    if (file_st.st_uid != geteuid()) return -1;
+    if ((file_st.st_mode & 0777) != 0600) return -1;
+
+    int fd = open(PULSE_STATE_PATH, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+
+    FILE *f = fdopen(fd, "r");
+    if (!f) {
+        close(fd);
+        return -1;
+    }
+
+    char line[512];
+    int has_pid = 0, has_sec = 0, has_usec = 0;
+    int has_act = 0, has_act_attr = 0;
+    int has_inact = 0, has_inact_attr = 0;
+    int has_suspect = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        char *cr = strchr(line, '\r'); if (cr) *cr = '\0';
+
+        if (strncmp(line, "pid=", 4) == 0) {
+            st_out->pid = atoi(line + 4);
+            has_pid = 1;
+        } else if (strncmp(line, "start_sec=", 10) == 0) {
+            st_out->start_sec = strtoull(line + 10, NULL, 10);
+            has_sec = 1;
+        } else if (strncmp(line, "start_usec=", 11) == 0) {
+            st_out->start_usec = strtoull(line + 11, NULL, 10);
+            has_usec = 1;
+        } else if (strncmp(line, "uniqueid=", 9) == 0) {
+            st_out->uniqueid = strtoull(line + 9, NULL, 10);
+        } else if (strncmp(line, "path=", 5) == 0) {
+            snprintf(st_out->path, sizeof(st_out->path), "%s", line + 5);
+        } else if (strncmp(line, "orig_active=", 12) == 0) {
+            st_out->orig_active = (int32_t)atoi(line + 12);
+            has_act = 1;
+        } else if (strncmp(line, "orig_active_attr=", 17) == 0) {
+            st_out->orig_active_attr = (uint32_t)strtoul(line + 17, NULL, 0);
+            has_act_attr = 1;
+        } else if (strncmp(line, "orig_inactive=", 14) == 0) {
+            st_out->orig_inactive = (int32_t)atoi(line + 14);
+            has_inact = 1;
+        } else if (strncmp(line, "orig_inactive_attr=", 19) == 0) {
+            st_out->orig_inactive_attr = (uint32_t)strtoul(line + 19, NULL, 0);
+            has_inact_attr = 1;
+        } else if (strncmp(line, "suspect=", 8) == 0) {
+            st_out->suspect = atoi(line + 8);
+            has_suspect = 1;
+        }
+    }
+    fclose(f);
+
+    if (!has_pid || !has_sec || !has_usec || !has_act || !has_act_attr || !has_inact || !has_inact_attr) {
+        return -1;
+    }
+
+    /* R4-a: suspect 字段缺失时 fail closed，按可疑处理 (suspect=1) */
+    if (!has_suspect) {
+        st_out->suspect = 1;
+    }
+
+    if (ident != NULL) {
+        if (st_out->pid != ident->pid ||
+            st_out->start_sec != ident->start_sec ||
+            st_out->start_usec != ident->start_usec) {
+            return -1;
+        }
+    } else if (st_out->pid != pid) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static void pulse_clear_state_file(pid_t pid) {
+    (void)pid;
+    struct stat file_st;
+    if (lstat(PULSE_STATE_PATH, &file_st) == 0) {
+        if (!S_ISLNK(file_st.st_mode) && S_ISREG(file_st.st_mode) && file_st.st_uid == geteuid()) {
+            unlink(PULSE_STATE_PATH);
+        }
+    }
+}
+
+static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *ident,
+                                             pulse_saved_state_t *st_out) {
+    if (!ident || pid <= 0 || !st_out) return -1;
+
+    pulse_saved_state_t existing;
+    if (pulse_load_trusted_state_file(pid, ident, &existing) == 0) {
+        if (existing.pid == ident->pid &&
+            existing.start_sec == ident->start_sec &&
+            existing.start_usec == ident->start_usec) {
+            *st_out = existing;
+            return 0;
+        }
+    }
+
+    memorystatus_memlimit_properties_t props;
+    int err = pulse_get_memlimit_props(pid, &props);
+    if (err != 0) {
+        return -1;
+    }
+
+    memset(st_out, 0, sizeof(*st_out));
+    st_out->pid = ident->pid;
+    st_out->start_sec = ident->start_sec;
+    st_out->start_usec = ident->start_usec;
+    st_out->uniqueid = ident->uniqueid;
+    snprintf(st_out->path, sizeof(st_out->path), "%s", ident->path);
+    st_out->orig_active = props.memlimit_active;
+    st_out->orig_active_attr = props.memlimit_active_attr;
+    st_out->orig_inactive = props.memlimit_inactive;
+    st_out->orig_inactive_attr = props.memlimit_inactive_attr;
+
+    int act_fatal = (props.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+    int inact_fatal = (props.memlimit_inactive_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+    if (props.memlimit_inactive != props.memlimit_active || inact_fatal != act_fatal) {
+        st_out->suspect = 1;
+        JPLOG(JP_INFO, "ORIG_SUSPECT inactive=%d/%u active=%d/%u",
+              props.memlimit_inactive, props.memlimit_inactive_attr,
+              props.memlimit_active, props.memlimit_active_attr);
+    } else {
+        st_out->suspect = 0;
+    }
+
+    if (pulse_save_state_file(st_out) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/* 统一 Restore 实现函数 (C2-3) */
+static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_t verdict_sz) {
+    if (verdict_out && verdict_sz > 0) verdict_out[0] = '\0';
+
+    char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+    if (proc_pidpath(pid, path, sizeof(path)) <= 0 || !pulse_is_supported_app(pid, path, bid)) {
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=validate");
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=validate");
+        return 1;
+    }
+
+    uint64_t fp_mb = 0;
+    int fp_err = pulse_get_footprint_mb(pid, &fp_mb);
+    if (fp_err != 0) {
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=fp_unreadable");
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=fp_unreadable");
+        return 1;
+    }
+
+    proc_identity_t ident;
+    if (pulse_get_proc_identity(pid, &ident) != 0) {
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=ident");
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+        return 1;
+    }
+
+    memorystatus_memlimit_properties_t cur_props;
+    int cur_err = pulse_get_memlimit_props(pid, &cur_props);
+    if (cur_err != 0) {
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=get");
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=get");
+        return 1;
+    }
+
+    pulse_saved_state_t state;
+    const char *mirror_reason = NULL;
+    if (pulse_load_trusted_state_file(pid, &ident, &state) != 0) {
+        mirror_reason = "untrusted";
+    } else if (state.orig_inactive <= 0) {
+        mirror_reason = "none";
+    } else if (state.suspect == 1) {
+        mirror_reason = "suspect";
+    } else {
+        uint64_t floor_1_2 = calc_restore_floor(fp_mb);
+        int implausible = 0;
+        if ((uint64_t)state.orig_inactive < floor_1_2) {
+            implausible = 1;
+        }
+        if (cur_props.memlimit_active > 0 &&
+            (int64_t)state.orig_inactive * 2 < cur_props.memlimit_active) {
+            implausible = 1;
+        }
+        if (implausible) {
+            mirror_reason = "implausible";
+        }
+    }
+
+    int32_t target_inactive = 0;
+    uint32_t target_inactive_attr = 0;
+
+    if (mirror_reason != NULL) {
+        uint64_t floor_1_2 = calc_restore_floor(fp_mb);
+        if (cur_props.memlimit_active <= 0 ||
+            (uint64_t)cur_props.memlimit_active <= floor_1_2) {
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=active_low");
+            JPLOG(JP_INFO, "RESTORE_REFUSED reason=active_low");
+            return 1;
+        }
+        target_inactive = cur_props.memlimit_active;
+        target_inactive_attr = cur_props.memlimit_active_attr;
+    } else {
+        target_inactive = state.orig_inactive;
+        target_inactive_attr = state.orig_inactive_attr;
+    }
+
+    int success = 0;
+    int write_attempted = 0;
+    int readback_mismatch = 0;
+
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (attempt > 0) {
+            usleep(100 * 1000); /* 100 ms */
+        }
+
+        proc_identity_t check_ident;
+        if (pulse_get_proc_identity(pid, &check_ident) != 0 || !pulse_compare_proc_identity(&ident, &check_ident)) {
+            break;
+        }
+
+        memorystatus_memlimit_properties_t cur_active;
+        if (pulse_get_memlimit_props(pid, &cur_active) != 0) {
+            continue;
+        }
+
+        memorystatus_memlimit_properties_t target_props;
+        target_props.memlimit_active = cur_active.memlimit_active;
+        target_props.memlimit_active_attr = cur_active.memlimit_active_attr;
+        target_props.memlimit_inactive = target_inactive;
+        target_props.memlimit_inactive_attr = target_inactive_attr;
+
+        write_attempted = 1;
+        if (pulse_set_memlimit_props(pid, &target_props) != 0) {
+            continue;
+        }
+
+        memorystatus_memlimit_properties_t readback;
+        memset(&readback, 0, sizeof(readback));
+        if (pulse_get_memlimit_props(pid, &readback) != 0) {
+            readback_mismatch = 1;
+            continue;
+        }
+
+        /* M2-a: 每次回读都打一行原始 attr，十六进制 */
+        JPLOG(JP_INFO, "READBACK active=%d/0x%x inactive=%d/0x%x",
+              readback.memlimit_active, readback.memlimit_active_attr,
+              readback.memlimit_inactive, readback.memlimit_inactive_attr);
+
+        int rb_act_fatal = (readback.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+        int exp_act_fatal = (target_props.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+        int rb_inact_fatal = (readback.memlimit_inactive_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+        int exp_inact_fatal = (target_props.memlimit_inactive_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+
+        if (readback.memlimit_active == target_props.memlimit_active &&
+            rb_act_fatal == exp_act_fatal &&
+            readback.memlimit_inactive == target_props.memlimit_inactive &&
+            rb_inact_fatal == exp_inact_fatal) {
+            success = 1;
+            break;
+        } else {
+            readback_mismatch = 1;
+        }
+    }
+
+    if (!success) {
+        if (!write_attempted) {
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED reason=ident");
+            JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+            return 1;
+        }
+        if (readback_mismatch) {
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED reason=readback");
+            JPLOG(JP_INFO, "RESTORE_FAILED reason=readback");
+            return 1;
+        } else {
+            if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED reason=retry");
+            JPLOG(JP_INFO, "RESTORE_FAILED reason=retry");
+            return 1;
+        }
+    }
+
+    pulse_clear_state_file(pid);
+
+    if (mirror_reason != NULL) {
+        if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_MIRROR reason=%s", mirror_reason);
+        JPLOG(JP_INFO, "RESTORE_MIRROR reason=%s", mirror_reason);
+        return 0;
+    }
+
+    if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_OK");
+    JPLOG(JP_INFO, "RESTORE_OK");
+    return 0;
+}
+
 static void *pulse_worker_thread(void *arg) {
     pulse_queue_entry_t *target = (pulse_queue_entry_t *)arg;
     if (!target) return NULL;
 
-    /* C2-3 将在此实现完整 pulse / 窗口采样 / restore 逻辑 */
+    pid_t pid = target->pid;
+    const char *bid = target->bid;
 
+    proc_identity_t ident;
+    if (pulse_get_proc_identity(pid, &ident) != 0) {
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+        goto thread_done;
+    }
+
+    pulse_saved_state_t state;
+    if (pulse_get_or_record_initial_state(pid, &ident, &state) != 0) {
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+        goto thread_done;
+    }
+
+    uint64_t fp0 = 0;
+    if (pulse_get_footprint_mb(pid, &fp0) != 0) {
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=fp_unreadable");
+        goto thread_done;
+    }
+
+    uint64_t L = calc_pulse_limit(fp0);
+    uint64_t hard_guard = calc_hard_guard_limit(fp0);
+    if (L < hard_guard) L = hard_guard;
+
+    memorystatus_memlimit_properties_t cur_props;
+    if (pulse_get_memlimit_props(pid, &cur_props) != 0) {
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=get");
+        goto thread_done;
+    }
+
+    memorystatus_memlimit_properties_t new_props = cur_props;
+    new_props.memlimit_inactive = (int32_t)L;
+    new_props.memlimit_inactive_attr &= ~MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
+
+    proc_identity_t check_ident;
+    if (pulse_get_proc_identity(pid, &check_ident) != 0 || !pulse_compare_proc_identity(&ident, &check_ident)) {
+        JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
+        goto thread_done;
+    }
+
+    if (pulse_set_memlimit_props(pid, &new_props) != 0) {
+        JPLOG(JP_INFO, "RESTORE_FAILED reason=retry");
+        goto thread_done;
+    }
+
+    memorystatus_memlimit_properties_t readback;
+    if (pulse_get_memlimit_props(pid, &readback) != 0) {
+        JPLOG(JP_INFO, "RESTORE_FAILED reason=readback");
+        pulse_do_restore(pid, bid, NULL, 0);
+        goto thread_done;
+    }
+
+    JPLOG(JP_INFO, "READBACK active=%d/0x%x inactive=%d/0x%x",
+          readback.memlimit_active, readback.memlimit_active_attr,
+          readback.memlimit_inactive, readback.memlimit_inactive_attr);
+
+    int rb_act_fatal = (readback.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+    int exp_act_fatal = (new_props.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+    int rb_inactive_fatal = (readback.memlimit_inactive_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+    if (readback.memlimit_active != new_props.memlimit_active ||
+        rb_act_fatal != exp_act_fatal ||
+        readback.memlimit_inactive != (int32_t)L ||
+        rb_inactive_fatal != 0) {
+        JPLOG(JP_INFO, "RESTORE_FAILED reason=readback");
+        pulse_do_restore(pid, bid, NULL, 0);
+        goto thread_done;
+    }
+
+    JPLOG(JP_INFO, "PULSE_ARMED pid=%d fp=%llu L=%llu window=60s",
+          pid, (unsigned long long)fp0, (unsigned long long)L);
+
+    const char *end_reason = "WINDOW_END";
+    int should_restore = 1;
+    int t_reach = -1;
+    (void)t_reach;
+
+    for (int sec = 1; sec <= 60; sec++) {
+        usleep(1000 * 1000);
+
+        if (g_pulse_stop_requested) {
+            end_reason = "WINDOW_END";
+            should_restore = 1;
+            break;
+        }
+
+        proc_identity_t loop_ident;
+        if (pulse_get_proc_identity(pid, &loop_ident) != 0) {
+            struct proc_bsdinfo bi;
+            if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != sizeof(bi)) {
+                JPLOG(JP_INFO, "PULSE_GONE L=%llu t=%d", (unsigned long long)L, sec);
+                end_reason = "GONE";
+                should_restore = 0;
+                break;
+            }
+        }
+        if (!pulse_compare_proc_identity(&ident, &loop_ident)) {
+            JPLOG(JP_INFO, "PID_REUSED");
+            end_reason = "PID_REUSED";
+            should_restore = 0;
+            break;
+        }
+
+        uint64_t cur_fp = 0;
+        int rerr = pulse_get_footprint_mb(pid, &cur_fp);
+        if (rerr != 0) {
+            struct proc_bsdinfo bi;
+            if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != sizeof(bi)) {
+                JPLOG(JP_INFO, "PULSE_GONE L=%llu t=%d", (unsigned long long)L, sec);
+                end_reason = "GONE";
+                should_restore = 0;
+                break;
+            }
+            should_restore = 1;
+            break;
+        }
+
+        JPLOG(JP_DEBUG, "t=%ds fp=%llu L=%llu (%.1f%%)",
+              sec, (unsigned long long)cur_fp, (unsigned long long)L,
+              (double)cur_fp * 100.0 / (double)L);
+
+        /* 5. 窗口内一旦 fp >= 0.95*L，马上 restore，记 ABORT near_limit */
+        if (cur_fp * 100 >= 95 * L) {
+            JPLOG(JP_INFO, "ABORT near_limit fp=%llu limit=%llu",
+                  (unsigned long long)cur_fp, (unsigned long long)L);
+            end_reason = "ABORT";
+            t_reach = sec;
+            should_restore = 1;
+            break;
+        }
+
+        /* 4. 窗口到时间，或者 fp 降到 0.8*L 以下，就按原值 restore */
+        if (cur_fp * 100 < 80 * L) {
+            JPLOG(JP_INFO, "TARGET_REACHED fp=%llu < 0.8*L (%llu)",
+                  (unsigned long long)cur_fp, (unsigned long long)((80 * L) / 100));
+            end_reason = "TARGET_REACHED";
+            t_reach = sec;
+            should_restore = 1;
+            break;
+        }
+
+        if (sec == 60) {
+            end_reason = "WINDOW_END";
+            should_restore = 1;
+            break;
+        }
+    }
+
+    char restore_verdict_str[64] = "NONE";
+    if (should_restore) {
+        memorystatus_memlimit_properties_t pre_restore;
+        if (pulse_get_memlimit_props(pid, &pre_restore) == 0 &&
+            pre_restore.memlimit_inactive != (int32_t)L) {
+            JPLOG(JP_INFO, "OVERRIDDEN old=%llu now=%d",
+                  (unsigned long long)L, pre_restore.memlimit_inactive);
+            end_reason = "OVERRIDDEN";
+            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "NONE");
+        } else {
+            pulse_do_restore(pid, bid, restore_verdict_str, sizeof(restore_verdict_str));
+        }
+    }
+    (void)end_reason;
+    (void)restore_verdict_str;
+
+thread_done:
     g_pulse_in_progress = 0;
     g_pulse_current_pid = 0;
     g_pulse_current_bid[0] = '\0';
