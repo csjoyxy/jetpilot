@@ -4064,16 +4064,26 @@ static void *pulse_worker_thread(void *arg) {
         }
     }
 
+    int gone_post_restore = 0;
+    int elapsed_post_restore = 0;
+
     /* 提前结束 (TARGET_REACHED 或 ABORT) 时，restore 完成后继续只读采样到 60 秒 (C2-4 / Q4) */
     if ((strcmp(end_reason, "TARGET_REACHED") == 0 || strcmp(end_reason, "ABORT") == 0) &&
         t_reach > 0 && t_reach < 60 && !g_pulse_stop_requested) {
         for (int sec = t_reach + 1; sec <= 60; sec++) {
             usleep(1000 * 1000);
+            elapsed_post_restore++;
             if (g_pulse_stop_requested) break;
 
             proc_identity_t post_ident;
             if (pulse_get_proc_identity(pid, &post_ident) != 0 ||
                 !pulse_compare_proc_identity(&ident, &post_ident)) {
+                if (elapsed_post_restore <= 10) {
+                    struct proc_bsdinfo bi;
+                    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != sizeof(bi)) {
+                        gone_post_restore = 1;
+                    }
+                }
                 break;
             }
 
@@ -4090,6 +4100,23 @@ static void *pulse_worker_thread(void *arg) {
             if (sec == 15) { fp15 = post_fp; has_fp15 = 1; }
             else if (sec == 30) { fp30 = post_fp; has_fp30 = 1; }
             else if (sec == 60) { fp60 = post_fp; has_fp60 = 1; }
+        }
+    }
+
+    /* restore 之后 10 秒内监控进程存活 (C2-6 熔断) */
+    if (should_restore && strcmp(end_reason, "GONE") != 0 && !gone_post_restore && !g_pulse_stop_requested) {
+        for (int psec = elapsed_post_restore; psec < 10; psec++) {
+            if (g_pulse_stop_requested) break;
+            usleep(1000 * 1000);
+            proc_identity_t post_chk;
+            if (pulse_get_proc_identity(pid, &post_chk) != 0 ||
+                !pulse_compare_proc_identity(&ident, &post_chk)) {
+                struct proc_bsdinfo bi;
+                if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != sizeof(bi)) {
+                    gone_post_restore = 1;
+                    break;
+                }
+            }
         }
     }
 
@@ -4121,10 +4148,28 @@ static void *pulse_worker_thread(void *arg) {
         st->last_pulse_mono = ts.tv_sec;
         st->day_count++;
         st->total_pulses++;
-        if (has_fp60 && fp60 + 5 >= fp0) {
-            st->no_drop_pulses++;
-            if (st->total_pulses >= 2 && st->no_drop_pulses == st->total_pulses) {
-                st->unresponsive = 1;
+
+        /* 熔断判定 (C2-6): 窗口内或 restore 后 10 秒内 GONE */
+        if (strcmp(end_reason, "GONE") == 0 || gone_post_restore) {
+            st->tripped_today = 1;
+            JPLOG(JP_WARN, "%-6s circuit_break app=%s pid=%d reason=gone", "PLS", bid, (int)pid);
+        }
+
+        /* 无响应判定 (C2-6): 若已完成 >= 2 次 pulse 且最近连续 2 次降幅均 <= 5MB，标记为无响应 (只标记，不停用) */
+        uint64_t fp_final = has_fp60 ? fp60 : (has_fp30 ? fp30 : (has_fp15 ? fp15 : fp0));
+        if (strcmp(end_reason, "GONE") != 0 && !gone_post_restore && strcmp(end_reason, "PID_REUSED") != 0) {
+            if (fp_final + 5 >= fp0) {
+                st->no_drop_pulses++;
+                if (st->total_pulses >= 2 && st->no_drop_pulses >= 2) {
+                    if (!st->unresponsive) {
+                        st->unresponsive = 1;
+                        JPLOG(JP_INFO, "%-6s unresponsive app=%s total=%d no_drop=%d",
+                              "PLS", bid, st->total_pulses, st->no_drop_pulses);
+                    }
+                }
+            } else {
+                st->no_drop_pulses = 0;
+                st->unresponsive = 0;
             }
         }
     }
