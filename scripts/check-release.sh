@@ -6,15 +6,50 @@ set -u
 # Requirements:
 # 1. Info.plist CFBundleShortVersionString == jetpilotd.c JP_VERSION; CFBundleVersion is positive integer.
 # 2. Source code (src/) must not contain: restart_spike, SBSLaunch, springboard.launchapplications, debug_fake, __ActivateSuspended.
-# 3. entitlements-daemon.plist contains com.apple.frontboard.launchapplications.
+# 3. entitlements-daemon.plist contains com.apple.frontboard.launchapplications, and when artifacts are built,
+#    verifies embedded entitlements, code signatures, and page hashes of the packaged binaries.
 # 4. Print count of JPLOG lines for each level (ERR/WARN/INFO/DEBUG) - diagnostic only.
 #
-# Returns exit 1 on any check (1, 2, 3) failure; 0 if all pass.
+# Returns exit 1 on any check failure; 0 if all pass.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 FAILED=0
+ARTIFACT_PATH=""
+SKIP_ARTIFACT=0
+
+# Parse options
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --artifact|-a)
+            if [ $# -gt 1 ]; then
+                ARTIFACT_PATH="$2"
+                shift 2
+            else
+                echo "[FAIL] --artifact requires a file path"
+                exit 1
+            fi
+            ;;
+        --skip-artifact)
+            SKIP_ARTIFACT=1
+            shift
+            ;;
+        *)
+            if [ -z "$ARTIFACT_PATH" ] && [ -f "$1" ]; then
+                ARTIFACT_PATH="$1"
+                shift
+            else
+                shift
+            fi
+            ;;
+    esac
+done
+
+# If no explicit artifact provided and not skipped, auto-detect built tipa in src/
+if [ -z "$ARTIFACT_PATH" ] && [ "$SKIP_ARTIFACT" -eq 0 ] && [ -f "$REPO_ROOT/src/JetPilot.tipa" ]; then
+    ARTIFACT_PATH="$REPO_ROOT/src/JetPilot.tipa"
+fi
 
 echo "=== JetPilot Release Gate Check ==="
 
@@ -81,9 +116,9 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Check 3: FrontBoard entitlement in entitlements-daemon.plist
+# Check 3: FrontBoard entitlement in entitlements-daemon.plist and built artifacts
 # -----------------------------------------------------------------------------
-echo "--- Check 3: FrontBoard Entitlement ---"
+echo "--- Check 3: FrontBoard Entitlement & Artifact Entitlements ---"
 ENTITLEMENTS_FILE="$REPO_ROOT/src/entitlements-daemon.plist"
 
 if [ ! -f "$ENTITLEMENTS_FILE" ]; then
@@ -94,6 +129,26 @@ elif grep -q "com.apple.frontboard.launchapplications" "$ENTITLEMENTS_FILE" 2>/d
 else
     echo "[FAIL] entitlements-daemon.plist missing com.apple.frontboard.launchapplications"
     FAILED=1
+fi
+
+if [ -n "$ARTIFACT_PATH" ]; then
+    echo "--- Check 3b: Artifact Entitlements & Signature Verification ($ARTIFACT_PATH) ---"
+    if [ ! -f "$ARTIFACT_PATH" ]; then
+        echo "[FAIL] Specified artifact not found: $ARTIFACT_PATH"
+        FAILED=1
+    elif [ ! -f "$SCRIPT_DIR/verify-artifacts.py" ]; then
+        echo "[FAIL] Missing verification script at $SCRIPT_DIR/verify-artifacts.py"
+        FAILED=1
+    else
+        if ! python3 "$SCRIPT_DIR/verify-artifacts.py" --tipa "$ARTIFACT_PATH"; then
+            echo "[FAIL] Artifact verification failed for $ARTIFACT_PATH"
+            FAILED=1
+        else
+            echo "[OK] Artifact entitlements and signature verification passed for $ARTIFACT_PATH"
+        fi
+    fi
+else
+    echo "[INFO] No built artifact provided or found; skipping artifact verification."
 fi
 
 # -----------------------------------------------------------------------------

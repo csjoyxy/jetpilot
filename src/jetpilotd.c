@@ -983,6 +983,7 @@ static void write_status(int protected_now, int demoted_pids,
                "restart_support=1\n"
                "version=" JP_VERSION "\n"
                "commit=" JP_COMMIT "\n"
+               "mempressure_state=retired\n"
                "cfg_bad=%d\n"
                "protect_rules=%d\ndemote_rules=%d\n"
                "protected_pids=%d\ndemoted_pids=%d\nreasserts_total=%lu\n",
@@ -1093,6 +1094,8 @@ static int wait_lock_change(int secs) {
  * 前台 App 内存压力触发模块 (v0.7.0)
  * ========================================================================= */
 
+#define MEMP_RETIRED       1  /* v0.7.8 C3-1: 前台释放已停用，由后台释放替代 */
+
 #define MEMP_CONFIG_PATH   CONFIG_DIR "/mempressure.txt"
 #define MEMP_PENDING_PATH  CONFIG_DIR "/mempressure_pending"
 #define MEMP_STATE_PATH    CONFIG_DIR "/mempressure_state.txt"
@@ -1155,6 +1158,7 @@ typedef struct {
 static memp_floor_entry_t g_memp_floors[MEMP_MAX_FLOOR_ENTRIES];
 static int g_nmemp_floors = 0;
 static void memp_floor_load(void);
+static void mempressure_write_state(void);
 
 static uint64_t g_memp_memcap = 2048;
 static int g_memp_memcap_fallback = 0;
@@ -1778,53 +1782,79 @@ static void memp_check_fatal_persist(void) {
 }
 
 static void memp_check_boot_reset(void) {
-    if (access(MEMP_PENDING_PATH, F_OK) != 0) return;
-    FILE *f = fopen(MEMP_PENDING_PATH, "r");
-    if (!f) return;
-    int pid = 0;
-    unsigned long long tvsec = 0, tvusec = 0;
-    char frag[256] = {0};
-    int n = fscanf(f, "%d %llu %llu %255s", &pid, &tvsec, &tvusec, frag);
-    fclose(f);
-    if (n < 4) {
-        unlink(MEMP_PENDING_PATH);
-        return;
+    int has_pending = (access(MEMP_PENDING_PATH, F_OK) == 0);
+    int has_state_reset = 0;
+
+    FILE *sf = fopen(MEMP_STATE_PATH, "r");
+    if (sf) {
+        char sline[256];
+        if (fgets(sline, sizeof(sline), sf)) {
+            if (strstr(sline, "reset_pending_normal") != NULL) {
+                has_state_reset = 1;
+            }
+        }
+        fclose(sf);
     }
 
-    int v = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
-    int rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &v, sizeof(int));
-    int err = (rc != 0) ? errno : 0;
-    char eb[128];
-    memp_fmt_errno(err, eb, sizeof(eb));
-    JPLOG(JP_INFO, "MEMP boot_reset ret=%d errno=%s", rc, eb);
+    if (has_pending || has_state_reset) {
+        int v = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
+        int rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &v, sizeof(int));
+        int err = (rc != 0) ? errno : 0;
+        if (rc == 0) {
+            unlink(MEMP_PENDING_PATH);
+            JPLOG(JP_INFO, "MEMP_RETIRED_CLEANUP ok");
+        } else {
+            JPLOG(JP_WARN, "MEMP_RETIRED_CLEANUP fail errno=%d", err);
+        }
+    }
 
-    if (rc == 0) {
-        unlink(MEMP_PENDING_PATH);
-        memp_taint_add((pid_t)pid, tvsec, tvusec, frag, "boot");
-    } else if (err == EINVAL) {
-        memp_enter_fatal("einval");
-    } else if (err == ENOENT || err == EPERM) {
-        unlink(MEMP_PENDING_PATH);
-        memp_enter_unsupported("trigger", err);
+    /* 收尾完成后，把 mempressure_state.txt 改写成 state=retired */
+    mempressure_write_state();
+
+    /* 收尾完成后调用一次 memp_read_level（读 kern.memorystatus_vm_pressure_level，期望值 1 = NORMAL） */
+    int cur_lvl = 0, lerr = 0;
+    int lrc = memp_read_level(&cur_lvl, &lerr);
+    if (lrc == 0) {
+        JPLOG(JP_INFO, "MEMP_RETIRED level=%d", cur_lvl);
     } else {
-        memp_taint_add((pid_t)pid, tvsec, tvusec, frag, "boot");
-        struct timespec mono;
-        clock_gettime(CLOCK_MONOTONIC, &mono);
-        memp_enter_reset_pending_normal(0, mono);
+        JPLOG(JP_INFO, "MEMP_RETIRED level=NA");
     }
 }
 
 static void mempressure_init(void) {
     mempressure_init_memcap();
-    memp_check_fatal_persist();
-    if (g_memp_state != MEMP_STATE_FATAL) {
+    memp_check_boot_reset();
+    if (!MEMP_RETIRED) {
+        memp_check_fatal_persist();
         memp_taint_load();
-        memp_check_boot_reset();
         memp_floor_load();
     }
 }
 
 static void mempressure_write_state(void) {
+    if (MEMP_RETIRED) {
+        const char *line = "state=retired fails=0 last_errno=0 reason=- tainted=0\n";
+        static char s_last_line[256] = "";
+        if (strcmp(line, s_last_line) == 0) return; /* 内容无变化不写 */
+
+        char tmp[512];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_STATE_PATH);
+        FILE *f = fopen(tmp, "w");
+        if (!f) return;
+        fputs(line, f);
+        fflush(f);
+        int werr = ferror(f);
+        fclose(f);
+        if (werr) { unlink(tmp); return; }
+        if (rename(tmp, MEMP_STATE_PATH) == 0) {
+            strncpy(s_last_line, line, sizeof(s_last_line) - 1);
+            s_last_line[sizeof(s_last_line) - 1] = '\0';
+        } else {
+            unlink(tmp);
+        }
+        return;
+    }
+
     const char *state_str = "off";
     const char *reason_str = "-";
 
@@ -2355,6 +2385,10 @@ static void memp_post_register(const char *frag, pid_t pid, uint64_t tvsec, uint
 }
 
 static int mempressure_load_config(void) {
+    if (MEMP_RETIRED) {
+        return 0;
+    }
+
     FILE *f = fopen(MEMP_CONFIG_PATH, "r");
     int file_absent = (f == NULL);
     int new_cooldown = MEMP_DEFAULT_COOLDOWN;
@@ -5690,19 +5724,22 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
 }
 
 static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
+    /* 自动重启与后台释放配置及判定 (v0.7.7 C2, v0.7.8 C2) */
+    restart_load_config();
+    pulse_load_config();
+    restart_round(list, count);
+    pulse_round(list, count);
+
+    /* v0.7.8 C3-1: E (前台释放) 已停用，跳过 E 的触发、让位、污染与修复路径 (代码保留至 0.7.9 删除) */
+    if (MEMP_RETIRED) {
+        return;
+    }
+
     /* 1. 每一轮开头检查观察槽与采样（§八、§三-A） */
     memp_post_sample(list, count);
 
     /* 2. 重新加载配置（§四） */
     mempressure_load_config();
-    restart_load_config();
-    pulse_load_config();
-
-    /* 2.5 自动重启判定与状态机 (v0.7.7 C2) */
-    restart_round(list, count);
-
-    /* 2.6 后台内存释放判定 (v0.7.8 C2-1) */
-    pulse_round(list, count);
 
     /* 3. 检查 fatal 状态 */
     if (g_memp_state == MEMP_STATE_FATAL) return;
@@ -6567,7 +6604,13 @@ int rst_fbs_launch(const char *bid, const char **err_stage) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] && strcmp(argv[i], "--probe") == 0) {
+            exit(0);
+        }
+    }
+
     if (geteuid() != 0) {
         fprintf(stderr, "[JetPilot] 必须以 root 运行\n");
         return 1;

@@ -64,6 +64,9 @@ jobs:
           chmod 755 Payload/JetPilot.app/JetPilot Payload/JetPilot.app/jetpilotd
           zip -qr JetPilot.tipa Payload
 
+      - name: Verify package signature and entitlements
+        run: bash scripts/check-release.sh --artifact src/JetPilot.tipa
+
       - uses: actions/upload-artifact@v4
         with:
           name: JetPilot
