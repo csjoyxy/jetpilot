@@ -7748,7 +7748,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 @optional
 - (void)pulseRuleCardViewDidTap:(JPPulseRuleCardView *)card;
 - (void)pulseRuleCardViewDidToggle:(JPPulseRuleCardView *)card enabled:(BOOL)enabled;
-- (void)pulseRuleCardViewDidRequestDelete:(JPPulseRuleCardView *)card;
 @end
 
 @interface JPPulseRuleCardView : UIView
@@ -7761,7 +7760,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *thrLabel;
 @property (nonatomic, strong) UISwitch *toggleSwitch;
-@property (nonatomic, strong) UIButton *deleteButton;
 
 - (instancetype)initWithRule:(JPPulseRule *)rule
                     delegate:(id<JPPulseRuleCardViewDelegate>)delegate
@@ -7874,13 +7872,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.thrLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.rule.target];
     [self addSubview:self.thrLabel];
 
-    self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.deleteButton setImage:[UIImage systemImageNamed:@"trash"] forState:UIControlStateNormal];
-    self.deleteButton.tintColor = UIColor.systemRedColor;
-    [self.deleteButton addTarget:self action:@selector(deleteTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:self.deleteButton];
-
     self.toggleSwitch = [UISwitch new];
     self.toggleSwitch.translatesAutoresizingMaskIntoConstraints = NO;
     self.toggleSwitch.on = self.rule.enabled;
@@ -7904,12 +7895,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         [chevron.widthAnchor constraintEqualToConstant:8],
         [chevron.heightAnchor constraintEqualToConstant:13],
 
-        [self.deleteButton.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-4],
-        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-        [self.deleteButton.widthAnchor constraintEqualToConstant:32],
-        [self.deleteButton.heightAnchor constraintEqualToConstant:32],
-
-        [self.toggleSwitch.trailingAnchor constraintEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.toggleSwitch.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-8],
         [self.toggleSwitch.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
 
         [self.thrLabel.trailingAnchor constraintEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-8],
@@ -7941,7 +7927,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)cardTapped:(UITapGestureRecognizer *)sender {
     CGPoint pt = [sender locationInView:self];
-    if (CGRectContainsPoint(self.deleteButton.frame, pt) || CGRectContainsPoint(self.toggleSwitch.frame, pt)) {
+    if (CGRectContainsPoint(self.toggleSwitch.frame, pt)) {
         return;
     }
     if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidTap:)]) {
@@ -7968,12 +7954,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     }
     if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidToggle:enabled:)]) {
         [self.delegate pulseRuleCardViewDidToggle:self enabled:sender.isOn];
-    }
-}
-
-- (void)deleteTapped {
-    if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidRequestDelete:)]) {
-        [self.delegate pulseRuleCardViewDidRequestDelete:self];
     }
 }
 
@@ -9556,23 +9536,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     [self presentViewController:nav animated:YES completion:nil];
 }
 
-- (void)deletePulseRule:(JPPulseRule *)rule {
-    JPPulseLine *line = [self.pulseConfig lineForRule:rule];
-    if (!line) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
-                                                                       message:@"规则已变化，请刷新后重试"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self presentViewController:alert animated:YES completion:nil];
-        });
-        return;
-    }
-    [self.pulseConfig removeLine:line];
-    [self savePulseConfig];
-    [self rebuildPulseCards];
-}
-
 - (BOOL)savePulseConfig {
     NSError *err = nil;
     BOOL ok = [self savePulseConfigWithError:&err];
@@ -9629,30 +9592,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     card.rule.enabled = enabled;
     [self savePulseConfig];
     [self rebuildPulseCards];
-}
-
-- (void)pulseRuleCardViewDidRequestDelete:(JPPulseRuleCardView *)card {
-    JPPulseRule *rule = card.rule;
-    NSString *name = ResolveDisplayNameHelper([NSString stringWithFormat:@"bid:%@", rule.bid], self.installedApps);
-    if (name.length == 0) name = rule.displayName.length > 0 ? rule.displayName : rule.bid;
-
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除规则"
-                                                                   message:[NSString stringWithFormat:@"确定要移除对「%@」的后台释放规则吗？", name]
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-
-    __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"移除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        [weakSelf deletePulseRule:rule];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-
-    if (alert.popoverPresentationController) {
-        alert.popoverPresentationController.sourceView = card;
-        alert.popoverPresentationController.sourceRect = card.bounds;
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self presentViewController:alert animated:YES completion:nil];
-    });
 }
 
 #pragma mark - JPPulseUnknownLineCardViewDelegate
