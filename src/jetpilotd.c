@@ -1277,6 +1277,7 @@ typedef struct {
 
 typedef struct {
     pid_t    pid;
+    char     bid[128];
     uint64_t start_sec;
     uint64_t start_usec;
     uint64_t uniqueid;
@@ -3471,6 +3472,9 @@ static int pulse_save_state_file(const pulse_saved_state_t *st) {
         return -1;
     }
     fprintf(f, "pid=%d\n", st->pid);
+    if (st->bid[0] != '\0') {
+        fprintf(f, "bid=%s\n", st->bid);
+    }
     fprintf(f, "start_sec=%llu\n", (unsigned long long)st->start_sec);
     fprintf(f, "start_usec=%llu\n", (unsigned long long)st->start_usec);
     fprintf(f, "uniqueid=%llu\n", (unsigned long long)st->uniqueid);
@@ -3490,7 +3494,7 @@ static int pulse_save_state_file(const pulse_saved_state_t *st) {
 }
 
 static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident, pulse_saved_state_t *st_out) {
-    if (!st_out || pid <= 0) return -1;
+    if (!st_out || (pid <= 0 && ident != NULL)) return -1;
     memset(st_out, 0, sizeof(*st_out));
 
     struct stat dir_st;
@@ -3526,6 +3530,8 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
         if (strncmp(line, "pid=", 4) == 0) {
             st_out->pid = atoi(line + 4);
             has_pid = 1;
+        } else if (strncmp(line, "bid=", 4) == 0) {
+            snprintf(st_out->bid, sizeof(st_out->bid), "%s", line + 4);
         } else if (strncmp(line, "start_sec=", 10) == 0) {
             st_out->start_sec = strtoull(line + 10, NULL, 10);
             has_sec = 1;
@@ -3570,7 +3576,7 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
             st_out->start_usec != ident->start_usec) {
             return -1;
         }
-    } else if (st_out->pid != pid) {
+    } else if (pid > 0 && st_out->pid != pid) {
         return -1;
     }
 
@@ -3588,6 +3594,7 @@ static void pulse_clear_state_file(pid_t pid) {
 }
 
 static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *ident,
+                                             const char *bid,
                                              pulse_saved_state_t *st_out) {
     if (!ident || pid <= 0 || !st_out) return -1;
 
@@ -3597,6 +3604,9 @@ static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *i
             existing.start_sec == ident->start_sec &&
             existing.start_usec == ident->start_usec) {
             *st_out = existing;
+            if (bid && bid[0] && st_out->bid[0] == '\0') {
+                snprintf(st_out->bid, sizeof(st_out->bid), "%s", bid);
+            }
             return 0;
         }
     }
@@ -3609,6 +3619,9 @@ static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *i
 
     memset(st_out, 0, sizeof(*st_out));
     st_out->pid = ident->pid;
+    if (bid && bid[0]) {
+        snprintf(st_out->bid, sizeof(st_out->bid), "%s", bid);
+    }
     st_out->start_sec = ident->start_sec;
     st_out->start_usec = ident->start_usec;
     st_out->uniqueid = ident->uniqueid;
@@ -3798,6 +3811,72 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     return 0;
 }
 
+/* 崩溃恢复状态与启动校验 (v0.7.8 C2-5 / Q5) */
+static int g_pulse_corrupt_state = 0;
+static char g_pulse_corrupt_bid[128] = {0};
+
+static void pulse_startup_recovery(void) {
+    struct stat dir_st;
+    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
+        struct stat file_st;
+        if (lstat(PULSE_STATE_PATH, &file_st) == 0) {
+            unlink(PULSE_STATE_PATH);
+            JPLOG(JP_WARN, "%-6s state_invalid reason=dir_symlink path=%s", "PLS", PULSE_STATE_PATH);
+            g_pulse_corrupt_state = 1;
+            snprintf(g_pulse_corrupt_bid, sizeof(g_pulse_corrupt_bid), "com.tencent.xin");
+        }
+        return;
+    }
+
+    struct stat file_st;
+    if (lstat(PULSE_STATE_PATH, &file_st) != 0) {
+        return; /* 状态文件不存在，正常启动 */
+    }
+
+    /* 校验文件：不是符号链接，属主为 euid，权限 0600 */
+    if (S_ISLNK(file_st.st_mode) || !S_ISREG(file_st.st_mode) ||
+        file_st.st_uid != geteuid() || (file_st.st_mode & 0777) != 0600) {
+        unlink(PULSE_STATE_PATH);
+        JPLOG(JP_WARN, "%-6s state_invalid reason=file_attr path=%s", "PLS", PULSE_STATE_PATH);
+        g_pulse_corrupt_state = 1;
+        snprintf(g_pulse_corrupt_bid, sizeof(g_pulse_corrupt_bid), "com.tencent.xin");
+        return;
+    }
+
+    pulse_saved_state_t st;
+    if (pulse_load_trusted_state_file(0, NULL, &st) != 0 || st.pid <= 0) {
+        unlink(PULSE_STATE_PATH);
+        JPLOG(JP_WARN, "%-6s state_invalid reason=parse_fail path=%s", "PLS", PULSE_STATE_PATH);
+        g_pulse_corrupt_state = 1;
+        snprintf(g_pulse_corrupt_bid, sizeof(g_pulse_corrupt_bid), "com.tencent.xin");
+        return;
+    }
+
+    /* pid 和启动时间校验 */
+    proc_identity_t curr_ident;
+    if (pulse_get_proc_identity(st.pid, &curr_ident) != 0) {
+        /* 进程已经没了 */
+        unlink(PULSE_STATE_PATH);
+        JPLOG(JP_INFO, "%-6s state_cleanup pid=%d reason=process_gone", "PLS", st.pid);
+        return;
+    }
+
+    if (curr_ident.start_sec != st.start_sec || curr_ident.start_usec != st.start_usec) {
+        /* pid 对不上 (pid 已被其他进程复用) */
+        unlink(PULSE_STATE_PATH);
+        JPLOG(JP_INFO, "%-6s state_cleanup pid=%d reason=pid_reused", "PLS", st.pid);
+        return;
+    }
+
+    /* 校验通过，并且 pid 和启动时间都对得上：先 restore，再进入正常流程 */
+    char verdict_str[64] = {0};
+    const char *bid = (st.bid[0] != '\0') ? st.bid : "com.tencent.xin";
+    pulse_do_restore(st.pid, bid, verdict_str, sizeof(verdict_str));
+    JPLOG(JP_INFO, "%-6s crash_recovered pid=%d bid=%s verdict=%s",
+          "PLS", st.pid, bid, verdict_str[0] ? verdict_str : "RESTORE_OK");
+    pulse_clear_state_file(st.pid);
+}
+
 static int pulse_get_cur_priority(pid_t pid, int32_t *prio_out) {
     int count = 0;
     memorystatus_priority_entry_t *list = get_list(&count);
@@ -3828,7 +3907,7 @@ static void *pulse_worker_thread(void *arg) {
     }
 
     pulse_saved_state_t state;
-    if (pulse_get_or_record_initial_state(pid, &ident, &state) != 0) {
+    if (pulse_get_or_record_initial_state(pid, &ident, bid, &state) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED reason=ident");
         goto thread_done;
     }
@@ -6153,6 +6232,7 @@ int main(void) {
     lockmon_init();  /* 锁屏监听（失败则保持常速轮询，不影响保护） */
     load_old_targets();  /* 启动时导入旧 status.txt 记录供首轮认领 */
     restart_state_load();  /* 启动时载入重启计数状态 (v0.7.7 C2) */
+    pulse_startup_recovery();  /* 启动时脉冲状态恢复 (v0.7.8 C2-5) */
     JPLOG(JP_INFO, "%-6s v%s commit=%s pid=%d old_records=%d locked=%d",
            "START", JP_VERSION, JP_COMMIT, (int)getpid(), g_nold_targets, g_locked);
     mempressure_init();  /* 前台 App 内存压力触发初始化 (v0.7.0) */
