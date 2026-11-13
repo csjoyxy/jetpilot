@@ -132,6 +132,18 @@ struct proc_bsdinfo {
     uint64_t  pbi_start_tvusec;
 };
 #endif
+#ifndef PROC_PIDUNIQIDENTIFIERINFO
+#define PROC_PIDUNIQIDENTIFIERINFO 17
+struct proc_uniqidentifierinfo {
+    uint8_t   p_uuid[16];
+    uint64_t  p_uniqueid;
+    uint64_t  p_puniqueid;
+    int32_t   p_idversion;
+    uint32_t  p_reserve2;
+    uint64_t  p_reserve3;
+    uint64_t  p_reserve4;
+};
+#endif
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
@@ -1311,6 +1323,16 @@ typedef struct {
     uint32_t orig_inactive_attr;
     int      suspect;
 } pulse_saved_state_t;
+
+/* 配置文件状态变更检查通用结构体 (供 restart.txt 与 pulse.txt 共同复用) */
+typedef struct {
+    int             initialized;   /* 0: 未初始化; 1: 已记录状态 */
+    int             file_absent;   /* 上次检查时文件是否不存在 (1: 不存在; 0: 存在) */
+    ino_t           ino;           /* 上次文件的 st_ino */
+    off_t           size;          /* 上次文件的 st_size */
+    struct timespec mtimespec;     /* 上次文件的 st_mtimespec (含纳秒 tv_nsec) */
+    int             open_failed;   /* 是否处于打开失败状态 (用于只打一次 Warn) */
+} jp_file_stamp_t;
 
 static pulse_rule_t g_pulse_rules[PULSE_MAX_RULES];
 static int g_npulse_rules = 0;
@@ -2591,15 +2613,8 @@ static int restart_rule_cfg_equal(const restart_rule_t *a, const restart_rule_t 
 
 /* =========================================================================
  * 配置文件状态变更检查与打开通用函数 (供 restart.txt 与卡 2 的 pulse.txt 共同复用)
+ * 注: jp_file_stamp_t 结构体定义已前置于文件上方
  * ========================================================================= */
-typedef struct {
-    int             initialized;   /* 0: 未初始化; 1: 已记录状态 */
-    int             file_absent;   /* 上次检查时文件是否不存在 (1: 不存在; 0: 存在) */
-    ino_t           ino;           /* 上次文件的 st_ino */
-    off_t           size;          /* 上次文件的 st_size */
-    struct timespec mtimespec;     /* 上次文件的 st_mtimespec (含纳秒 tv_nsec) */
-    int             open_failed;   /* 是否处于打开失败状态 (用于只打一次 Warn) */
-} jp_file_stamp_t;
 
 /* 检查指定路径文件的内容/元数据是否发生变更。
  * 判定依据：st_ino + st_size + st_mtimespec (纳秒)。
@@ -2946,6 +2961,9 @@ static int restart_load_config(void) {
 
     return file_absent ? -1 : 0;
 }
+
+/* 前置声明：供 pulse 模块复用 restart 模块的字符串截断拷贝函数 */
+static inline void rst_str_copy(char *dst, size_t sz, const char *src);
 
 /* =========================================================================
  * 后台内存释放：配置加载与适用范围校验 (v0.7.8 C2-0)
@@ -3509,13 +3527,18 @@ static int pulse_get_proc_identity(pid_t pid, proc_identity_t *ident) {
 
     struct proc_bsdinfo bsdinfo;
     memset(&bsdinfo, 0, sizeof(bsdinfo));
-    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdinfo, sizeof(bsdinfo)) == sizeof(bsdinfo)) {
-        ident->uniqueid = bsdinfo.pbi_uniqueid;
-        ident->start_sec = bsdinfo.pbi_start_tvsec;
-        ident->start_usec = bsdinfo.pbi_start_tvusec;
-        return 0;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsdinfo, sizeof(bsdinfo)) != sizeof(bsdinfo)) {
+        return -1;
     }
-    return -1;
+    ident->start_sec = bsdinfo.pbi_start_tvsec;
+    ident->start_usec = bsdinfo.pbi_start_tvusec;
+
+    struct proc_uniqidentifierinfo uniqinfo;
+    memset(&uniqinfo, 0, sizeof(uniqinfo));
+    if (proc_pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, 0, &uniqinfo, sizeof(uniqinfo)) == sizeof(uniqinfo)) {
+        ident->uniqueid = uniqinfo.p_uniqueid;
+    }
+    return 0;
 }
 
 static int pulse_compare_proc_identity(const proc_identity_t *a, const proc_identity_t *b) {
@@ -4455,6 +4478,22 @@ static void *pulse_ctrl_worker_thread(void *arg) {
     return NULL;
 }
 
+/* =========================================================================
+ * App 进程列表单轮遍历缓存 (供 restart 与 pulse 共同复用，N5-a)
+ * ========================================================================= */
+#define RST_MAX_TRACKED_APPS 256
+typedef struct {
+    pid_t pid;
+    int32_t priority;
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    char bid[128];
+} rst_app_proc_t;
+
+static rst_app_proc_t s_app_procs[RST_MAX_TRACKED_APPS];
+static int s_napp_procs = -1;
+
+static void rst_ensure_app_procs(memorystatus_priority_entry_t *list, int count);
+
 static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     if (g_npulse_rules == 0 || g_pulse_cfg_file_absent) return;
 
@@ -5359,18 +5398,8 @@ static void restart_log_skip(const restart_rule_t *rule, rst_rule_state_t *r_sta
  * N5-a 限制说明：
  * 1. s_app_procs 上限 256 (RST_MAX_TRACKED_APPS)：单轮遍历最多缓存 256 个用户 App 进程，超出部分静默截断。
  * 2. bid 缓冲区 128 (sizeof(bid))：bundle ID 长度上限 127 字节，超出部分静默截断。
+ * 注: rst_app_proc_t、s_app_procs、s_napp_procs 已前置声明于上方供 pulse 与 restart 复用。
  */
-#define RST_MAX_TRACKED_APPS 256
-typedef struct {
-    pid_t pid;
-    int32_t priority;
-    char path[PROC_PIDPATHINFO_MAXSIZE];
-    char bid[128];
-} rst_app_proc_t;
-
-static rst_app_proc_t s_app_procs[RST_MAX_TRACKED_APPS];
-static int s_napp_procs = -1;
-
 static void rst_ensure_app_procs(memorystatus_priority_entry_t *list, int count) {
     if (s_napp_procs >= 0) return; /* 本轮已构建 */
     s_napp_procs = 0;
@@ -5490,7 +5519,7 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
 
         /* C2-2: pulse 进行期间，0.7.7 重启规则跳过该 pid */
         if (g_pulse_in_progress && g_pulse_current_pid == main_pid) {
-            restart_log_skip(rule, r_state, "pulse_in_progress", main_cur);
+            restart_log_skip(rule, r_state, "pulse_in_progress", main_cur, now_mono);
             continue;
         }
 
@@ -6857,7 +6886,7 @@ int main(void) {
 
     act_dedup_flush_all();
     JPLOG(JP_INFO, "STOP");
-    FILE *pf = fopen(PID_PATH, "r");
+    pf = fopen(PID_PATH, "r");
     if (pf) {
         int cur_pid = 0;
         if (fscanf(pf, "%d", &cur_pid) == 1 && cur_pid == (int)getpid()) {
