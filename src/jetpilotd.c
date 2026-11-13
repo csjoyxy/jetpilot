@@ -1209,6 +1209,41 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
     st->last_skip_reason[0] = '\0';
 }
 
+/* =========================================================================
+ * 后台内存释放规则模块 (v0.7.8 C2-0)
+ * ========================================================================= */
+#define PULSE_CONFIG_PATH     CONFIG_DIR "/pulse.txt"
+#define PULSE_STATE_PATH      CONFIG_DIR "/pulse.state"
+#define PULSE_STATE_TMP_PATH  CONFIG_DIR "/pulse.state.tmp"
+
+#define PULSE_MAX_RULES       32
+#define PULSE_MIN_TARGET_MB   300
+#define PULSE_MAX_TARGET_MB   1500
+#define PULSE_MIN_N_MIN       5
+#define PULSE_MAX_N_MIN       60
+#define PULSE_MIN_DAYMAX      1
+#define PULSE_MAX_DAYMAX      100
+#define PULSE_MIN_DELAY_MIN   1
+#define PULSE_MAX_DELAY_MIN   60
+#define PULSE_GLOBAL_DAYMAX   100
+#define PULSE_DEFAULT_WECHAT_TARGET 550
+
+typedef struct {
+    char    bid[128];
+    int     enabled;        /* 1: on, 0: off */
+    int32_t target_mb;      /* 300..1500 */
+    int32_t n_min;          /* 5..60 */
+    int32_t daymax;         /* 1..100 */
+    int32_t delay_min;      /* 1..60 */
+} pulse_rule_t;
+
+static pulse_rule_t g_pulse_rules[PULSE_MAX_RULES];
+static int g_npulse_rules = 0;
+static int g_pulse_cfg_file_absent = 1;
+static int g_pulse_cfg_first_load = 1;
+static int g_pulse_cfg_bad_count = 0;
+static jp_file_stamp_t s_pulse_cfg_stamp = {0};
+
 static memp_state_t g_memp_state = MEMP_STATE_OFF;
 static memp_reset_pending_t g_memp_reset_pending = MEMP_RESET_PENDING_NONE;
 static int g_memp_fails = 0;
@@ -2838,6 +2873,272 @@ static int restart_load_config(void) {
 }
 
 /* =========================================================================
+ * 后台内存释放：配置加载与适用范围校验 (v0.7.8 C2-0)
+ * ========================================================================= */
+static int pulse_rule_cfg_equal(const pulse_rule_t *a, const pulse_rule_t *b) {
+    if (strcmp(a->bid, b->bid) != 0) return 0;
+    if (a->enabled != b->enabled) return 0;
+    if (a->target_mb != b->target_mb) return 0;
+    if (a->n_min != b->n_min) return 0;
+    if (a->daymax != b->daymax) return 0;
+    if (a->delay_min != b->delay_min) return 0;
+    return 1;
+}
+
+static int pulse_is_supported_app(pid_t pid, const char *path, const char *bid) {
+    if (pid <= 0 || !path || !bid || bid[0] == '\0') return 0;
+    /* 1. 可执行文件必须位于 /var/containers/Bundle/Application/ 或 /private/var/containers/Bundle/Application/ 下 */
+    static const char kPrefix1[] = "/private/var/containers/Bundle/Application/";
+    static const char kPrefix2[] = "/var/containers/Bundle/Application/";
+    if (strncmp(path, kPrefix1, sizeof(kPrefix1) - 1) != 0 &&
+        strncmp(path, kPrefix2, sizeof(kPrefix2) - 1) != 0) {
+        return 0;
+    }
+    /* 2. 不支持扩展 (路径含 /PlugIns/) */
+    if (strstr(path, "/PlugIns/") != NULL) {
+        return 0;
+    }
+    /* 3. 不支持 Safari WebContent */
+    if (strstr(path, "WebContent") != NULL) {
+        return 0;
+    }
+    /* 4. 必须为主 App 二进制 (.app/<exe>) */
+    if (!memp_is_main_app_binary(path)) {
+        return 0;
+    }
+    /* 5. 不允许黑名单系统/守护进程 */
+    if (restart_is_blocked_bid(bid)) {
+        return 0;
+    }
+    return 1;
+}
+
+static pulse_rule_t *pulse_find_rule(const char *bid) {
+    if (!bid || bid[0] == '\0') return NULL;
+    for (int i = 0; i < g_npulse_rules; i++) {
+        if (strcmp(g_pulse_rules[i].bid, bid) == 0) {
+            return &g_pulse_rules[i];
+        }
+    }
+    return NULL;
+}
+
+static int pulse_load_config(void) {
+    int file_absent = 0;
+    FILE *f = NULL;
+    int rc = jp_config_open(PULSE_CONFIG_PATH, &s_pulse_cfg_stamp, "PLS", &file_absent, &f);
+
+    if (rc == 0) {
+        return g_pulse_cfg_file_absent ? -1 : 0;
+    }
+    if (rc < 0) {
+        return g_pulse_cfg_file_absent ? -1 : 0;
+    }
+
+    pulse_rule_t parsed_rules[PULSE_MAX_RULES];
+    int nparsed = 0;
+    int bad_line_count = 0;
+
+    if (f) {
+        char line[512];
+        int line_no = 0;
+        while (fgets(line, sizeof(line), f)) {
+            line_no++;
+            size_t llen = strlen(line);
+            int oversized = 0;
+            if (llen == sizeof(line) - 1 && line[llen - 1] != '\n' && !feof(f)) {
+                oversized = 1;
+                int c;
+                while ((c = fgetc(f)) != EOF && c != '\n') {}
+            }
+
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0') continue;
+
+            char raw_text[512];
+            strncpy(raw_text, p, sizeof(raw_text) - 1);
+            raw_text[sizeof(raw_text) - 1] = '\0';
+            char *nl = strchr(raw_text, '\n');
+            if (nl) *nl = '\0';
+            char *cr = strchr(raw_text, '\r');
+            if (cr) *cr = '\0';
+
+            if (oversized) {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                continue;
+            }
+
+            char line_copy[512];
+            strncpy(line_copy, raw_text, sizeof(line_copy) - 1);
+            line_copy[sizeof(line_copy) - 1] = '\0';
+
+            char *tokens[16];
+            int ntokens = 0;
+            char *saveptr = NULL;
+            char *tok = strtok_r(line_copy, " \t", &saveptr);
+            while (tok) {
+                if (ntokens < 15) {
+                    tokens[ntokens] = tok;
+                }
+                ntokens++;
+                tok = strtok_r(NULL, " \t", &saveptr);
+            }
+
+            /* 格式: bid:<bid> on|off target=<MB> n=<分钟> daymax=<次> delay=<分钟> (6 个 token) */
+            if (ntokens != 6) {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                continue;
+            }
+
+            if (strncmp(tokens[0], "bid:", 4) != 0) {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                continue;
+            }
+
+            const char *bid = tokens[0] + 4;
+            if (bid[0] == '\0' || strlen(bid) >= sizeof(parsed_rules[0].bid) || restart_is_blocked_bid(bid)) {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                continue;
+            }
+
+            int enabled = -1;
+            if (strcmp(tokens[1], "on") == 0) {
+                enabled = 1;
+            } else if (strcmp(tokens[1], "off") == 0) {
+                enabled = 0;
+            } else {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                continue;
+            }
+
+            int duplicate = 0;
+            for (int i = 0; i < nparsed; i++) {
+                if (strcmp(parsed_rules[i].bid, bid) == 0) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (duplicate) {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                continue;
+            }
+
+            int has_target = 0, has_n = 0, has_daymax = 0, has_delay = 0;
+            int32_t val_target = 0, val_n = 0, val_daymax = 0, val_delay = 0;
+            int bad = 0;
+
+            for (int k = 2; k < 6; k++) {
+                char *eq = strchr(tokens[k], '=');
+                if (!eq || eq == tokens[k] || *(eq + 1) == '\0') {
+                    bad = 1;
+                    break;
+                }
+                *eq = '\0';
+                char *key = tokens[k];
+                char *val_str = eq + 1;
+
+                char *endp = NULL;
+                errno = 0;
+                long v = strtol(val_str, &endp, 10);
+                if (errno != 0 || !endp || *endp != '\0') {
+                    bad = 1;
+                    break;
+                }
+
+                if (strcmp(key, "target") == 0) {
+                    if (has_target) { bad = 1; break; }
+                    if (v < PULSE_MIN_TARGET_MB || v > PULSE_MAX_TARGET_MB) { bad = 1; break; }
+                    val_target = (int32_t)v;
+                    has_target = 1;
+                } else if (strcmp(key, "n") == 0) {
+                    if (has_n) { bad = 1; break; }
+                    if (v < PULSE_MIN_N_MIN || v > PULSE_MAX_N_MIN) { bad = 1; break; }
+                    val_n = (int32_t)v;
+                    has_n = 1;
+                } else if (strcmp(key, "daymax") == 0) {
+                    if (has_daymax) { bad = 1; break; }
+                    if (v < PULSE_MIN_DAYMAX || v > PULSE_MAX_DAYMAX) { bad = 1; break; }
+                    val_daymax = (int32_t)v;
+                    has_daymax = 1;
+                } else if (strcmp(key, "delay") == 0) {
+                    if (has_delay) { bad = 1; break; }
+                    if (v < PULSE_MIN_DELAY_MIN || v > PULSE_MAX_DELAY_MIN) { bad = 1; break; }
+                    val_delay = (int32_t)v;
+                    has_delay = 1;
+                } else {
+                    bad = 1;
+                    break;
+                }
+            }
+
+            if (bad || !has_target || !has_n || !has_daymax || !has_delay) {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                continue;
+            }
+
+            if (nparsed >= PULSE_MAX_RULES) {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "PLS", line_no, raw_text);
+                continue;
+            }
+
+            pulse_rule_t *pr = &parsed_rules[nparsed++];
+            strncpy(pr->bid, bid, sizeof(pr->bid) - 1);
+            pr->bid[sizeof(pr->bid) - 1] = '\0';
+            pr->enabled = enabled;
+            pr->target_mb = val_target;
+            pr->n_min = val_n;
+            pr->daymax = val_daymax;
+            pr->delay_min = val_delay;
+        }
+        fclose(f);
+    }
+
+    g_pulse_cfg_bad_count = bad_line_count;
+
+    int changed = 0;
+    if (g_pulse_cfg_first_load) {
+        g_pulse_cfg_first_load = 0;
+        changed = 1;
+    } else if (file_absent != g_pulse_cfg_file_absent) {
+        changed = 1;
+    } else if (nparsed != g_npulse_rules) {
+        changed = 1;
+    } else {
+        for (int i = 0; i < nparsed; i++) {
+            if (!pulse_rule_cfg_equal(&parsed_rules[i], &g_pulse_rules[i])) {
+                changed = 1;
+                break;
+            }
+        }
+    }
+
+    if (changed) {
+        JPLOG(JP_INFO, "%-6s cfg rules=%d file=%s",
+              "PLS", nparsed, file_absent ? "absent" : "ok");
+        for (int i = 0; i < nparsed; i++) {
+            JPLOG(JP_DEBUG, "%-6s cfg_rule i=%d bid=%s on=%d target=%d n=%d daymax=%d delay=%d",
+                  "PLS", i, parsed_rules[i].bid, parsed_rules[i].enabled,
+                  (int)parsed_rules[i].target_mb, (int)parsed_rules[i].n_min,
+                  (int)parsed_rules[i].daymax, (int)parsed_rules[i].delay_min);
+        }
+        memcpy(g_pulse_rules, parsed_rules, sizeof(pulse_rule_t) * nparsed);
+        g_npulse_rules = nparsed;
+        g_pulse_cfg_file_absent = file_absent;
+    }
+
+    return file_absent ? -1 : 0;
+}
+
+/* =========================================================================
  * 超内存自动重启：状态持久化与状态机实现 (v0.7.7 C2)
  * ========================================================================= */
 int rst_fbs_launch(const char *bid, const char **err_stage);
@@ -3502,6 +3803,11 @@ static void restart_log_skip(const restart_rule_t *rule, rst_rule_state_t *r_sta
     }
 }
 
+/*
+ * N5-a 限制说明：
+ * 1. s_app_procs 上限 256 (RST_MAX_TRACKED_APPS)：单轮遍历最多缓存 256 个用户 App 进程，超出部分静默截断。
+ * 2. bid 缓冲区 128 (sizeof(bid))：bundle ID 长度上限 127 字节，超出部分静默截断。
+ */
 #define RST_MAX_TRACKED_APPS 256
 typedef struct {
     pid_t pid;
@@ -3795,6 +4101,7 @@ static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
     /* 2. 重新加载配置（§四） */
     mempressure_load_config();
     restart_load_config();
+    pulse_load_config();
 
     /* 2.5 自动重启判定与状态机 (v0.7.7 C2) */
     restart_round(list, count);

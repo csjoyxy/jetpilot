@@ -8982,7 +8982,9 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
                                                                        message:@"规则已变化，请刷新后重试"
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:alert animated:YES completion:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentViewController:alert animated:YES completion:nil];
+        });
         return;
     }
     [self.config removeLine:line];
