@@ -813,7 +813,17 @@ static int load_config(void) {
     return 0;
 }
 
+static volatile sig_atomic_t g_got_sigterm = 0;
+static volatile int g_pulse_stop_requested = 0;
+
+static void sigterm_handler(int sig) {
+    (void)sig;
+    g_got_sigterm = 1;
+    g_pulse_stop_requested = 1;
+}
+
 static int should_stop(void) {
+    if (g_got_sigterm) return 1;
     if (access(FLAG_PATH, F_OK) != 0) return 1;  /* 标记文件被删 */
     FILE *f = fopen(CONFIG_PATH, "r");
     if (f) {
@@ -3273,6 +3283,60 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
     return 1;
 }
 
+/* =========================================================================
+ * 后台内存释放：排队、并发控制与异步执行线程 (v0.7.8 C2-2)
+ * ========================================================================= */
+typedef struct {
+    char     bid[128];
+    pid_t    pid;
+    uint64_t fp_mb;
+    time_t   enqueued_mono;
+} pulse_queue_entry_t;
+
+#define PULSE_MAX_QUEUE 32
+static pulse_queue_entry_t g_pulse_queue[PULSE_MAX_QUEUE];
+static int g_npulse_queue = 0;
+
+static volatile int   g_pulse_in_progress = 0;
+static volatile pid_t g_pulse_current_pid = 0;
+static char           g_pulse_current_bid[128] = {0};
+static pthread_t      g_pulse_thread;
+static int            g_pulse_thread_running = 0;
+
+static void pulse_queue_remove_at(int idx) {
+    if (idx < 0 || idx >= g_npulse_queue) return;
+    for (int i = idx; i < g_npulse_queue - 1; i++) {
+        g_pulse_queue[i] = g_pulse_queue[i + 1];
+    }
+    g_npulse_queue--;
+}
+
+static void pulse_sort_queue(void) {
+    for (int i = 0; i < g_npulse_queue - 1; i++) {
+        for (int j = i + 1; j < g_npulse_queue; j++) {
+            if (g_pulse_queue[j].fp_mb > g_pulse_queue[i].fp_mb) {
+                pulse_queue_entry_t tmp = g_pulse_queue[i];
+                g_pulse_queue[i] = g_pulse_queue[j];
+                g_pulse_queue[j] = tmp;
+            }
+        }
+    }
+}
+
+static void *pulse_worker_thread(void *arg) {
+    pulse_queue_entry_t *target = (pulse_queue_entry_t *)arg;
+    if (!target) return NULL;
+
+    /* C2-3 将在此实现完整 pulse / 窗口采样 / restore 逻辑 */
+
+    g_pulse_in_progress = 0;
+    g_pulse_current_pid = 0;
+    g_pulse_current_bid[0] = '\0';
+    g_pulse_thread_running = 0;
+    free(target);
+    return NULL;
+}
+
 static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     if (g_npulse_rules == 0 || g_pulse_cfg_file_absent) return;
 
@@ -3286,6 +3350,29 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
 
     rst_ensure_app_procs(list, count);
 
+    /* 1. 维护队列：若队列中的 App 已回前台 (cur == 100)、处于 120 档或进程消失，移出队列 */
+    for (int q = g_npulse_queue - 1; q >= 0; q--) {
+        pid_t qpid = g_pulse_queue[q].pid;
+        int found = 0;
+        int32_t qcur = -1;
+        for (int j = 0; j < s_napp_procs; j++) {
+            if (s_app_procs[j].pid == qpid) {
+                found = 1;
+                qcur = s_app_procs[j].priority;
+                break;
+            }
+        }
+        if (!found || qcur == 100 || qcur == 120) {
+            pulse_queue_remove_at(q);
+        } else {
+            uint64_t cfp = 0;
+            if (pulse_get_footprint_mb(qpid, &cfp) == 0) {
+                g_pulse_queue[q].fp_mb = cfp;
+            }
+        }
+    }
+
+    /* 2. 状态推进与候选 App 入队 */
     for (int i = 0; i < g_npulse_rules; i++) {
         pulse_rule_t *rule = &g_pulse_rules[i];
         pulse_app_state_t *st = pulse_get_app_state(rule->bid, today_str);
@@ -3305,7 +3392,6 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         }
 
         if (main_pid <= 0) {
-            /* 进程已消失或未启动：重置后台跟踪状态 */
             st->tracked_pid = 0;
             st->in_bg = 0;
             st->bg_start_mono = 0;
@@ -3315,32 +3401,85 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
 
         /* 档位状态推进与 delay 计时 (Q2 / delay 裁定) */
         if (main_cur == 100) {
-            /* 前台：计时清零，允许下次进后台时再次 pulse */
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->pulsed_this_bg = 0;
             st->tracked_pid = main_pid;
         } else if (main_cur == 120) {
-            /* 后台音频：暂停/重置计时，回到 0..95 后从 0 重新计 */
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->tracked_pid = main_pid;
         } else if (main_cur >= 0 && main_cur <= 95) {
-            /* 后台档位 0..95 */
             if (st->tracked_pid != main_pid) {
-                /* PID 变化：计时清零 */
                 st->tracked_pid = main_pid;
                 st->in_bg = 1;
                 st->bg_start_mono = now_mono;
                 st->pulsed_this_bg = 0;
             } else if (!st->in_bg || st->bg_start_mono == 0) {
-                /* 刚进入后台：开始计时 */
                 st->in_bg = 1;
                 st->bg_start_mono = now_mono;
             }
-            /* 已经在后台：保持计时 */
+        }
+
+        /* 检查 7 项触发条件 */
+        uint64_t cand_fp = 0;
+        int skip_ctrl = 0;
+        int eligible = pulse_check_candidate(rule, st, main_pid, main_cur, main_path,
+                                             now_mono, &cand_fp, &skip_ctrl);
+        if (eligible) {
+            if (g_pulse_in_progress && g_pulse_current_pid == main_pid) {
+                continue;
+            }
+            int in_queue = 0;
+            for (int q = 0; q < g_npulse_queue; q++) {
+                if (g_pulse_queue[q].pid == main_pid) {
+                    in_queue = 1;
+                    break;
+                }
+            }
+            if (!in_queue && g_npulse_queue < PULSE_MAX_QUEUE) {
+                pulse_queue_entry_t *qe = &g_pulse_queue[g_npulse_queue++];
+                rst_str_copy(qe->bid, sizeof(qe->bid), rule->bid);
+                qe->pid = main_pid;
+                qe->fp_mb = cand_fp;
+                qe->enqueued_mono = now_mono;
+            }
+        }
+    }
+
+    /* 3. 对队列按 fp 从大到小排序 */
+    pulse_sort_queue();
+
+    /* 4. 若全局无 pulse 正在进行，且队列非空，弹出最大者并启动异步线程 */
+    if (!g_pulse_in_progress && g_npulse_queue > 0) {
+        pulse_queue_entry_t target = g_pulse_queue[0];
+        pulse_queue_remove_at(0);
+
+        pulse_app_state_t *st = pulse_get_app_state(target.bid, today_str);
+        if (st) {
+            st->pulsed_this_bg = 1; /* 每次进入后台最多 1 次 */
+        }
+
+        g_pulse_in_progress = 1;
+        g_pulse_current_pid = target.pid;
+        rst_str_copy(g_pulse_current_bid, sizeof(g_pulse_current_bid), target.bid);
+        g_pulse_stop_requested = 0;
+
+        pulse_queue_entry_t *thread_arg = (pulse_queue_entry_t *)malloc(sizeof(pulse_queue_entry_t));
+        if (thread_arg) {
+            *thread_arg = target;
+            if (pthread_create(&g_pulse_thread, NULL, pulse_worker_thread, thread_arg) == 0) {
+                g_pulse_thread_running = 1;
+            } else {
+                free(thread_arg);
+                g_pulse_in_progress = 0;
+                g_pulse_current_pid = 0;
+                g_pulse_current_bid[0] = '\0';
+            }
         } else {
-            /* 其他档位 (101-119 或 >120)：一律不处理 */
+            g_pulse_in_progress = 0;
+            g_pulse_current_pid = 0;
+            g_pulse_current_bid[0] = '\0';
         }
     }
 }
@@ -4140,6 +4279,12 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
             r_state->in_bg = 0;
             r_state->bg_start_mono = 0;
             r_state->sample_count = 0;
+            continue;
+        }
+
+        /* C2-2: pulse 进行期间，0.7.7 重启规则跳过该 pid */
+        if (g_pulse_in_progress && g_pulse_current_pid == main_pid) {
+            restart_log_skip(rule, r_state, "pulse_in_progress", main_cur);
             continue;
         }
 
@@ -5199,6 +5344,8 @@ int main(void) {
     if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
 
     setsid();  /* 脱离拉起它的 App 会话 */
+    signal(SIGTERM, sigterm_handler);
+    signal(SIGINT, sigterm_handler);
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     init_loglevel();  /* 从启动第一行起按配置 loglevel 过滤 (P1) */
     lockmon_init();  /* 锁屏监听（失败则保持常速轮询，不影响保护） */
@@ -5481,6 +5628,12 @@ int main(void) {
         }
         /* 注意：锁屏时最长 60 秒才发现 running.flag 被删（停止变慢），
          * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
+    }
+
+    if (g_pulse_thread_running) {
+        g_pulse_stop_requested = 1;
+        pthread_join(g_pulse_thread, NULL);
+        g_pulse_thread_running = 0;
     }
 
     act_dedup_flush_all();
