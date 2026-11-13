@@ -1198,7 +1198,7 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
 @property (nonatomic, assign) NSInteger target;  // MB: 300 ~ 1500
 @property (nonatomic, assign) NSInteger n;       // min: 5 ~ 60
 @property (nonatomic, assign) NSInteger daymax;  // times: 1 ~ 100
-@property (nonatomic, assign) NSInteger delay;   // min: 1 ~ 60
+@property (nonatomic, assign) NSInteger delay;   // 秒: 3 ~ 20 (默认 10)
 @property (nonatomic, copy) NSString *displayName;
 @property (nonatomic, assign) NSInteger lineIndex;
 @property (nonatomic, assign) BOOL isDuplicate;     // 重复规则标记
@@ -1305,7 +1305,7 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
             if (t.length > 0) [tokens addObject:t];
         }
 
-        // pulse.txt 格式: bid:<bid> on|off target=<MB> n=<分钟> daymax=<次> delay=<分钟> (恰好 6 个 token)
+        // pulse.txt 格式: bid:<bid> on|off target=<MB> n=<分钟> daymax=<次> delay_s=<秒> (恰好 6 个 token)
         if (tokens.count != 6 || ![tokens[0] hasPrefix:@"bid:"]) {
             JPPulseLine *l = [JPPulseLine new];
             l.isUnknownOrComment = YES;
@@ -1370,9 +1370,14 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
                 if (hasDaymax || v < 1 || v > 100) { bad = YES; break; }
                 valDaymax = (NSInteger)v;
                 hasDaymax = YES;
-            } else if ([key isEqualToString:@"delay"]) {
-                if (hasDelay || v < 1 || v > 60) { bad = YES; break; }
+            } else if ([key isEqualToString:@"delay_s"]) {
+                if (hasDelay || v < 3 || v > 20) { bad = YES; break; }
                 valDelay = (NSInteger)v;
+                hasDelay = YES;
+            } else if ([key isEqualToString:@"delay"]) {
+                if (hasDelay) { bad = YES; break; }
+                // 旧的 delay=<分钟> 照样能解析，但数值忽略，按 10 秒执行 (C2-T)
+                valDelay = 10;
                 hasDelay = YES;
             } else {
                 bad = YES;
@@ -1531,7 +1536,7 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
             [outputLines addObject:l.rawText ?: @""];
         } else {
             JPPulseRule *r = l.rule;
-            NSString *rLine = [NSString stringWithFormat:@"bid:%@ %@ target=%ld n=%ld daymax=%ld delay=%ld",
+            NSString *rLine = [NSString stringWithFormat:@"bid:%@ %@ target=%ld n=%ld daymax=%ld delay_s=%ld",
                                r.bid, r.enabled ? @"on" : @"off",
                                (long)r.target, (long)r.n, (long)r.daymax, (long)r.delay];
             [outputLines addObject:rLine];
@@ -7818,7 +7823,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.paramLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     self.paramLabel.textColor = UIColor.secondaryLabelColor;
     self.paramLabel.numberOfLines = 1;
-    self.paramLabel.text = [NSString stringWithFormat:@"目标 %ld MB · 等待 %ld 分 · 间隔 %ld 分 · 每天 %ld 次",
+    self.paramLabel.text = [NSString stringWithFormat:@"目标 %ld MB · 等待 %ld 秒 · 间隔 %ld 分 · 每天 %ld 次",
                             (long)self.rule.target, (long)self.rule.delay, (long)self.rule.n, (long)self.rule.daymax];
     [self addSubview:self.paramLabel];
 
@@ -8090,7 +8095,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
 
     self.currentTarget = (self.rule.target >= 300 && self.rule.target <= 1500) ? self.rule.target : 550;
-    self.currentDelay = (self.rule.delay >= 1 && self.rule.delay <= 60) ? self.rule.delay : 10;
+    self.currentDelay = (self.rule.delay >= 3 && self.rule.delay <= 20) ? self.rule.delay : 10;
     self.currentN = (self.rule.n >= 5 && self.rule.n <= 60) ? self.rule.n : 10;
     self.currentDaymax = (self.rule.daymax >= 1 && self.rule.daymax <= 100) ? self.rule.daymax : 30;
     self.isEnabled = self.rule.enabled;
@@ -8135,9 +8140,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             [self presentViewController:err animated:YES completion:nil];
             return;
         }
-        if (self.currentDelay < 1 || self.currentDelay > 60) {
+        if (self.currentDelay < 3 || self.currentDelay > 20) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"等待时间超出范围"
-                                                                         message:@"后台等待时间必须在 1 到 60 分钟之间"
+                                                                         message:@"后台等待时间必须在 3 到 20 秒之间"
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:err animated:YES completion:nil];
@@ -8245,7 +8250,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         label.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
         label.numberOfLines = 0;
         label.textColor = UIColor.secondaryLabelColor;
-        label.text = @"后台等待时间：切到后台多久后再释放。\n目标内存：当进入后台且物理内存达到此值时尝试释放。";
+        label.text = @"后台等待时间：切后台满这么多秒后释放一次；回前台前不会再动。\n目标内存：当进入后台且物理内存达到此值时尝试释放。";
         [footer addSubview:label];
         [NSLayoutConstraint activateConstraints:@[
             [label.topAnchor constraintEqualToAnchor:footer.topAnchor constant:6],
@@ -8307,7 +8312,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             if (self.isEnabled) cell.detailTextLabel.textColor = UIColor.systemBlueColor;
         } else if (indexPath.row == 1) {
             cell.textLabel.text = @"后台等待时间";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 分钟", (long)self.currentDelay];
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 秒", (long)self.currentDelay];
         } else if (indexPath.row == 2) {
             cell.textLabel.text = @"释放最小间隔";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 分钟", (long)self.currentN];
@@ -8380,31 +8385,30 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)promptEditDelay {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置后台等待时间"
-                                                                   message:@"切到后台多久后再释放。请输入 1 到 60 之间的分钟数"
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
-        textField.keyboardType = UIKeyboardTypeNumberPad;
-        textField.placeholder = @"分钟 (1 - 60)";
-        textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentDelay];
-    }];
-
-    __weak typeof(alert) weakAlert = alert;
+                                                                   message:@"切后台满这么多秒后释放一次；回前台前不会再动"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-        NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        NSInteger val = [txt integerValue];
-        if (txt.length == 0 || val < 1 || val > 60) {
-            UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
-                                                                         message:@"后台等待时间必须在 1 到 60 分钟之间"
-                                                                  preferredStyle:UIAlertControllerStyleAlert];
-            [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-            [weakSelf presentViewController:err animated:YES completion:nil];
-            return;
-        }
-        weakSelf.currentDelay = val;
-        [weakSelf.tableView reloadData];
-    }]];
+    NSArray<NSNumber *> *options = @[@5, @10, @15, @20];
+    for (NSNumber *opt in options) {
+        NSInteger s = [opt integerValue];
+        NSString *title = [NSString stringWithFormat:@"%ld 秒%@", (long)s, (s == self.currentDelay ? @"（当前）" : (s == 10 ? @"（默认）" : @""))];
+        [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            weakSelf.currentDelay = s;
+            [weakSelf.tableView reloadData];
+        }]];
+    }
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    if (alert.popoverPresentationController) {
+        UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:1 inSection:2]];
+        if (cell) {
+            alert.popoverPresentationController.sourceView = cell;
+            alert.popoverPresentationController.sourceRect = cell.bounds;
+        } else {
+            alert.popoverPresentationController.sourceView = self.view;
+            alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, self.view.bounds.size.height / 2, 1, 1);
+        }
+    }
     [self presentViewController:alert animated:YES completion:nil];
 }
 
