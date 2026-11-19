@@ -7014,6 +7014,8 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     self.titleLabel.textColor = UIColor.labelColor;
     self.titleLabel.text = name;
+    self.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.titleLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:self.titleLabel];
 
     self.fragLabel = [UILabel new];
@@ -7022,6 +7024,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.fragLabel.textColor = UIColor.secondaryLabelColor;
     self.fragLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
     self.fragLabel.text = self.rule.bid;
+    [self.fragLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:self.fragLabel];
 
     self.paramLabel = [UILabel new];
@@ -7029,6 +7032,8 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.paramLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     self.paramLabel.textColor = UIColor.secondaryLabelColor;
     self.paramLabel.numberOfLines = 1;
+    self.paramLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.paramLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
 
     NSString *bgStr = (self.rule.bg % 60 == 0) ?
         [NSString stringWithFormat:@"%ld分", (long)(self.rule.bg / 60)] :
@@ -7042,6 +7047,8 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
     self.statusLabel.numberOfLines = 1;
+    self.statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.statusLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:self.statusLabel];
 
     self.thrLabel = [UILabel new];
@@ -7049,12 +7056,14 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.thrLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
     self.thrLabel.textAlignment = NSTextAlignmentRight;
     self.thrLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.rule.thr];
+    [self.thrLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:self.thrLabel];
 
     UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
     chevron.translatesAutoresizingMaskIntoConstraints = NO;
     chevron.tintColor = UIColor.tertiaryLabelColor;
     chevron.contentMode = UIViewContentModeScaleAspectFit;
+    [chevron setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:chevron];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -7788,6 +7797,8 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     self.titleLabel.textColor = UIColor.labelColor;
     self.titleLabel.text = name;
+    self.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.titleLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:self.titleLabel];
 
     self.fragLabel = [UILabel new];
@@ -7796,6 +7807,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.fragLabel.textColor = UIColor.secondaryLabelColor;
     self.fragLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
     self.fragLabel.text = self.rule.bid;
+    [self.fragLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:self.fragLabel];
 
     self.paramLabel = [UILabel new];
@@ -7803,6 +7815,8 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.paramLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     self.paramLabel.textColor = UIColor.secondaryLabelColor;
     self.paramLabel.numberOfLines = 1;
+    self.paramLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.paramLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     self.paramLabel.text = [NSString stringWithFormat:@"目标 %ld MB · 等待 %ld 秒 · 间隔 %ld 分 · 每天 %ld 次",
                             (long)self.rule.target, (long)self.rule.delay, (long)self.rule.n, (long)self.rule.daymax];
     [self addSubview:self.paramLabel];
@@ -7811,6 +7825,8 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
     self.statusLabel.numberOfLines = 1;
+    self.statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.statusLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [self updateStatus];
     [self addSubview:self.statusLabel];
 
@@ -7819,11 +7835,13 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.thrLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
     self.thrLabel.textAlignment = NSTextAlignmentRight;
     self.thrLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.rule.target];
+    [self.thrLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:self.thrLabel];
 
     self.toggleSwitch = [UISwitch new];
     self.toggleSwitch.translatesAutoresizingMaskIntoConstraints = NO;
     self.toggleSwitch.on = self.rule.enabled;
+    [self.toggleSwitch setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self.toggleSwitch addTarget:self action:@selector(switchToggled:) forControlEvents:UIControlEventValueChanged];
     [self addSubview:self.toggleSwitch];
 
@@ -7831,6 +7849,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     chevron.translatesAutoresizingMaskIntoConstraints = NO;
     chevron.tintColor = UIColor.tertiaryLabelColor;
     chevron.contentMode = UIViewContentModeScaleAspectFit;
+    [chevron setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:chevron];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -7844,10 +7863,12 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         [chevron.widthAnchor constraintEqualToConstant:8],
         [chevron.heightAnchor constraintEqualToConstant:13],
 
-        [self.toggleSwitch.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-8],
+        [self.toggleSwitch.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-10],
         [self.toggleSwitch.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        [self.toggleSwitch.widthAnchor constraintEqualToConstant:51],
+        [self.toggleSwitch.heightAnchor constraintEqualToConstant:31],
 
-        [self.thrLabel.trailingAnchor constraintEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-8],
+        [self.thrLabel.trailingAnchor constraintEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-10],
         [self.thrLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
         [self.thrLabel.widthAnchor constraintGreaterThanOrEqualToConstant:60],
 
@@ -7861,11 +7882,11 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
         [self.paramLabel.topAnchor constraintEqualToAnchor:self.fragLabel.bottomAnchor constant:3],
         [self.paramLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
-        [self.paramLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-8],
+        [self.paramLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-10],
 
         [self.statusLabel.topAnchor constraintEqualToAnchor:self.paramLabel.bottomAnchor constant:3],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
-        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-8],
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.toggleSwitch.leadingAnchor constant:-10],
         [self.statusLabel.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12]
     ]];
 
@@ -7876,8 +7897,24 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.userInteractionEnabled = YES;
 }
 
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!self.userInteractionEnabled || self.hidden || self.alpha < 0.01) {
+        return [super hitTest:point withEvent:event];
+    }
+    CGRect switchHitRect = CGRectInset(self.toggleSwitch.frame, -8, -12);
+    if (CGRectContainsPoint(switchHitRect, point)) {
+        return self.toggleSwitch;
+    }
+    return [super hitTest:point withEvent:event];
+}
+
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
     if ([touch.view isDescendantOfView:self.toggleSwitch]) {
+        return NO;
+    }
+    CGPoint pt = [touch locationInView:self];
+    CGFloat switchLeft = CGRectGetMinX(self.toggleSwitch.frame);
+    if (switchLeft > 0 && pt.x >= (switchLeft - 10.0)) {
         return NO;
     }
     return YES;
@@ -7885,7 +7922,8 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)cardTapped:(UITapGestureRecognizer *)sender {
     CGPoint pt = [sender locationInView:self];
-    if (CGRectContainsPoint(CGRectInset(self.toggleSwitch.frame, -8, -8), pt)) {
+    CGFloat switchLeft = CGRectGetMinX(self.toggleSwitch.frame);
+    if (switchLeft > 0 && pt.x >= (switchLeft - 10.0)) {
         return;
     }
     if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidTap:)]) {
@@ -8133,10 +8171,10 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             return;
         }
 
-        // 有重启规则的才做 target <= 阈值 - 200 校验 (Q14)
+        // 有重启规则且已开启的才做 target <= 阈值 - 200 校验 (Q14)
         JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
         JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
-        if (rst && rst.thr > 0) {
+        if (rst && rst.isEnabled && rst.thr > 0) {
             if (self.currentTarget > rst.thr - 200) {
                 UIAlertController *err = [UIAlertController alertControllerWithTitle:@"目标值过高"
                                                                              message:[NSString stringWithFormat:@"目标值必须比该 App 的超内存重启阈值（%ld MB）低至少 200 MB。当前重启阈值为 %ld MB，目标值最高只能设为 %ld MB。", (long)rst.thr, (long)rst.thr, (long)(rst.thr - 200)]
@@ -9438,7 +9476,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         if (defTarget < 300) defTarget = 300;
 
         JPRestartRule *rst = [weakSelf.config ruleForBundleId:bid];
-        if (rst && rst.thr > 0 && defTarget > rst.thr - 200) {
+        if (rst && rst.isEnabled && rst.thr > 0 && defTarget > rst.thr - 200) {
             defTarget = MAX(300, rst.thr - 200);
         }
 
@@ -9526,7 +9564,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     if (enabled) {
         JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
         JPRestartRule *rst = [restartCfg ruleForBundleId:card.rule.bid];
-        if (rst && rst.thr > 0 && card.rule.target > rst.thr - 200) {
+        if (rst && rst.isEnabled && rst.thr > 0 && card.rule.target > rst.thr - 200) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"目标值过高"
                                                                          message:[NSString stringWithFormat:@"目标值必须比该 App 的超内存重启阈值（%ld MB）低至少 200 MB。当前重启阈值为 %ld MB，目标值最高只能设为 %ld MB。", (long)rst.thr, (long)rst.thr, (long)(rst.thr - 200)]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
