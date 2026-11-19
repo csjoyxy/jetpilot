@@ -7738,6 +7738,48 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 - (void)pulseRuleCardViewDidToggle:(JPPulseRuleCardView *)card enabled:(BOOL)enabled;
 @end
 
+@interface JPPulseSwitch : UISwitch
+@end
+
+@implementation JPPulseSwitch
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    CGRect hitBounds = CGRectInset(self.bounds, -8, -12);
+    return CGRectContainsPoint(hitBounds, point);
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!self.userInteractionEnabled || self.hidden || self.alpha < 0.01) {
+        return nil;
+    }
+    CGRect hitBounds = CGRectInset(self.bounds, -8, -12);
+    if (!CGRectContainsPoint(hitBounds, point)) {
+        return nil;
+    }
+    if (CGRectContainsPoint(self.bounds, point)) {
+        UIView *hit = [super hitTest:point withEvent:event];
+        if (hit && hit != self) {
+            return hit;
+        }
+    }
+    CGSize sz = self.bounds.size;
+    if (sz.width <= 0 || sz.height <= 0) {
+        return nil;
+    }
+    CGFloat clampedX = MAX(0.0, MIN(sz.width - 1.0, point.x));
+    CGFloat clampedY = MAX(0.0, MIN(sz.height - 1.0, point.y));
+    UIView *clampedHit = [super hitTest:CGPointMake(clampedX, clampedY) withEvent:event];
+    if (clampedHit && clampedHit != self) {
+        return clampedHit;
+    }
+    if (self.subviews.count > 0) {
+        return self.subviews.firstObject;
+    }
+    return self;
+}
+
+@end
+
 @interface JPPulseRuleCardView : UIView <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) JPPulseRule *rule;
 @property (nonatomic, weak) id<JPPulseRuleCardViewDelegate> delegate;
@@ -7838,7 +7880,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     [self.thrLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [self addSubview:self.thrLabel];
 
-    self.toggleSwitch = [UISwitch new];
+    self.toggleSwitch = [JPPulseSwitch new];
     self.toggleSwitch.translatesAutoresizingMaskIntoConstraints = NO;
     self.toggleSwitch.on = self.rule.enabled;
     [self.toggleSwitch setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
@@ -7903,7 +7945,11 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     }
     CGRect switchHitRect = CGRectInset(self.toggleSwitch.frame, -8, -12);
     if (CGRectContainsPoint(switchHitRect, point)) {
-        return self.toggleSwitch;
+        CGPoint switchPt = [self convertPoint:point toView:self.toggleSwitch];
+        UIView *hit = [self.toggleSwitch hitTest:switchPt withEvent:event];
+        if (hit) {
+            return hit;
+        }
     }
     return [super hitTest:point withEvent:event];
 }
