@@ -1192,11 +1192,16 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
 
 #pragma mark - Pulse Models (v0.7.8 C2-7)
 
+static const NSInteger kPulseMinTargetMB = 100;
+static const NSInteger kPulseMaxTargetMB = 1500;
+static const NSInteger kPulseMinNMin = 0;
+static const NSInteger kPulseMaxNMin = 60;
+
 @interface JPPulseRule : NSObject
 @property (nonatomic, copy) NSString *bid;
 @property (nonatomic, assign) BOOL enabled;      // YES: on, NO: off
-@property (nonatomic, assign) NSInteger target;  // MB: 300 ~ 1500
-@property (nonatomic, assign) NSInteger n;       // min: 5 ~ 60
+@property (nonatomic, assign) NSInteger target;  // MB: 100 ~ 1500
+@property (nonatomic, assign) NSInteger n;       // min: 0 ~ 60
 @property (nonatomic, assign) NSInteger daymax;  // times: 1 ~ 100
 @property (nonatomic, assign) NSInteger delay;   // 秒: 3 ~ 20 (默认 10)
 @property (nonatomic, copy) NSString *displayName;
@@ -1359,11 +1364,11 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
             }
 
             if ([key isEqualToString:@"target"]) {
-                if (hasTarget || v < 300 || v > 1500) { bad = YES; break; }
+                if (hasTarget || v < kPulseMinTargetMB || v > kPulseMaxTargetMB) { bad = YES; break; }
                 valTarget = (NSInteger)v;
                 hasTarget = YES;
             } else if ([key isEqualToString:@"n"]) {
-                if (hasN || v < 5 || v > 60) { bad = YES; break; }
+                if (hasN || v < kPulseMinNMin || v > kPulseMaxNMin) { bad = YES; break; }
                 valN = (NSInteger)v;
                 hasN = YES;
             } else if ([key isEqualToString:@"daymax"]) {
@@ -1560,9 +1565,12 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
 
 #pragma mark - Restart Models
 
+static const NSInteger kRestartMinThrMB = 50;
+static const NSInteger kRestartLowThrWarnMB = 100;
+
 @interface JPRestartRule : NSObject
 @property (nonatomic, copy) NSString *bid;
-@property (nonatomic, assign) NSInteger thr;        // MB, 200 ~ memcap
+@property (nonatomic, assign) NSInteger thr;        // MB, 50 ~ memcap
 @property (nonatomic, assign) NSInteger bg;         // 秒, 60 ~ 7200
 @property (nonatomic, assign) NSInteger max;        // 每天最多几次, 1 ~ 10
 @property (nonatomic, assign) NSInteger relaunch;   // 0 或 1
@@ -1707,7 +1715,7 @@ typedef NS_ENUM(NSInteger, JPMemPressureLineType) {
             }
 
             if ([key isEqualToString:@"thr"]) {
-                if (hasThr || v < 200 || (uint64_t)v > memcap) { bad = YES; break; }
+                if (hasThr || v < kRestartMinThrMB || (uint64_t)v > memcap) { bad = YES; break; }
                 valThr = (NSInteger)v;
                 hasThr = YES;
             } else if ([key isEqualToString:@"bg"]) {
@@ -7311,7 +7319,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
 
     self.memcapMB = JPGetDeviceMemcapMB();
-    self.currentThr = (self.rule.thr >= 200) ? self.rule.thr : 800;
+    self.currentThr = (self.rule.thr >= kRestartMinThrMB) ? self.rule.thr : 800;
     if ((uint64_t)self.currentThr > self.memcapMB) self.currentThr = (NSInteger)self.memcapMB;
 
     self.currentBgSeconds = (self.rule.bg >= 60 && self.rule.bg <= 7200) ? self.rule.bg : 600;
@@ -7359,9 +7367,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)saveTapped {
     if (self.isEnabled) {
-        if (self.currentThr < 200 || (uint64_t)self.currentThr > self.memcapMB) {
+        if (self.currentThr < kRestartMinThrMB || (uint64_t)self.currentThr > self.memcapMB) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"阈值超出范围"
-                                                                         message:[NSString stringWithFormat:@"重启阈值必须在 200 到 %llu MB 之间", self.memcapMB]
+                                                                         message:[NSString stringWithFormat:@"重启阈值必须在 %ld 到 %llu MB 之间", (long)kRestartMinThrMB, self.memcapMB]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:err animated:YES completion:nil];
@@ -7435,14 +7443,23 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 - (UIView *)tableView:(UITableView *)tableView viewForFooterInSection:(NSInteger)section {
     if (section == 2) {
         BOOL showWarn = self.isEnabled && (self.appWarnThr > 0) && (self.currentThr <= self.appWarnThr);
+        BOOL lowThr = self.isEnabled && (self.currentThr < kRestartLowThrWarnMB);
         UIView *footer = [UIView new];
         UILabel *label = [UILabel new];
         label.translatesAutoresizingMaskIntoConstraints = NO;
         label.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
         label.numberOfLines = 0;
-        if (showWarn) {
+        if (showWarn || lowThr) {
             label.textColor = UIColor.systemOrangeColor;
-            label.text = [NSString stringWithFormat:@"⚠️ 建议重启阈值高于释放阈值（当前释放阈值 %ld MB）", (long)self.appWarnThr];
+            NSString *warnText = [NSString stringWithFormat:@"⚠️ 建议重启阈值高于释放阈值（当前释放阈值 %ld MB）", (long)self.appWarnThr];
+            NSString *lowText = @"⚠️ 阈值低于 100 MB：App 刚启动的内存就可能超过阈值，可能频繁重启";
+            if (showWarn && lowThr) {
+                label.text = [NSString stringWithFormat:@"%@\n%@", warnText, lowText];
+            } else if (showWarn) {
+                label.text = warnText;
+            } else {
+                label.text = lowText;
+            }
         } else {
             label.textColor = UIColor.secondaryLabelColor;
             label.text = @"守护进程在后台定时检测内存；满足后台驻留时长且超限时将触发终止与拉起。";
@@ -7497,13 +7514,14 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             cell.textLabel.text = @"重启阈值";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.currentThr];
             BOOL showWarn = self.isEnabled && (self.appWarnThr > 0) && (self.currentThr <= self.appWarnThr);
+            BOOL lowThr = self.isEnabled && (self.currentThr < kRestartLowThrWarnMB);
             if (!self.isEnabled) {
                 cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
                 cell.textLabel.textColor = UIColor.secondaryLabelColor;
                 cell.accessoryType = UITableViewCellAccessoryNone;
                 cell.selectionStyle = UITableViewCellSelectionStyleNone;
             } else {
-                cell.detailTextLabel.textColor = showWarn ? UIColor.systemOrangeColor : UIColor.systemBlueColor;
+                cell.detailTextLabel.textColor = (showWarn || lowThr) ? UIColor.systemOrangeColor : UIColor.systemBlueColor;
                 cell.textLabel.textColor = UIColor.labelColor;
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
                 cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -7596,11 +7614,11 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)promptEditThreshold {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置重启阈值"
-                                                                   message:[NSString stringWithFormat:@"请输入 200 到 %llu MB 之间的数值", self.memcapMB]
+                                                                   message:[NSString stringWithFormat:@"请输入 %ld 到 %llu MB 之间的数值", (long)kRestartMinThrMB, self.memcapMB]
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
         textField.keyboardType = UIKeyboardTypeNumberPad;
-        textField.placeholder = @"MB (200 - memcap)";
+        textField.placeholder = [NSString stringWithFormat:@"MB (%ld - memcap)", (long)kRestartMinThrMB];
         textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentThr];
     }];
 
@@ -7609,9 +7627,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         NSInteger val = [txt integerValue];
-        if (txt.length == 0 || val < 200 || (uint64_t)val > weakSelf.memcapMB) {
+        if (txt.length == 0 || val < kRestartMinThrMB || (uint64_t)val > weakSelf.memcapMB) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
-                                                                         message:[NSString stringWithFormat:@"重启阈值必须在 200 到 %llu MB 之间", weakSelf.memcapMB]
+                                                                         message:[NSString stringWithFormat:@"重启阈值必须在 %ld 到 %llu MB 之间", (long)kRestartMinThrMB, weakSelf.memcapMB]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [weakSelf presentViewController:err animated:YES completion:nil];
@@ -7859,8 +7877,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.paramLabel.numberOfLines = 1;
     self.paramLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [self.paramLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
-    self.paramLabel.text = [NSString stringWithFormat:@"目标 %ld MB · 等待 %ld 秒 · 间隔 %ld 分 · 每天 %ld 次",
-                            (long)self.rule.target, (long)self.rule.delay, (long)self.rule.n, (long)self.rule.daymax];
+    NSString *nStr = (self.rule.n == 0) ? @"间隔 不限" : [NSString stringWithFormat:@"间隔 %ld 分", (long)self.rule.n];
+    self.paramLabel.text = [NSString stringWithFormat:@"目标 %ld MB · 等待 %ld 秒 · %@ · 每天 %ld 次",
+                            (long)self.rule.target, (long)self.rule.delay, nStr, (long)self.rule.daymax];
     [self addSubview:self.paramLabel];
 
     self.statusLabel = [UILabel new];
@@ -7980,7 +7999,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 - (void)updateStatus {
     JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
     JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
-    BOOL targetTooHigh = (self.rule.enabled && rst && rst.isEnabled && rst.thr > 0 && self.rule.target > rst.thr - 200);
+    BOOL rstActive = (self.rule.enabled && rst && rst.isEnabled && rst.thr > 0);
+    BOOL targetBlocked = rstActive && (self.rule.target >= rst.thr);
+    BOOL targetNear = rstActive && (!targetBlocked) && (rst.thr - self.rule.target < 200);
 
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     JPPulseAppState *ast = (st && self.rule.bid.length > 0) ? st.pulseAppStates[self.rule.bid] : nil;
@@ -8002,8 +8023,12 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         self.statusLabel.text = @"⚠️ 今日已熔断（切后台后异常退出）";
         self.statusLabel.textColor = UIColor.systemRedColor;
         self.alpha = 1.0;
-    } else if (targetTooHigh) {
-        self.statusLabel.text = @"目标高于重启阈值 − 200，释放可能来不及";
+    } else if (targetBlocked) {
+        self.statusLabel.text = @"⚠️ 目标不低于重启阈值，不会释放";
+        self.statusLabel.textColor = UIColor.systemRedColor;
+        self.alpha = 1.0;
+    } else if (targetNear) {
+        self.statusLabel.text = @"目标离重启阈值不到 200 MB，释放可能来不及";
         self.statusLabel.textColor = UIColor.systemOrangeColor;
         self.alpha = 1.0;
     } else if (ast.unresponsive) {
@@ -8146,9 +8171,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.title = self.isNewRule ? @"添加释放规则" : @"编辑释放规则";
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
 
-    self.currentTarget = (self.rule.target >= 300 && self.rule.target <= 1500) ? self.rule.target : 550;
+    self.currentTarget = (self.rule.target >= kPulseMinTargetMB && self.rule.target <= kPulseMaxTargetMB) ? self.rule.target : 550;
     self.currentDelay = (self.rule.delay >= 3 && self.rule.delay <= 20) ? self.rule.delay : 10;
-    self.currentN = (self.rule.n >= 5 && self.rule.n <= 60) ? self.rule.n : 10;
+    self.currentN = (self.rule.n >= kPulseMinNMin && self.rule.n <= kPulseMaxNMin) ? self.rule.n : 10;
     self.currentDaymax = (self.rule.daymax >= 1 && self.rule.daymax <= 100) ? self.rule.daymax : 30;
     self.isEnabled = self.rule.enabled;
     self.currentDisplayName = self.rule.displayName ?: @"";
@@ -8184,9 +8209,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)saveTapped {
     if (self.isEnabled) {
-        if (self.currentTarget < 300 || self.currentTarget > 1500) {
+        if (self.currentTarget < kPulseMinTargetMB || self.currentTarget > kPulseMaxTargetMB) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"目标值超出范围"
-                                                                         message:@"目标内存必须在 300 到 1500 MB 之间"
+                                                                         message:[NSString stringWithFormat:@"目标内存必须在 %ld 到 %ld MB 之间", (long)kPulseMinTargetMB, (long)kPulseMaxTargetMB]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:err animated:YES completion:nil];
@@ -8200,9 +8225,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             [self presentViewController:err animated:YES completion:nil];
             return;
         }
-        if (self.currentN < 5 || self.currentN > 60) {
+        if (self.currentN < kPulseMinNMin || self.currentN > kPulseMaxNMin) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"间隔超出范围"
-                                                                         message:@"释放最小间隔必须在 5 到 60 分钟之间"
+                                                                         message:@"释放最小间隔必须在 0 到 60 分钟之间"
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:err animated:YES completion:nil];
@@ -8217,13 +8242,13 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             return;
         }
 
-        // 有重启规则且已开启的才做 target <= 阈值 - 200 校验 (Q14)
+        // 有重启规则且已开启的才做 target < 重启阈值 校验 (Q14)
         JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
         JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
         if (rst && rst.isEnabled && rst.thr > 0) {
-            if (self.currentTarget > rst.thr - 200) {
+            if (self.currentTarget >= rst.thr) {
                 UIAlertController *err = [UIAlertController alertControllerWithTitle:@"目标值过高"
-                                                                             message:[NSString stringWithFormat:@"目标值必须比该 App 的超内存重启阈值（%ld MB）低至少 200 MB。当前重启阈值为 %ld MB，目标值最高只能设为 %ld MB。", (long)rst.thr, (long)rst.thr, (long)(rst.thr - 200)]
+                                                                             message:[NSString stringWithFormat:@"目标值必须低于该 App 的超内存重启阈值（%ld MB）。当前目标 %ld MB。", (long)rst.thr, (long)self.currentTarget]
                                                                       preferredStyle:UIAlertControllerStyleAlert];
                 [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
                 [self presentViewController:err animated:YES completion:nil];
@@ -8367,7 +8392,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 秒", (long)self.currentDelay];
         } else if (indexPath.row == 2) {
             cell.textLabel.text = @"释放最小间隔";
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 分钟", (long)self.currentN];
+            cell.detailTextLabel.text = (self.currentN == 0) ? @"不限" : [NSString stringWithFormat:@"%ld 分钟", (long)self.currentN];
         } else {
             cell.textLabel.text = @"每天释放上限";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 次", (long)self.currentDaymax];
@@ -8407,11 +8432,11 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)promptEditTarget {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置目标内存"
-                                                                   message:@"请输入 300 到 1500 MB 之间的数值"
+                                                                   message:[NSString stringWithFormat:@"请输入 %ld 到 %ld MB 之间的数值", (long)kPulseMinTargetMB, (long)kPulseMaxTargetMB]
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
         textField.keyboardType = UIKeyboardTypeNumberPad;
-        textField.placeholder = @"MB (300 - 1500)";
+        textField.placeholder = [NSString stringWithFormat:@"MB (%ld - %ld)", (long)kPulseMinTargetMB, (long)kPulseMaxTargetMB];
         textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentTarget];
     }];
 
@@ -8420,9 +8445,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
         NSInteger val = [txt integerValue];
-        if (txt.length == 0 || val < 300 || val > 1500) {
+        if (txt.length == 0 || val < kPulseMinTargetMB || val > kPulseMaxTargetMB) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
-                                                                         message:@"目标内存必须在 300 到 1500 MB 之间"
+                                                                         message:[NSString stringWithFormat:@"目标内存必须在 %ld 到 %ld MB 之间", (long)kPulseMinTargetMB, (long)kPulseMaxTargetMB]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [weakSelf presentViewController:err animated:YES completion:nil];
@@ -8466,11 +8491,11 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)promptEditN {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置释放最小间隔"
-                                                                   message:@"两次释放之间的最小间隔时间。请输入 5 到 60 之间的分钟数"
+                                                                   message:@"请输入 0 到 60 之间的分钟数，0 表示每次切后台都可释放"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
         textField.keyboardType = UIKeyboardTypeNumberPad;
-        textField.placeholder = @"分钟 (5 - 60)";
+        textField.placeholder = @"分钟 (0 - 60)";
         textField.text = [NSString stringWithFormat:@"%ld", (long)self.currentN];
     }];
 
@@ -8478,10 +8503,12 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     __weak typeof(self) weakSelf = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        NSInteger val = [txt integerValue];
-        if (txt.length == 0 || val < 5 || val > 60) {
+        NSScanner *scanner = [NSScanner scannerWithString:txt];
+        NSInteger val = 0;
+        BOOL validNum = [scanner scanInteger:&val] && [scanner isAtEnd];
+        if (txt.length == 0 || !validNum || val < kPulseMinNMin || val > kPulseMaxNMin) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
-                                                                         message:@"释放最小间隔必须在 5 到 60 分钟之间"
+                                                                         message:@"释放最小间隔必须在 0 到 60 分钟之间"
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [weakSelf presentViewController:err animated:YES completion:nil];
@@ -9514,16 +9541,16 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
                 JPBandsSnapshot *snap = [JPBandsSnapshot parseSnapshotContent:bContent expectedToken:nil];
                 JPBandsProcess *p = [snap bestProcessForBundleId:bid];
                 if (p && p.hasFp && p.fpMb > 0) {
-                    defTarget = MAX(300, p.fpMb + 100);
+                    defTarget = MAX(kPulseMinTargetMB, p.fpMb + 100);
                 }
             }
         }
-        if (defTarget > 1500) defTarget = 1500;
-        if (defTarget < 300) defTarget = 300;
+        if (defTarget > kPulseMaxTargetMB) defTarget = kPulseMaxTargetMB;
+        if (defTarget < kPulseMinTargetMB) defTarget = kPulseMinTargetMB;
 
         JPRestartRule *rst = [weakSelf.config ruleForBundleId:bid];
         if (rst && rst.isEnabled && rst.thr > 0 && defTarget > rst.thr - 200) {
-            defTarget = MAX(300, rst.thr - 200);
+            defTarget = MAX(kPulseMinTargetMB, rst.thr - 200);
         }
 
         JPPulseRule *newRule = [JPPulseRule new];
@@ -9610,15 +9637,16 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     if (enabled) {
         JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
         JPRestartRule *rst = [restartCfg ruleForBundleId:card.rule.bid];
-        if (rst && rst.isEnabled && rst.thr > 0 && card.rule.target > rst.thr - 200) {
+        if (rst && rst.isEnabled && rst.thr > 0 && card.rule.target >= rst.thr) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"目标值过高"
-                                                                         message:[NSString stringWithFormat:@"目标值必须比该 App 的超内存重启阈值（%ld MB）低至少 200 MB。当前重启阈值为 %ld MB，目标值最高只能设为 %ld MB。", (long)rst.thr, (long)rst.thr, (long)(rst.thr - 200)]
+                                                                         message:[NSString stringWithFormat:@"目标值必须低于该 App 的超内存重启阈值（%ld MB）。当前目标 %ld MB。", (long)rst.thr, (long)card.rule.target]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:err animated:YES completion:nil];
             card.toggleSwitch.on = NO;
             card.rule.enabled = NO;
             [card updateStatus];
+            [self rebuildPulseCards];
             return;
         }
     }
