@@ -1194,7 +1194,7 @@ static int g_memp_memcap_fallback = 0;
  * ========================================================================= */
 #define RESTART_CONFIG_PATH CONFIG_DIR "/restart.txt"
 #define RESTART_MAX_RULES   32
-#define RESTART_MIN_THR_MB  200
+#define RESTART_MIN_THR_MB  50
 #define RESTART_MIN_BG_SEC  60
 #define RESTART_MAX_BG_SEC  7200
 #define RESTART_MIN_MAX     1
@@ -1292,9 +1292,9 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
 #define PULSE_STATE_TMP_PATH  CONFIG_DIR "/pulse.state.tmp"
 
 #define PULSE_MAX_RULES       32
-#define PULSE_MIN_TARGET_MB   300
+#define PULSE_MIN_TARGET_MB   100
 #define PULSE_MAX_TARGET_MB   1500
-#define PULSE_MIN_N_MIN       5
+#define PULSE_MIN_N_MIN       0
 #define PULSE_MAX_N_MIN       60
 #define PULSE_MIN_DAYMAX      1
 #define PULSE_MAX_DAYMAX      100
@@ -1308,8 +1308,8 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
 typedef struct {
     char    bid[128];
     int     enabled;        /* 1: on, 0: off */
-    int32_t target_mb;      /* 300..1500 */
-    int32_t n_min;          /* 5..60 */
+    int32_t target_mb;      /* 100..1500 */
+    int32_t n_min;          /* 0..60 */
     int32_t daymax;         /* 1..100 */
     int32_t delay_s;        /* 3..20 秒 (默认 10) */
 } pulse_rule_t;
@@ -3475,7 +3475,8 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
     if (st->tripped_today) return 0;
 
     /* 检查是否命中频控 (条件 4 和 5)：命中频控者可作为对照组采样来源 (M5 / Q2) */
-    /* 条件 4: 距该 App 上一次 pulse 至少 n 分钟 (按 App 计，换 pid 也不清零；Hark-A 顺带裁定) */
+    /* 条件 4: 距该 App 上一次 pulse 至少 n 分钟 (按 App 计，换 pid 也不清零；Hark-A 顺带裁定)
+     * n=0 时没有冷却判定，永远满足，也就没有对照组样本 (用户已知) */
     int cooldown_hit = 0;
     if (st->last_pulse_mono > 0 && (now_mono - st->last_pulse_mono) < (time_t)rule->n_min * 60) {
         cooldown_hit = 1;
@@ -4124,30 +4125,8 @@ static uint64_t pulse_calc_cpu_ms(uint64_t cpu_start, uint64_t cpu_end) {
     return ms;
 }
 
-/* 首次启动状态清零标记 (C2-T) */
-#define PULSE_C2T_RESET_MARKER CONFIG_DIR "/pulse_c2t_reset"
-static void pulse_check_c2t_reset(void) {
-    if (access(PULSE_C2T_RESET_MARKER, F_OK) != 0) {
-        pthread_mutex_lock(&s_pulse_mutex);
-        for (int i = 0; i < PULSE_MAX_RULES; i++) {
-            g_pulse_app_states[i].total_pulses = 0;
-            g_pulse_app_states[i].no_drop_pulses = 0;
-            g_pulse_app_states[i].unresponsive = 0;
-        }
-        pthread_mutex_unlock(&s_pulse_mutex);
-        JPLOG(JP_INFO, "PULSE_STATS_RESET reason=c2t");
-        int fd = open(PULSE_C2T_RESET_MARKER, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-        if (fd >= 0) {
-            (void)write(fd, "c2t\n", 4);
-            close(fd);
-        }
-    }
-}
-
 /* 崩溃恢复状态与启动校验 (v0.7.8 C2-5 / Q5) */
 static void pulse_startup_recovery(void) {
-    pulse_check_c2t_reset();
-
     struct stat dir_st;
     if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
         JPLOG(JP_WARN, "%-6s state_invalid reason=dir_symlink path=%s", "PLS", PULSE_STATE_PATH);
