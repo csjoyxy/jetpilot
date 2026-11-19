@@ -39,6 +39,9 @@ extern int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <stdatomic.h>
 #if !defined(__APPLE__) && !defined(st_mtimespec)
 #define st_mtimespec st_mtim
 #endif
@@ -204,6 +207,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define FLAG_PATH   CONFIG_DIR "/running.flag"
 #define STATUS_PATH CONFIG_DIR "/status.txt"
 #define PID_PATH    CONFIG_DIR "/daemon.pid"
+#define LOCK_PATH   CONFIG_DIR "/daemon.lock"
 #define BANDS_REQ_PATH   CONFIG_DIR "/bands.req"
 #define BANDS_TAKEN_PATH CONFIG_DIR "/bands.req.taken"
 #define BANDS_PATH       CONFIG_DIR "/bands.txt"
@@ -3585,7 +3589,7 @@ static volatile int   g_pulse_in_progress = 0;
 static volatile pid_t g_pulse_current_pid = 0;
 static char           g_pulse_current_bid[128] = {0};
 static pthread_t      g_pulse_thread;
-static int            g_pulse_thread_running = 0;
+static _Atomic int    g_pulse_thread_running = 0;
 static int            g_pulse_thread_has_handle = 0;
 
 static void pulse_queue_remove_at(int idx) {
@@ -4962,10 +4966,11 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 pthread_join(g_pulse_thread, NULL);
                 g_pulse_thread_has_handle = 0;
             }
+            g_pulse_thread_running = 1;
             if (pthread_create(&g_pulse_thread, NULL, pulse_worker_thread, thread_arg) == 0) {
-                g_pulse_thread_running = 1;
                 g_pulse_thread_has_handle = 1;
             } else {
+                g_pulse_thread_running = 0;
                 free(thread_arg);
                 g_pulse_in_progress = 0;
                 g_pulse_current_pid = 0;
@@ -5001,8 +5006,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 pthread_join(g_pulse_thread, NULL);
                 g_pulse_thread_has_handle = 0;
             }
+            g_pulse_thread_running = 1;
             if (pthread_create(&g_pulse_thread, NULL, pulse_ctrl_worker_thread, carg) == 0) {
-                g_pulse_thread_running = 1;
                 g_pulse_thread_has_handle = 1;
                 pthread_mutex_lock(&s_pulse_mutex);
                 pulse_app_state_t *cst = pulse_get_app_state(best_ctrl_bid, today_str);
@@ -5011,6 +5016,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 }
                 pthread_mutex_unlock(&s_pulse_mutex);
             } else {
+                g_pulse_thread_running = 0;
                 free(carg);
                 g_pulse_in_progress = 0;
                 g_pulse_current_pid = 0;
@@ -6864,18 +6870,34 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[JetPilot] 必须以 root 运行\n");
         return 1;
     }
-    /* 防止重复启动：已有实例在跑就直接退出 */
-    FILE *pf = fopen(PID_PATH, "r");
-    if (pf) {
-        int old = 0;
-        if (fscanf(pf, "%d", &old) == 1 && old > 0 && kill(old, 0) == 0) {
-            fclose(pf);
-            fprintf(stderr, "[JetPilot] 已在运行 (pid %d)\n", old);
+    /* 单实例锁 (C1)：通过 flock 确保互斥，避免读写 pid 文件的竞态及 pid 复用误判 */
+    struct stat dir_st;
+    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
+        JPLOG(JP_WARN, "LOCK_FAIL reason=dir");
+        return 1;
+    }
+    int lock_fd = open(LOCK_PATH, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (lock_fd < 0) {
+        JPLOG(JP_WARN, "LOCK_FAIL errno=%d", errno);
+        return 1;
+    }
+    fchmod(lock_fd, 0600);
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            int file_pid = -1;   /* 读不到就是 -1 */
+            FILE *rpf = fopen(PID_PATH, "r");
+            if (rpf) { if (fscanf(rpf, "%d", &file_pid) != 1 || file_pid <= 0) file_pid = -1; fclose(rpf); }
+            JPLOG(JP_INFO, "DUP_INSTANCE pid=%d running=%d", (int)getpid(), file_pid);
+            if (file_pid > 0) fprintf(stderr, "[JetPilot] 已在运行 (pid %d)\n", file_pid);
+            else              fprintf(stderr, "[JetPilot] 已在运行\n");
             return 0;
         }
-        fclose(pf);
+        JPLOG(JP_WARN, "LOCK_FAIL errno=%d", errno);
+        return 1;
     }
-    pf = fopen(PID_PATH, "w");
+    (void)lock_fd; /* 锁在进程退出（含 SIGKILL）时由内核自动释放，生命周期内保持打开，不删除 lock 文件 */
+
+    FILE *pf = fopen(PID_PATH, "w");
     if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
 
     setsid();  /* 脱离拉起它的 App 会话 */
