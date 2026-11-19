@@ -6948,7 +6948,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 @protocol JPRestartRuleCardViewDelegate <NSObject>
 @optional
 - (void)restartRuleCardViewDidTap:(JPRestartRuleCardView *)card;
-- (void)restartRuleCardViewDidRequestDelete:(JPRestartRuleCardView *)card;
 @end
 
 @interface JPRestartRuleCardView : UIView
@@ -6960,7 +6959,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 @property (nonatomic, strong) UILabel *paramLabel;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *thrLabel;
-@property (nonatomic, strong) UIButton *deleteButton;
 
 - (instancetype)initWithRule:(JPRestartRule *)rule
                     delegate:(id<JPRestartRuleCardViewDelegate>)delegate
@@ -7053,13 +7051,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.thrLabel.text = [NSString stringWithFormat:@"%ld MB", (long)self.rule.thr];
     [self addSubview:self.thrLabel];
 
-    self.deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.deleteButton setImage:[UIImage systemImageNamed:@"trash"] forState:UIControlStateNormal];
-    self.deleteButton.tintColor = UIColor.systemRedColor;
-    [self.deleteButton addTarget:self action:@selector(deleteTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self addSubview:self.deleteButton];
-
     UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
     chevron.translatesAutoresizingMaskIntoConstraints = NO;
     chevron.tintColor = UIColor.tertiaryLabelColor;
@@ -7077,12 +7068,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         [chevron.widthAnchor constraintEqualToConstant:8],
         [chevron.heightAnchor constraintEqualToConstant:13],
 
-        [self.deleteButton.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-4],
-        [self.deleteButton.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
-        [self.deleteButton.widthAnchor constraintEqualToConstant:32],
-        [self.deleteButton.heightAnchor constraintEqualToConstant:32],
-
-        [self.thrLabel.trailingAnchor constraintEqualToAnchor:self.deleteButton.leadingAnchor constant:-6],
+        [self.thrLabel.trailingAnchor constraintEqualToAnchor:chevron.leadingAnchor constant:-8],
         [self.thrLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:12],
         [self.thrLabel.widthAnchor constraintGreaterThanOrEqualToConstant:60],
 
@@ -7096,11 +7082,11 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
         [self.paramLabel.topAnchor constraintEqualToAnchor:self.fragLabel.bottomAnchor constant:3],
         [self.paramLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
-        [self.paramLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.paramLabel.trailingAnchor constraintLessThanOrEqualToAnchor:chevron.leadingAnchor constant:-8],
 
         [self.statusLabel.topAnchor constraintEqualToAnchor:self.paramLabel.bottomAnchor constant:3],
         [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.iconImageView.trailingAnchor constant:12],
-        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.deleteButton.leadingAnchor constant:-8],
+        [self.statusLabel.trailingAnchor constraintLessThanOrEqualToAnchor:chevron.leadingAnchor constant:-8],
         [self.statusLabel.bottomAnchor constraintEqualToAnchor:self.bottomAnchor constant:-12]
     ]];
 
@@ -7136,20 +7122,13 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     }
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(cardTapped:)];
+    tap.cancelsTouchesInView = NO;
     [self addGestureRecognizer:tap];
 }
 
 - (void)cardTapped:(UITapGestureRecognizer *)gesture {
-    CGPoint pt = [gesture locationInView:self];
-    if (CGRectContainsPoint(self.deleteButton.frame, pt)) return;
     if ([self.delegate respondsToSelector:@selector(restartRuleCardViewDidTap:)]) {
         [self.delegate restartRuleCardViewDidTap:self];
-    }
-}
-
-- (void)deleteTapped {
-    if ([self.delegate respondsToSelector:@selector(restartRuleCardViewDidRequestDelete:)]) {
-        [self.delegate restartRuleCardViewDidRequestDelete:self];
     }
 }
 
@@ -7750,7 +7729,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 - (void)pulseRuleCardViewDidToggle:(JPPulseRuleCardView *)card enabled:(BOOL)enabled;
 @end
 
-@interface JPPulseRuleCardView : UIView
+@interface JPPulseRuleCardView : UIView <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) JPPulseRule *rule;
 @property (nonatomic, weak) id<JPPulseRuleCardViewDelegate> delegate;
 @property (nonatomic, strong) UIImageView *iconImageView;
@@ -7760,11 +7739,13 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *thrLabel;
 @property (nonatomic, strong) UISwitch *toggleSwitch;
+@property (nonatomic, strong) JPPulseAppState *appState;
 
 - (instancetype)initWithRule:(JPPulseRule *)rule
                     delegate:(id<JPPulseRuleCardViewDelegate>)delegate
                installedApps:(NSArray<JPInstalledApp *> *)apps
                     appState:(JPPulseAppState *)appState;
+- (void)updateStatus;
 @end
 
 @implementation JPPulseRuleCardView
@@ -7777,6 +7758,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     if (self) {
         _rule = rule;
         _delegate = delegate;
+        _appState = appState;
         [self setupUIWithApps:apps appState:appState];
     }
     return self;
@@ -7829,40 +7811,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.statusLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
     self.statusLabel.numberOfLines = 1;
-
-    JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
-    JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
-    BOOL targetTooHigh = (self.rule.enabled && rst && rst.isEnabled && rst.thr > 0 && self.rule.target > rst.thr - 200);
-
-    if (!self.rule.enabled) {
-        self.statusLabel.text = @"规则已关闭";
-        self.statusLabel.textColor = UIColor.secondaryLabelColor;
-        self.alpha = 0.65;
-    } else if (self.rule.isDuplicate) {
-        self.statusLabel.text = @"⚠️ 重复，只有第一条生效";
-        self.statusLabel.textColor = UIColor.systemRedColor;
-        self.alpha = 1.0;
-    } else if (appState.trippedToday) {
-        self.statusLabel.text = @"⚠️ 今日已熔断（切后台后异常退出）";
-        self.statusLabel.textColor = UIColor.systemRedColor;
-        self.alpha = 1.0;
-    } else if (targetTooHigh) {
-        self.statusLabel.text = @"目标高于重启阈值 − 200，释放可能来不及";
-        self.statusLabel.textColor = UIColor.systemOrangeColor;
-        self.alpha = 1.0;
-    } else if (appState.unresponsive) {
-        self.statusLabel.text = @"⚠️ 此 App 对释放无响应";
-        self.statusLabel.textColor = UIColor.systemOrangeColor;
-        self.alpha = 1.0;
-    } else if (appState.dayCount > 0) {
-        self.statusLabel.text = [NSString stringWithFormat:@"今日已释放 %ld 次", (long)appState.dayCount];
-        self.statusLabel.textColor = UIColor.systemGreenColor;
-        self.alpha = 1.0;
-    } else {
-        self.statusLabel.text = @"后台满足条件时自动释放";
-        self.statusLabel.textColor = UIColor.secondaryLabelColor;
-        self.alpha = 1.0;
-    }
+    [self updateStatus];
     [self addSubview:self.statusLabel];
 
     self.thrLabel = [UILabel new];
@@ -7921,13 +7870,22 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     ]];
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(cardTapped:)];
+    tap.delegate = self;
+    tap.cancelsTouchesInView = NO;
     [self addGestureRecognizer:tap];
     self.userInteractionEnabled = YES;
 }
 
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    if ([touch.view isDescendantOfView:self.toggleSwitch]) {
+        return NO;
+    }
+    return YES;
+}
+
 - (void)cardTapped:(UITapGestureRecognizer *)sender {
     CGPoint pt = [sender locationInView:self];
-    if (CGRectContainsPoint(self.toggleSwitch.frame, pt)) {
+    if (CGRectContainsPoint(CGRectInset(self.toggleSwitch.frame, -8, -8), pt)) {
         return;
     }
     if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidTap:)]) {
@@ -7935,23 +7893,53 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     }
 }
 
-- (void)switchToggled:(UISwitch *)sender {
-    self.rule.enabled = sender.isOn;
-    self.alpha = sender.isOn ? 1.0 : 0.65;
-    if (!sender.isOn) {
+- (void)updateStatus {
+    JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
+    JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
+    BOOL targetTooHigh = (self.rule.enabled && rst && rst.isEnabled && rst.thr > 0 && self.rule.target > rst.thr - 200);
+
+    JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
+    JPPulseAppState *ast = (st && self.rule.bid.length > 0) ? st.pulseAppStates[self.rule.bid] : nil;
+    if (!ast) {
+        ast = self.appState;
+    } else {
+        self.appState = ast;
+    }
+
+    if (!self.rule.enabled) {
         self.statusLabel.text = @"规则已关闭";
         self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        self.alpha = 0.65;
+    } else if (self.rule.isDuplicate) {
+        self.statusLabel.text = @"⚠️ 重复，只有第一条生效";
+        self.statusLabel.textColor = UIColor.systemRedColor;
+        self.alpha = 1.0;
+    } else if (ast.trippedToday) {
+        self.statusLabel.text = @"⚠️ 今日已熔断（切后台后异常退出）";
+        self.statusLabel.textColor = UIColor.systemRedColor;
+        self.alpha = 1.0;
+    } else if (targetTooHigh) {
+        self.statusLabel.text = @"目标高于重启阈值 − 200，释放可能来不及";
+        self.statusLabel.textColor = UIColor.systemOrangeColor;
+        self.alpha = 1.0;
+    } else if (ast.unresponsive) {
+        self.statusLabel.text = @"⚠️ 此 App 对释放无响应";
+        self.statusLabel.textColor = UIColor.systemOrangeColor;
+        self.alpha = 1.0;
+    } else if (ast.dayCount > 0) {
+        self.statusLabel.text = [NSString stringWithFormat:@"今日已释放 %ld 次", (long)ast.dayCount];
+        self.statusLabel.textColor = UIColor.systemGreenColor;
+        self.alpha = 1.0;
     } else {
-        JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
-        JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
-        if (rst && rst.isEnabled && rst.thr > 0 && self.rule.target > rst.thr - 200) {
-            self.statusLabel.text = @"目标高于重启阈值 − 200，释放可能来不及";
-            self.statusLabel.textColor = UIColor.systemOrangeColor;
-        } else {
-            self.statusLabel.text = @"后台满足条件时自动释放";
-            self.statusLabel.textColor = UIColor.secondaryLabelColor;
-        }
+        self.statusLabel.text = @"后台满足条件时自动释放";
+        self.statusLabel.textColor = UIColor.secondaryLabelColor;
+        self.alpha = 1.0;
     }
+}
+
+- (void)switchToggled:(UISwitch *)sender {
+    self.rule.enabled = sender.isOn;
+    [self updateStatus];
     if ([self.delegate respondsToSelector:@selector(pulseRuleCardViewDidToggle:enabled:)]) {
         [self.delegate pulseRuleCardViewDidToggle:self enabled:sender.isOn];
     }
@@ -9301,51 +9289,10 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     [self presentViewController:nav animated:YES completion:nil];
 }
 
-- (void)deleteRule:(JPRestartRule *)rule {
-    JPRestartLine *line = [self.config lineForRule:rule];
-    if (!line) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示"
-                                                                       message:@"规则已变化，请刷新后重试"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self presentViewController:alert animated:YES completion:nil];
-        });
-        return;
-    }
-    [self.config removeLine:line];
-    [self saveConfig];
-    [self rebuildRulesCards];
-}
-
 #pragma mark - JPRestartRuleCardViewDelegate
 
 - (void)restartRuleCardViewDidTap:(JPRestartRuleCardView *)card {
     [self openEditRuleController:card.rule isNew:NO];
-}
-
-- (void)restartRuleCardViewDidRequestDelete:(JPRestartRuleCardView *)card {
-    JPRestartRule *rule = card.rule;
-    NSString *name = ResolveDisplayNameHelper([NSString stringWithFormat:@"bid:%@", rule.bid], self.installedApps);
-    if (name.length == 0) name = rule.displayName.length > 0 ? rule.displayName : rule.bid;
-
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"移除规则"
-                                                                   message:[NSString stringWithFormat:@"确定要移除对「%@」的超内存重启规则吗？", name]
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-
-    __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"移除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        [weakSelf deleteRule:rule];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-
-    if (alert.popoverPresentationController) {
-        alert.popoverPresentationController.sourceView = card;
-        alert.popoverPresentationController.sourceRect = card.bounds;
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self presentViewController:alert animated:YES completion:nil];
-    });
 }
 
 #pragma mark - JPRestartUnknownLineCardViewDelegate
@@ -9585,13 +9532,28 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:err animated:YES completion:nil];
-            [self rebuildPulseCards];
+            card.toggleSwitch.on = NO;
+            card.rule.enabled = NO;
+            [card updateStatus];
             return;
         }
     }
     card.rule.enabled = enabled;
-    [self savePulseConfig];
-    [self rebuildPulseCards];
+    NSError *err = nil;
+    BOOL ok = [self.pulseConfig saveToPath:kPulseConfig error:&err];
+    if (!ok) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"保存配置失败"
+                                                                       message:[NSString stringWithFormat:@"写入 pulse.txt 失败：%@", err ? err.localizedDescription : @"未知错误"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentViewController:alert animated:YES completion:nil];
+        });
+        [self loadConfig];
+        [self rebuildPulseCards];
+    } else {
+        [self showSaveNotice];
+    }
 }
 
 #pragma mark - JPPulseUnknownLineCardViewDelegate
