@@ -2,3 +2,4 @@
 *.tipa
 *.zip
 .testrel
+src/*.verification

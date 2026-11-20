@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Note on E1 预审 L7 / 复审 L5: 确认已由 382763c 覆盖及环境适配设计，无需额外代码变更。
 """
 verify-artifacts.py: Post-package signature and entitlements verification for JetPilot.
 
@@ -214,8 +215,10 @@ def verify_code_signature(data: bytes, cs_offset: int, cs_size: int, bin_path: s
                 )
 
         # 2. Verify all special slots (1..n_special)
+        # 复审 L1: 特殊槽 -1 (Info.plist) 和 -3 (CodeResources) 内容在外部文件，不在 SuperBlob 里，跳过不判失败
         special_slot_errors = []
         special_slots_checked = []
+        special_slots_skipped = []
         for s in range(1, n_special + 1):
             expected_ent_hash = data[
                 hashes_base - s * hash_size : hashes_base - (s - 1) * hash_size
@@ -233,7 +236,9 @@ def verify_code_signature(data: bytes, cs_offset: int, cs_size: int, bin_path: s
                 else:
                     special_slots_checked.append(f"-{s}")
             else:
-                if not is_zero:
+                if s in (1, 3):
+                    special_slots_skipped.append(f"-{s}")
+                elif not is_zero:
                     special_slot_errors.append(
                         f"Special slot -{s} expected in CD but missing from SuperBlob"
                     )
@@ -253,6 +258,7 @@ def verify_code_signature(data: bytes, cs_offset: int, cs_size: int, bin_path: s
             "code_limit": code_limit,
             "n_special": n_special,
             "special_checked": special_slots_checked,
+            "special_skipped": special_slots_skipped,
             "cdhash_20": cdhash_20,
             "cdhash_full": cdhash_full,
             "code_page_errors": code_page_errors,
@@ -263,9 +269,12 @@ def verify_code_signature(data: bytes, cs_offset: int, cs_size: int, bin_path: s
 
         if not quiet:
             if cd_ok:
+                skip_msg = ""
+                if special_slots_skipped:
+                    skip_msg = f", skipped({','.join(special_slots_skipped)}: external)"
                 print(
                     f"[OK] CodeDirectory {slot_name}: {hasher_name}, all {n_code} code page hashes verified "
-                    f"(limit {code_limit}B, special slots {special_slots_checked} verified)."
+                    f"(limit {code_limit}B, special slots {special_slots_checked} verified{skip_msg})."
                 )
             else:
                 print(f"[FAIL] CodeDirectory {slot_name} verification FAILED:")
@@ -386,7 +395,6 @@ def print_comparison_table(ref_results: dict, cur_results: dict):
         print(row_fmt.format("File Size", f"{ref['size']} bytes", f"{cur['size']} bytes"))
         print(row_fmt.format("CPU Arch", f"{ref['cputype']}/{ref['cpusubtype']}", f"{cur['cputype']}/{cur['cpusubtype']}"))
         print(row_fmt.format("LC_BUILD_VERSION (minos)", f"{ref['minos']} (sdk {ref['sdk']})", f"{cur['minos']} (sdk {cur['sdk']})"))
-        
         ref_n_code = ref['sig']['n_code'] if ref.get('sig') else "N/A"
         cur_n_code = cur['sig']['n_code'] if cur.get('sig') else "N/A"
         print(row_fmt.format("Code Pages", f"{ref_n_code} pages", f"{cur_n_code} pages"))
@@ -394,24 +402,27 @@ def print_comparison_table(ref_results: dict, cur_results: dict):
         ref_cds = [f"0x{cd['slot_type']:04x} ({cd['hash_name']})" for cd in ref['sig']['cds']] if ref.get('sig') else []
         cur_cds = [f"0x{cd['slot_type']:04x} ({cd['hash_name']})" for cd in cur['sig']['cds']] if cur.get('sig') else []
         print(row_fmt.format("CodeDirectories", ", ".join(ref_cds), ", ".join(cur_cds)))
-        
+
         ref_cdhash = (ref['sig']['cdhash_20'][:16] + "...") if ref.get('sig') else "N/A"
         cur_cdhash = (cur['sig']['cdhash_20'][:16] + "...") if cur.get('sig') else "N/A"
         print(row_fmt.format("Primary CDHash", ref_cdhash, cur_cdhash))
-        
-        ref_ent = "Matched [OK]" if ref.get('ent_ok') else "Mismatch [FAIL]"
-        cur_ent = "Matched [OK]" if cur.get('ent_ok') else "Mismatch [FAIL]"
-        print(row_fmt.format("Entitlements vs Plist", ref_ent, cur_ent))
-        
+
+        # 复审 L2: 对照包使用自身 slot 5 权限，未比对
+        ref_src = ref.get('ent_source', 'slot 5')
+        cur_src = cur.get('ent_source', 'plist')
+        ref_ent = f"SKIPPED [未比对] ({ref_src})" if ref.get('ent_ok') else "Mismatch [FAIL]"
+        cur_ent = f"Matched [OK] ({cur_src})" if cur.get('ent_ok') else "Mismatch [FAIL]"
+        print(row_fmt.format("Entitlements vs Source", ref_ent, cur_ent))
+
         if bin_name == "jetpilotd":
             ref_fb = "true [OK]" if ref.get('frontboard_ok') else "missing [FAIL]"
             cur_fb = "true [OK]" if cur.get('frontboard_ok') else "missing [FAIL]"
             print(row_fmt.format("FrontBoard Entitlement", ref_fb, cur_fb))
-        
+
         ref_sig = "PASSED [OK]" if ref.get('sig_ok') else "FAILED [FAIL]"
         cur_sig = "PASSED [OK]" if cur.get('sig_ok') else "FAILED [FAIL]"
         print(row_fmt.format("Page Hash Integrity", ref_sig, cur_sig))
-        
+
         print(row_fmt.format("codesign --verify", ref.get('codesign_verdict', 'N/A'), cur.get('codesign_verdict', 'N/A')))
     print("\n================================================================================\n")
 
@@ -460,17 +471,14 @@ def write_verification_status(
     with open(status_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    # Mirror to src/VERIFICATION_STATUS if in repo
-    parent = os.path.dirname(os.path.abspath(tipa_path))
-    repo_status_file = os.path.join(parent, "VERIFICATION_STATUS")
-    try:
-        with open(repo_status_file, "w", encoding="utf-8") as f:
-            f.write(content)
-    except Exception:
-        pass
 
-
-def verify_binary(bin_path: str, expected_plist_path: str, is_daemon: bool, quiet: bool = False) -> tuple[bool, dict]:
+def verify_binary(
+    bin_path: str,
+    expected_plist_path: str,
+    is_daemon: bool,
+    quiet: bool = False,
+    is_reference: bool = False,
+) -> tuple[bool, dict]:
     bin_name = os.path.basename(bin_path)
     if not quiet:
         print(f"============================================================")
@@ -501,7 +509,7 @@ def verify_binary(bin_path: str, expected_plist_path: str, is_daemon: bool, quie
         if not quiet:
             print(f"[FAIL] {err}")
         return False, info
-    if not os.path.isfile(expected_plist_path):
+    if not is_reference and not os.path.isfile(expected_plist_path):
         err = f"Expected entitlements file not found: {expected_plist_path}"
         errors.append(err)
         if not quiet:
@@ -569,27 +577,33 @@ def verify_binary(bin_path: str, expected_plist_path: str, is_daemon: bool, quie
         return False, info
 
     # 3. Compare with Expected Entitlements
-    try:
-        with open(expected_plist_path, "rb") as f:
-            expected_ent = plistlib.load(f)
-    except Exception as e:
-        err = f"Failed reading expected plist {expected_plist_path}: {e}"
-        errors.append(err)
-        if not quiet:
-            print(f"[FAIL] {err}")
-        return False, info
+    if is_reference:
+        # 复审 L2: 对照包使用自身 slot 5 权限，不与当前仓库 plist 比较
+        info["ent_source"] = "slot 5"
+        info["ent_ok"] = True
+    else:
+        info["ent_source"] = os.path.basename(expected_plist_path)
+        try:
+            with open(expected_plist_path, "rb") as f:
+                expected_ent = plistlib.load(f)
+        except Exception as e:
+            err = f"Failed reading expected plist {expected_plist_path}: {e}"
+            errors.append(err)
+            if not quiet:
+                print(f"[FAIL] {err}")
+            return False, info
 
-    diffs = compare_entitlements(embedded_ent, expected_ent, bin_name)
-    if diffs:
-        errors.extend(diffs)
+        diffs = compare_entitlements(embedded_ent, expected_ent, bin_name)
+        if diffs:
+            errors.extend(diffs)
+            if not quiet:
+                print(f"[FAIL] Embedded entitlements mismatch against {os.path.basename(expected_plist_path)}:")
+                for d in diffs:
+                    print(f"  - {d}")
+            return False, info
+        info["ent_ok"] = True
         if not quiet:
-            print(f"[FAIL] Embedded entitlements mismatch against {os.path.basename(expected_plist_path)}:")
-            for d in diffs:
-                print(f"  - {d}")
-        return False, info
-    info["ent_ok"] = True
-    if not quiet:
-        print(f"[OK] Embedded entitlements match {os.path.basename(expected_plist_path)} exactly.")
+            print(f"[OK] Embedded entitlements match {os.path.basename(expected_plist_path)} exactly.")
 
     # FrontBoard entitlement check for daemon
     if is_daemon:
@@ -704,8 +718,12 @@ def verify_tipa_package(
         daemon_bin = os.path.join(app_dir, "jetpilotd")
         app_bin = os.path.join(app_dir, "JetPilot")
 
-        daemon_ok, daemon_info = verify_binary(daemon_bin, daemon_plist, is_daemon=True, quiet=is_reference)
-        app_ok, app_info = verify_binary(app_bin, app_plist, is_daemon=False, quiet=is_reference)
+        daemon_ok, daemon_info = verify_binary(
+            daemon_bin, daemon_plist, is_daemon=True, quiet=is_reference, is_reference=is_reference
+        )
+        app_ok, app_info = verify_binary(
+            app_bin, app_plist, is_daemon=False, quiet=is_reference, is_reference=is_reference
+        )
         results["jetpilotd"] = daemon_info
         results["JetPilot"] = app_info
 

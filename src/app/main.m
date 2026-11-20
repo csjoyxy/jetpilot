@@ -2009,31 +2009,48 @@ typedef struct __SecTask *SecTaskRef;
 typedef SecTaskRef (*SecTaskCreateFromSelfFunc)(CFAllocatorRef allocator);
 typedef CFTypeRef (*SecTaskCopyValueForEntitlementFunc)(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error);
 
-static BOOL JPAppHasPersonaEntitlement(void) {
+typedef NS_ENUM(NSInteger, JPPersonaEntitlementStatus) {
+    JPPersonaEntitlementStatusUnknown = -1,
+    JPPersonaEntitlementStatusNo = 0,
+    JPPersonaEntitlementStatusYes = 1,
+};
+
+static JPPersonaEntitlementStatus JPAppPersonaEntitlementStatus(void) {
     void *secHandle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
     if (!secHandle) secHandle = RTLD_DEFAULT;
     SecTaskCreateFromSelfFunc taskCreate = (SecTaskCreateFromSelfFunc)dlsym(secHandle, "SecTaskCreateFromSelf");
     SecTaskCopyValueForEntitlementFunc copyEnt = (SecTaskCopyValueForEntitlementFunc)dlsym(secHandle, "SecTaskCopyValueForEntitlement");
-    if (!taskCreate || !copyEnt) return NO;
+    if (!taskCreate || !copyEnt) return JPPersonaEntitlementStatusUnknown;
 
     SecTaskRef task = taskCreate(NULL);
-    if (!task) return NO;
+    if (!task) return JPPersonaEntitlementStatusUnknown;
 
     CFErrorRef err = NULL;
     CFTypeRef val = copyEnt(task, CFSTR("com.apple.private.persona-mgmt"), &err);
-    BOOL hasEnt = NO;
+    JPPersonaEntitlementStatus status = JPPersonaEntitlementStatusNo;
     if (val) {
         if (CFGetTypeID(val) == CFBooleanGetTypeID()) {
-            hasEnt = CFBooleanGetValue((CFBooleanRef)val);
+            status = CFBooleanGetValue((CFBooleanRef)val) ? JPPersonaEntitlementStatusYes : JPPersonaEntitlementStatusNo;
         }
         CFRelease(val);
     }
     if (err) CFRelease(err);
     CFRelease(task);
-    return hasEnt;
+    return status;
 }
 
-static int JPSpawnPersonaProbe(int *exitCodeOut, int *errOut) {
+static BOOL JPAppHasPersonaEntitlement(void) {
+    return JPAppPersonaEntitlementStatus() == JPPersonaEntitlementStatusYes;
+}
+
+/*
+ * 探测执行辅助函数 (C3)
+ * - withPersona: YES 带 persona 99/uid 0/gid 0，NO 不带
+ * - sigOut: 记录子进程被信号杀掉时的信号编号 (WIFSIGNALED -> WTERMSIG)
+ * - waitpid 遇到 EINTR 自动循环重试 (复审 L2)
+ * - 5 秒超时：WNOHANG 轮询，每 100ms 一次；超时发 SIGKILL 并回收，errOut 设为 ETIMEDOUT (预审 L4)
+ */
+static int JPSpawnProbeCommon(BOOL withPersona, int *exitCodeOut, int *sigOut, int *errOut) {
     NSString *bin = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"jetpilotd"];
     const char *cpath = bin.fileSystemRepresentation;
     const char *argv[] = { cpath, "--probe", NULL };
@@ -2041,65 +2058,72 @@ static int JPSpawnPersonaProbe(int *exitCodeOut, int *errOut) {
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
-    posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
-    posix_spawnattr_set_persona_uid_np(&attr, 0);
-    posix_spawnattr_set_persona_gid_np(&attr, 0);
+    if (withPersona) {
+        posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+        posix_spawnattr_set_persona_uid_np(&attr, 0);
+        posix_spawnattr_set_persona_gid_np(&attr, 0);
+    }
 
     pid_t pid = 0;
     int rc = posix_spawn(&pid, cpath, NULL, &attr, (char **)argv, environ);
     posix_spawnattr_destroy(&attr);
 
     int exitCode = -1;
+    int sig = 0;
     int err = 0;
     if (rc != 0) {
         err = rc;
     } else if (pid > 0) {
         int status = 0;
-        pid_t wpid = waitpid(pid, &status, 0);
-        if (wpid == pid) {
-            if (WIFEXITED(status)) {
-                exitCode = WEXITSTATUS(status);
+        BOOL finished = NO;
+        // 等待最多 5 秒 (50 次 × 100ms)
+        for (int i = 0; i < 50; i++) {
+            pid_t wpid;
+            do {
+                wpid = waitpid(pid, &status, WNOHANG);
+            } while (wpid < 0 && errno == EINTR);
+
+            if (wpid == pid) {
+                finished = YES;
+                if (WIFEXITED(status)) {
+                    exitCode = WEXITSTATUS(status);
+                } else if (WIFSIGNALED(status)) {
+                    sig = WTERMSIG(status);
+                }
+                break;
+            } else if (wpid < 0) {
+                err = errno;
+                finished = YES;
+                break;
             }
-        } else {
-            err = errno;
+            usleep(100000); // 100 ms
+        }
+
+        if (!finished) {
+            // 超时：SIGKILL 并 waitpid 回收
+            kill(pid, SIGKILL);
+            pid_t wpid;
+            do {
+                wpid = waitpid(pid, &status, 0);
+            } while (wpid < 0 && errno == EINTR);
+            if (wpid == pid && WIFSIGNALED(status)) {
+                sig = WTERMSIG(status);
+            }
+            err = ETIMEDOUT;
         }
     }
     if (exitCodeOut) *exitCodeOut = exitCode;
+    if (sigOut) *sigOut = sig;
     if (errOut) *errOut = err;
     return rc;
 }
 
-static int JPSpawnPlainProbe(int *exitCodeOut, int *errOut) {
-    NSString *bin = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"jetpilotd"];
-    const char *cpath = bin.fileSystemRepresentation;
-    const char *argv[] = { cpath, "--probe", NULL };
+static int JPSpawnPersonaProbe(int *exitCodeOut, int *sigOut, int *errOut) {
+    return JPSpawnProbeCommon(YES, exitCodeOut, sigOut, errOut);
+}
 
-    posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
-
-    pid_t pid = 0;
-    int rc = posix_spawn(&pid, cpath, NULL, &attr, (char **)argv, environ);
-    posix_spawnattr_destroy(&attr);
-
-    int exitCode = -1;
-    int err = 0;
-    if (rc != 0) {
-        err = rc;
-    } else if (pid > 0) {
-        int status = 0;
-        pid_t wpid = waitpid(pid, &status, 0);
-        if (wpid == pid) {
-            if (WIFEXITED(status)) {
-                exitCode = WEXITSTATUS(status);
-            }
-        } else {
-            err = errno;
-        }
-    }
-    if (exitCodeOut) *exitCodeOut = exitCode;
-    if (errOut) *errOut = err;
-    return rc;
+static int JPSpawnPlainProbe(int *exitCodeOut, int *sigOut, int *errOut) {
+    return JPSpawnProbeCommon(NO, exitCodeOut, sigOut, errOut);
 }
 
 @interface JPDaemonManager : NSObject
@@ -2107,7 +2131,7 @@ static int JPSpawnPlainProbe(int *exitCodeOut, int *errOut) {
 + (int)startDaemonWithLastSpawnTime:(CFAbsoluteTime *)lastSpawnTimeOut;
 + (void)stopDaemon;
 + (void)runProbeDiagnosticsFromViewController:(UIViewController *)vc;
-+ (BOOL)precheckDaemonWithRc:(int *)rcOut exitOut:(int *)exitOut errOut:(int *)errOut reason:(NSString **)reasonOut;
++ (BOOL)precheckDaemonWithRc:(int *)rcOut exitOut:(int *)exitOut sigOut:(int *)sigOut errOut:(int *)errOut reason:(NSString **)reasonOut;
 + (void)handleSpawnFailure:(int)rc fromViewController:(UIViewController *)vc;
 @end
 
@@ -2166,37 +2190,88 @@ static int JPSpawnPlainProbe(int *exitCodeOut, int *errOut) {
      * 判读（写进代码注释，不用实现自动判断）：
      * (a) 返回 EPERM、(b) 成功 → 问题在 persona 这一步；
      * (a)(b) 都返回 EPERM → 内核拒绝执行这个文件；
-     * 两者都成功 → 问题在常规启动路径的环境里。
+     * 两者都成功 → 问题在常规启动路径的环境里；
+     * persona-mgmt 权限=NO 时，(a) 失败是预期结果，不能读作 persona 这一步有问题；
+     * sig=9 一般是被代码签名或系统拒绝执行（未核实），请截图。
      */
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         int persona_exit = -1;
-        int persona_rc = JPSpawnPersonaProbe(&persona_exit, NULL);
+        int persona_sig = 0;
+        int persona_err = 0;
+        int persona_rc = JPSpawnPersonaProbe(&persona_exit, &persona_sig, &persona_err);
 
         int plain_exit = -1;
-        int plain_rc = JPSpawnPlainProbe(&plain_exit, NULL);
+        int plain_sig = 0;
+        int plain_err = 0;
+        int plain_rc = JPSpawnPlainProbe(&plain_exit, &plain_sig, &plain_err);
 
-        BOOL persona_ent = JPAppHasPersonaEntitlement();
+        JPPersonaEntitlementStatus entStatus = JPAppPersonaEntitlementStatus();
+        NSString *entStr = (entStatus == JPPersonaEntitlementStatusYes) ? @"YES"
+                         : ((entStatus == JPPersonaEntitlementStatusNo) ? @"NO" : @"UNKNOWN");
 
-        // 记录结论行（E2-4 格式规范）
-        NSLog(@"SPAWN_PROBE persona_rc=%d plain_rc=%d plain_exit=%d persona_ent=%d",
-              persona_rc, plain_rc, plain_exit, (int)(persona_ent ? 1 : 0));
+        // 记录结论行（E2-4 格式规范，包含 persona_sig= 与 plain_sig=）
+        NSLog(@"SPAWN_PROBE persona_rc=%d persona_exit=%d persona_sig=%d persona_err=%d plain_rc=%d plain_exit=%d plain_sig=%d plain_err=%d persona_ent=%@",
+              persona_rc, persona_exit, persona_sig, persona_err,
+              plain_rc, plain_exit, plain_sig, plain_err, entStr);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!vc) return;
-            NSString *diagMsg = [NSString stringWithFormat:
-                @"SPAWN_PROBE persona_rc=%d plain_rc=%d plain_exit=%d persona_ent=%d\n\n"
-                @"【探测详情】\n"
-                @"a. 带 persona: rc=%d (%s), exit=%d\n"
-                @"b. 不带 persona: rc=%d (%s), exit=%d\n"
-                @"c. persona-mgmt 权限: %@\n\n"
+
+            NSString *personaDesc = nil;
+            if (persona_rc != 0) {
+                personaDesc = [NSString stringWithFormat:@"spawn 失败: %s (rc=%d)", strerror(persona_rc), persona_rc];
+            } else if (persona_err == ETIMEDOUT) {
+                personaDesc = @"探测超时";
+            } else if (persona_err != 0) {
+                personaDesc = [NSString stringWithFormat:@"waitpid 失败: %s (errno=%d)", strerror(persona_err), persona_err];
+            } else if (persona_sig != 0) {
+                personaDesc = [NSString stringWithFormat:@"被信号杀掉 (sig=%d)", persona_sig];
+            } else {
+                personaDesc = [NSString stringWithFormat:@"正常退出 (exit=%d)", persona_exit];
+            }
+
+            NSString *plainDesc = nil;
+            if (plain_rc != 0) {
+                plainDesc = [NSString stringWithFormat:@"spawn 失败: %s (rc=%d)", strerror(plain_rc), plain_rc];
+            } else if (plain_err == ETIMEDOUT) {
+                plainDesc = @"探测超时";
+            } else if (plain_err != 0) {
+                plainDesc = [NSString stringWithFormat:@"waitpid 失败: %s (errno=%d)", strerror(plain_err), plain_err];
+            } else if (plain_sig != 0) {
+                plainDesc = [NSString stringWithFormat:@"被信号杀掉 (sig=%d)", plain_sig];
+            } else {
+                plainDesc = [NSString stringWithFormat:@"正常退出 (exit=%d)", plain_exit];
+            }
+
+            NSMutableString *interpretRef = [NSMutableString stringWithFormat:
                 @"【判读参考】\n"
                 @"• (a) EPERM、(b) 成功 → 问题在 persona 这一步\n"
                 @"• (a)(b) 都 EPERM → 内核拒绝执行该文件\n"
-                @"• 两者都成功 → 问题在常规启动环境",
-                persona_rc, plain_rc, plain_exit, (int)(persona_ent ? 1 : 0),
-                persona_rc, strerror(persona_rc), persona_exit,
-                plain_rc, strerror(plain_rc), plain_exit,
-                persona_ent ? @"YES" : @"NO"];
+                @"• 两者都成功 → 问题在常规启动环境\n"
+                @"• persona-mgmt 权限=NO 时，(a) 失败是预期结果，不能读作 persona 这一步有问题"];
+            BOOL showSigHint = NO;
+            if (persona_sig > 0 && !(persona_err == ETIMEDOUT && persona_sig == 9)) {
+                showSigHint = YES;
+            }
+            if (plain_sig > 0 && !(plain_err == ETIMEDOUT && plain_sig == 9)) {
+                showSigHint = YES;
+            }
+            if (showSigHint) {
+                [interpretRef appendString:@"\n• sig=9 一般是被代码签名或系统拒绝执行（未核实），请截图"];
+            }
+
+            NSString *diagMsg = [NSString stringWithFormat:
+                @"SPAWN_PROBE persona_rc=%d plain_rc=%d plain_exit=%d persona_ent=%@ persona_sig=%d plain_sig=%d\n\n"
+                @"【探测详情】\n"
+                @"a. 带 persona: %@\n"
+                @"b. 不带 persona: %@\n"
+                @"c. persona-mgmt 权限: %@\n\n"
+                @"%@",
+                persona_rc, plain_rc, plain_exit, entStr, persona_sig, plain_sig,
+                personaDesc,
+                plainDesc,
+                entStr,
+                interpretRef];
 
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"进程探测诊断"
                                                                            message:diagMsg
@@ -2207,7 +2282,7 @@ static int JPSpawnPlainProbe(int *exitCodeOut, int *errOut) {
     });
 }
 
-+ (BOOL)precheckDaemonWithRc:(int *)rcOut exitOut:(int *)exitOut errOut:(int *)errOut reason:(NSString **)reasonOut {
++ (BOOL)precheckDaemonWithRc:(int *)rcOut exitOut:(int *)exitOut sigOut:(int *)sigOut errOut:(int *)errOut reason:(NSString **)reasonOut {
     /*
      * E2-1 重启前预检（先验后停）
      * 1. jetpilotd 存在且可执行（access(X_OK)）；
@@ -2222,43 +2297,70 @@ static int JPSpawnPlainProbe(int *exitCodeOut, int *errOut) {
         int e = errno;
         if (rcOut) *rcOut = -1;
         if (exitOut) *exitOut = -1;
+        if (sigOut) *sigOut = 0;
         if (errOut) *errOut = e;
         if (reasonOut) *reasonOut = [NSString stringWithFormat:@"jetpilotd 不存在或不可执行 (access X_OK 失败: %s)", strerror(e)];
         return NO;
     }
 
     // 2. App 自身持有 persona-mgmt（SecTaskCopyValueForEntitlement）
-    if (!JPAppHasPersonaEntitlement()) {
+    // 复审 L1: 缺少权限时 errOut 设为 0，不再编造 EPERM
+    // 预审 L6: dlsym 取不到符号时改记为无法判断权限，跳过此步继续做第 3 步 probe
+    JPPersonaEntitlementStatus entStatus = JPAppPersonaEntitlementStatus();
+    if (entStatus == JPPersonaEntitlementStatusNo) {
         if (rcOut) *rcOut = -1;
         if (exitOut) *exitOut = -1;
-        if (errOut) *errOut = EPERM;
+        if (sigOut) *sigOut = 0;
+        if (errOut) *errOut = 0;
         if (reasonOut) *reasonOut = @"App 缺少 com.apple.private.persona-mgmt 权限";
         return NO;
     }
 
     // 3. 带 persona spawn jetpilotd --probe (E2-4 a)
     int probe_exit = -1;
+    int probe_sig = 0;
     int probe_err = 0;
-    int probe_rc = JPSpawnPersonaProbe(&probe_exit, &probe_err);
+    int probe_rc = JPSpawnPersonaProbe(&probe_exit, &probe_sig, &probe_err);
     if (probe_rc != 0) {
         if (rcOut) *rcOut = probe_rc;
         if (exitOut) *exitOut = -1;
+        if (sigOut) *sigOut = 0;
         if (errOut) *errOut = (probe_err != 0) ? probe_err : probe_rc;
         if (reasonOut) *reasonOut = [NSString stringWithFormat:@"带 persona 探测 spawn 失败: %s", strerror(probe_rc)];
+        return NO;
+    }
+
+    if (probe_err == ETIMEDOUT) {
+        if (rcOut) *rcOut = 0;
+        if (exitOut) *exitOut = -1;
+        if (sigOut) *sigOut = probe_sig;
+        if (errOut) *errOut = ETIMEDOUT;
+        if (reasonOut) *reasonOut = @"探测超时";
         return NO;
     }
 
     if (probe_err != 0) {
         if (rcOut) *rcOut = 0;
         if (exitOut) *exitOut = probe_exit;
+        if (sigOut) *sigOut = probe_sig;
         if (errOut) *errOut = probe_err;
         if (reasonOut) *reasonOut = [NSString stringWithFormat:@"带 persona 探测 waitpid 失败: %s", strerror(probe_err)];
+        return NO;
+    }
+
+    if (probe_sig != 0) {
+        if (rcOut) *rcOut = 0;
+        if (exitOut) *exitOut = -1;
+        if (sigOut) *sigOut = probe_sig;
+        if (errOut) *errOut = 0;
+        if (reasonOut) *reasonOut = [NSString stringWithFormat:@"带 persona 探测被信号杀掉: sig=%d", probe_sig];
         return NO;
     }
 
     if (probe_exit != 0) {
         if (rcOut) *rcOut = 0;
         if (exitOut) *exitOut = probe_exit;
+        if (sigOut) *sigOut = 0;
         if (errOut) *errOut = 0;
         if (reasonOut) *reasonOut = [NSString stringWithFormat:@"带 persona 探测退出码非 0: %d", probe_exit];
         return NO;
@@ -2266,6 +2368,7 @@ static int JPSpawnPlainProbe(int *exitCodeOut, int *errOut) {
 
     if (rcOut) *rcOut = 0;
     if (exitOut) *exitOut = 0;
+    if (sigOut) *sigOut = 0;
     if (errOut) *errOut = 0;
     if (reasonOut) *reasonOut = nil;
     return YES;
@@ -6446,16 +6549,19 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
     int pre_rc = 0;
     int pre_exit = 0;
+    int pre_sig = 0;
     int pre_errno = 0;
     NSString *pre_reason = nil;
-    if (![JPDaemonManager precheckDaemonWithRc:&pre_rc exitOut:&pre_exit errOut:&pre_errno reason:&pre_reason]) {
-        NSLog(@"SPAWN_PRECHECK_FAIL rc=%d exit=%d errno=%d", pre_rc, pre_exit, pre_errno);
+    if (![JPDaemonManager precheckDaemonWithRc:&pre_rc exitOut:&pre_exit sigOut:&pre_sig errOut:&pre_errno reason:&pre_reason]) {
+        NSLog(@"SPAWN_PRECHECK_FAIL rc=%d exit=%d sig=%d errno=%d", pre_rc, pre_exit, pre_sig, pre_errno);
         self.restartInProgress = NO;
         s_restartInProgress = NO;
         self.versionWarningBanner.enabled = YES;
-        NSString *errDetail = (pre_errno != 0)
-            ? [NSString stringWithFormat:@"(rc=%d, exit=%d, errno=%d: %s)", pre_rc, pre_exit, pre_errno, strerror(pre_errno)]
-            : [NSString stringWithFormat:@"(rc=%d, exit=%d)", pre_rc, pre_exit];
+        NSString *errDetail = (pre_errno == ETIMEDOUT)
+            ? @"(5 秒内未退出，已结束探测进程)"
+            : ((pre_errno != 0)
+                ? [NSString stringWithFormat:@"(rc=%d, exit=%d, sig=%d, errno=%d: %s)", pre_rc, pre_exit, pre_sig, pre_errno, strerror(pre_errno)]
+                : [NSString stringWithFormat:@"(rc=%d, exit=%d, sig=%d)", pre_rc, pre_exit, pre_sig]);
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"预检失败，已保持旧守护进程运行"
                                                                        message:[NSString stringWithFormat:@"重启预检失败: %@\n%@\n旧守护进程未停止，继续保持运行。",
                                                                                 pre_reason ?: @"未知错误", errDetail]
@@ -7626,8 +7732,10 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     __weak typeof(self) weakSelf = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        NSInteger val = [txt integerValue];
-        if (txt.length == 0 || val < kRestartMinThrMB || (uint64_t)val > weakSelf.memcapMB) {
+        NSScanner *scanner = [NSScanner scannerWithString:txt];
+        NSInteger val = 0;
+        BOOL validNum = [scanner scanInteger:&val] && [scanner isAtEnd];
+        if (txt.length == 0 || !validNum || val < kRestartMinThrMB || (uint64_t)val > weakSelf.memcapMB) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
                                                                          message:[NSString stringWithFormat:@"重启阈值必须在 %ld 到 %llu MB 之间", (long)kRestartMinThrMB, weakSelf.memcapMB]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
@@ -8444,8 +8552,10 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     __weak typeof(self) weakSelf = self;
     [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *txt = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        NSInteger val = [txt integerValue];
-        if (txt.length == 0 || val < kPulseMinTargetMB || val > kPulseMaxTargetMB) {
+        NSScanner *scanner = [NSScanner scannerWithString:txt];
+        NSInteger val = 0;
+        BOOL validNum = [scanner scanInteger:&val] && [scanner isAtEnd];
+        if (txt.length == 0 || !validNum || val < kPulseMinTargetMB || val > kPulseMaxTargetMB) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"数值超出范围"
                                                                          message:[NSString stringWithFormat:@"目标内存必须在 %ld 到 %ld MB 之间", (long)kPulseMinTargetMB, (long)kPulseMaxTargetMB]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
@@ -9264,16 +9374,19 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
     int pre_rc = 0;
     int pre_exit = 0;
+    int pre_sig = 0;
     int pre_errno = 0;
     NSString *pre_reason = nil;
-    if (![JPDaemonManager precheckDaemonWithRc:&pre_rc exitOut:&pre_exit errOut:&pre_errno reason:&pre_reason]) {
-        NSLog(@"SPAWN_PRECHECK_FAIL rc=%d exit=%d errno=%d", pre_rc, pre_exit, pre_errno);
+    if (![JPDaemonManager precheckDaemonWithRc:&pre_rc exitOut:&pre_exit sigOut:&pre_sig errOut:&pre_errno reason:&pre_reason]) {
+        NSLog(@"SPAWN_PRECHECK_FAIL rc=%d exit=%d sig=%d errno=%d", pre_rc, pre_exit, pre_sig, pre_errno);
         self.restartInProgress = NO;
         s_restartInProgress = NO;
         self.versionWarningBanner.enabled = YES;
-        NSString *errDetail = (pre_errno != 0)
-            ? [NSString stringWithFormat:@"(rc=%d, exit=%d, errno=%d: %s)", pre_rc, pre_exit, pre_errno, strerror(pre_errno)]
-            : [NSString stringWithFormat:@"(rc=%d, exit=%d)", pre_rc, pre_exit];
+        NSString *errDetail = (pre_errno == ETIMEDOUT)
+            ? @"(5 秒内未退出，已结束探测进程)"
+            : ((pre_errno != 0)
+                ? [NSString stringWithFormat:@"(rc=%d, exit=%d, sig=%d, errno=%d: %s)", pre_rc, pre_exit, pre_sig, pre_errno, strerror(pre_errno)]
+                : [NSString stringWithFormat:@"(rc=%d, exit=%d, sig=%d)", pre_rc, pre_exit, pre_sig]);
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"预检失败，已保持旧守护进程运行"
                                                                        message:[NSString stringWithFormat:@"重启预检失败: %@\n%@\n旧守护进程未停止，继续保持运行。",
                                                                                 pre_reason ?: @"未知错误", errDetail]
@@ -9646,7 +9759,6 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             card.toggleSwitch.on = NO;
             card.rule.enabled = NO;
             [card updateStatus];
-            [self rebuildPulseCards];
             return;
         }
     }

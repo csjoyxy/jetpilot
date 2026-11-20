@@ -9,6 +9,7 @@ set -u
 # 3. entitlements-daemon.plist contains com.apple.frontboard.launchapplications, and when artifacts are built,
 #    verifies embedded entitlements, code signatures, and page hashes of the packaged binaries.
 # 4. Print count of JPLOG lines for each level (ERR/WARN/INFO/DEBUG) - diagnostic only.
+# (Note: E1 预审 L7 / 复审 L5 确认已由 382763c 覆盖及环境适配)
 #
 # Returns exit 1 on any check failure; 0 if all pass.
 
@@ -20,6 +21,7 @@ ARTIFACT_PATH=""
 SKIP_ARTIFACT=0
 
 # Parse options
+# 预审 L8: 遇到未知参数直接报 [FAIL] unknown argument 并退出，只认显式选项
 while [ $# -gt 0 ]; do
     case "$1" in
         --artifact|-a)
@@ -36,19 +38,21 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         *)
-            if [ -z "$ARTIFACT_PATH" ] && [ -f "$1" ]; then
-                ARTIFACT_PATH="$1"
-                shift
-            else
-                shift
-            fi
+            echo "[FAIL] unknown argument: $1"
+            exit 1
             ;;
     esac
 done
 
 # If no explicit artifact provided and not skipped, auto-detect built tipa in src/
+# 预审 L9: 若本地自动探测到 src/JetPilot.tipa 但比源文件旧，打 [WARN] stale artifact, skipped 并跳过
 if [ -z "$ARTIFACT_PATH" ] && [ "$SKIP_ARTIFACT" -eq 0 ] && [ -f "$REPO_ROOT/src/JetPilot.tipa" ]; then
-    ARTIFACT_PATH="$REPO_ROOT/src/JetPilot.tipa"
+    if [ "$REPO_ROOT/src/JetPilot.tipa" -ot "$REPO_ROOT/src/jetpilotd.c" ] || \
+       [ "$REPO_ROOT/src/JetPilot.tipa" -ot "$REPO_ROOT/src/app/main.m" ]; then
+        echo "[WARN] stale artifact, skipped: src/JetPilot.tipa is older than source files"
+    else
+        ARTIFACT_PATH="$REPO_ROOT/src/JetPilot.tipa"
+    fi
 fi
 
 echo "=== JetPilot Release Gate Check ==="
