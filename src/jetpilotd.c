@@ -212,7 +212,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define BANDS_TAKEN_PATH CONFIG_DIR "/bands.req.taken"
 #define BANDS_PATH       CONFIG_DIR "/bands.txt"
 #define BANDS_TMP_PATH   CONFIG_DIR "/bands.txt.tmp"
-#define JP_VERSION   "0.7.9"
+#define JP_VERSION   "0.8.0"
 #ifndef JP_COMMIT
 #define JP_COMMIT    "dev"
 #endif
@@ -999,6 +999,7 @@ static size_t g_last_body_len = 0;
 static time_t g_last_write = 0;     /* 上次成功写盘的 CLOCK_MONOTONIC 秒 */
 static int    g_restart_cfg_bad_count = 0; /* restart.txt 无效行数 (v0.7.8 C1-N6) */
 static void pulse_write_status(FILE *m);
+static void bgkill_write_status(FILE *m);
 
 static void write_status(int protected_now, int demoted_pids,
                          protected_entry_t *plist, int nplist,
@@ -1041,6 +1042,7 @@ static void write_status(int protected_now, int demoted_pids,
         }
     }
     pulse_write_status(m);
+    bgkill_write_status(m);
     int merr = ferror(m);
     fclose(m);                         /* fclose 后 body/blen 才有效 */
     if (merr || !body) { free(body); return; }
@@ -1121,73 +1123,12 @@ static int wait_lock_change(int secs) {
 }
 
 /* =========================================================================
- * 前台 App 内存压力触发模块 (v0.7.0)
+ * 内存压力触发与启动收尾模块 (v0.7.0; 路线 E 已停用，0.8.0 仅保留收尾与 memcap)
  * ========================================================================= */
 
-#define MEMP_RETIRED       1  /* v0.7.8 C3-1: 前台释放已停用，由后台释放替代 */
-
-#define MEMP_CONFIG_PATH   CONFIG_DIR "/mempressure.txt"
 #define MEMP_PENDING_PATH  CONFIG_DIR "/mempressure_pending"
 #define MEMP_STATE_PATH    CONFIG_DIR "/mempressure_state.txt"
-#define MEMP_TAINT_PATH    CONFIG_DIR "/mempressure_taint.txt"
-#define MEMP_FATAL_PATH    CONFIG_DIR "/mempressure_fatal"
-#define MEMP_FLOOR_PATH    CONFIG_DIR "/mempressure_floor.txt"
-#define MEMP_FLOOR_TMP     CONFIG_DIR "/mempressure_floor.txt.tmp"
 
-#define MEMP_MAX_RULES     32
-#define MEMP_MAX_TAINT     8
-#define MEMP_MAX_YIELD     32
-#define MEMP_DEFAULT_COOLDOWN 600
-#define MEMP_MIN_COOLDOWN     60
-#define MEMP_MAX_COOLDOWN     86400
-#define MEMP_MIN_THR_MB       100
-#define MEMP_DEFAULT_THR_MB   600
-
-#define MEMP_MAX_FLOOR_ENTRIES (MEMP_MAX_RULES + 16)
-#define MEMP_MAX_FLOOR_SAMPLES 5
-
-typedef enum {
-    MEMP_STATE_OFF = 0,
-    MEMP_STATE_ON,
-    MEMP_STATE_DISABLED,
-    MEMP_STATE_UNSUPPORTED,
-    MEMP_STATE_FATAL
-} memp_state_t;
-
-typedef enum {
-    MEMP_RESET_PENDING_NONE = 0,
-    MEMP_RESET_PENDING_NORMAL,
-    MEMP_RESET_PENDING_MARKER
-} memp_reset_pending_t;
-
-typedef struct {
-    char    frag[256];
-    int32_t thr_mb;       /* 阈值 MB (100 .. memcap) */
-    int32_t cooldown;     /* 单条冷却秒 (60 .. 86400, 0 = 用全局) */
-    int     is_bid;       /* 1 = bid: 开头, 0 = 路径片段 */
-    time_t  last_warn_sec;/* CLOCK_MONOTONIC 秒，冷却起点 */
-    time_t  last_skip_sec;/* 上次输出 skip 日志的 CLOCK_MONOTONIC 秒 (限频 60s) */
-    int     ineff;        /* 连续无效次数 (freed < 30) */
-    int32_t eff_cd;       /* 有效冷却 (退避后可能翻倍) */
-} memp_rule_t;
-
-static memp_rule_t g_memp_rules[MEMP_MAX_RULES];
-static int g_nmemp_rules = 0;
-static int g_memp_cooldown = MEMP_DEFAULT_COOLDOWN;
-static int g_memp_cfg_file_absent = 1;
-static int g_memp_cfg_first_load = 1;
-
-/* 底线记录表 */
-typedef struct {
-    char   frag[256];
-    time_t last_time;
-    int    nsamp;
-    double samples[MEMP_MAX_FLOOR_SAMPLES];
-} memp_floor_entry_t;
-
-static memp_floor_entry_t g_memp_floors[MEMP_MAX_FLOOR_ENTRIES];
-static int g_nmemp_floors = 0;
-static void memp_floor_load(void);
 static void mempressure_write_state(void);
 
 static uint64_t g_memp_memcap = 2048;
@@ -1377,112 +1318,52 @@ static int g_pulse_cfg_first_load = 1;
 static int g_pulse_cfg_bad_count = 0;
 static jp_file_stamp_t s_pulse_cfg_stamp = {0};
 
-static memp_state_t g_memp_state = MEMP_STATE_OFF;
-static memp_reset_pending_t g_memp_reset_pending = MEMP_RESET_PENDING_NONE;
-static int g_memp_fails = 0;
-static int g_memp_last_errno = 0;
-static char g_memp_fatal_reason[32] = "";
-static char g_memp_unsupported_reason[32] = "";
+/* =========================================================================
+ * 后台定时清理规则模块 (v0.8.0 卡 K)
+ * ========================================================================= */
+#define BGKILL_CONFIG_PATH   CONFIG_DIR "/bgkill.txt"
+#define BGKILL_MAX_RULES     32
+#define BGKILL_MIN_MIN       0
+#define BGKILL_MAX_MIN       720
+#define BGKILL_MIN_MAX       1
+#define BGKILL_MAX_MAX       30
+#define BGKILL_DEFAULT_MIN   60
+#define BGKILL_DEFAULT_MAX   5
 
-static int g_memp_reset_retry_count = 0;
-static time_t g_memp_last_reset_retry_time = 0;
-static struct timespec g_memp_warn_monotonic = {0, 0};
-static int g_memp_reset_overdue_logged = 0;
+typedef struct {
+    char    bid[128];
+    int     enabled;
+    int32_t min;
+    int32_t max;
+} bgkill_rule_t;
 
-static int g_memp_marker_rm_fail_count = 0;
-static time_t g_memp_last_marker_rm_fail_time = 0;
+typedef struct {
+    char   bid[128];
+    pid_t  tracked_pid;
+    int    in_bg;
+    time_t bg_start_mono;
+    int    bg_rounds;
+    int    today_count;
+    int    today_y;
+    int    today_m;
+    int    today_d;
+    char   last_kill_hhmm[8];
+    time_t last_skip_mono;
+    char   last_skip_reason[16];
+} bgkill_rule_state_t;
+
+static bgkill_rule_t g_bgkill_rules[BGKILL_MAX_RULES];
+static int g_nbgkill_rules = 0;
+static int g_bgkill_master = 1;
+static int g_bgkill_first_load = 1;
+static int g_bgkill_cfg_file_absent = 1;
+static int g_bgkill_cfg_bad_count = 0;
+static jp_file_stamp_t s_bgkill_cfg_stamp = {0};
+
+static bgkill_rule_state_t g_bgkill_rule_states[BGKILL_MAX_RULES];
+static int g_nbgkill_rule_states = 0;
 
 static int g_memp_level_first_logged = 0;
-
-/* 观察槽（§八） */
-typedef struct {
-    int      valid;
-    char     frag[256];
-    pid_t    pid;
-    uint64_t start_tvsec;
-    uint64_t start_tvusec;
-    time_t   warn_mono_sec;
-    double   fp_before_mb;
-    int      band_warn;
-    int      fg_ok;
-    int      nsamp;
-} memp_post_slot_t;
-
-static memp_post_slot_t g_memp_post = {0};
-
-/* 污染表（§五-6） */
-typedef struct {
-    pid_t    pid;
-    uint64_t tvsec;
-    uint64_t tvusec;
-    char     frag[256];
-} memp_taint_entry_t;
-
-static memp_taint_entry_t g_memp_taint[MEMP_MAX_TAINT];
-static int g_memp_ntaint = 0;
-
-/* 修复限频：每个 pid 上次尝试修复的时间（60 秒最多一次）与连续失败计数 */
-#define MEMP_MAX_REPAIR_SEEN 16
-typedef struct {
-    pid_t  pid;
-    time_t last_repair_sec;
-    int    fail_count;
-} memp_repair_seen_t;
-static memp_repair_seen_t g_memp_repair_seen[MEMP_MAX_REPAIR_SEEN];
-static int g_memp_nrepair_seen = 0;
-
-/* 目标识别初次记录（§九 target） */
-#define MEMP_MAX_SEEN_TARGETS 64
-static pid_t g_memp_seen_targets[MEMP_MAX_SEEN_TARGETS];
-static int g_memp_nseen_targets = 0;
-
-/* rusage 失败限频：同一 pid 每 60 秒最多一行 */
-#define MEMP_MAX_RUSAGE_FAIL_SEEN 16
-typedef struct {
-    pid_t  pid;
-    time_t last_fail_sec;
-} memp_rusage_fail_seen_t;
-static memp_rusage_fail_seen_t g_memp_rusage_fail_seen[MEMP_MAX_RUSAGE_FAIL_SEEN];
-static int g_memp_nrusage_fail_seen = 0;
-
-/* 修复跳过限频：同一 pid 每 60 秒最多一行 */
-#define MEMP_MAX_REPAIR_SKIP_SEEN 16
-typedef struct {
-    pid_t  pid;
-    time_t last_fail_sec;
-} memp_repair_skip_seen_t;
-static memp_repair_skip_seen_t g_memp_repair_skip_seen[MEMP_MAX_REPAIR_SKIP_SEEN];
-static int g_memp_nrepair_skip_seen = 0;
-
-static void memp_log_repair_skip_fp_fail(pid_t pid, time_t now_sec) {
-    for (int i = 0; i < g_memp_nrepair_skip_seen; i++) {
-        if (g_memp_repair_skip_seen[i].pid == pid) {
-            if (now_sec - g_memp_repair_skip_seen[i].last_fail_sec < 60) {
-                return;
-            }
-            g_memp_repair_skip_seen[i].last_fail_sec = now_sec;
-            JPLOG(JP_DEBUG, "MEMP repair_skip reason=fp_fail pid=%d", (int)pid);
-            return;
-        }
-    }
-    int idx = 0;
-    if (g_memp_nrepair_skip_seen < MEMP_MAX_REPAIR_SKIP_SEEN) {
-        idx = g_memp_nrepair_skip_seen++;
-    } else {
-        idx = 0;
-    }
-    g_memp_repair_skip_seen[idx].pid = pid;
-    g_memp_repair_skip_seen[idx].last_fail_sec = now_sec;
-    JPLOG(JP_DEBUG, "MEMP repair_skip reason=fp_fail pid=%d", (int)pid);
-}
-
-/* 让位记录项 */
-typedef struct {
-    pid_t    pid;
-    uint64_t tvsec;
-    uint64_t tvusec;
-    int      is_sys; /* 是否为 B 类系统/非保护让位进程 (1=B类, 0=A类) */
-} memp_yielded_entry_t;
 
 /* 格式化 errno: 0 -> 0(-)，非0 -> <n>(<strerror>) */
 static void memp_fmt_errno(int err, char *buf, size_t sz) {
@@ -1513,25 +1394,6 @@ static void memp_get_proc_name(pid_t pid, char *out, size_t sz) {
         }
     }
     snprintf(out, sz, "%s", raw);
-}
-
-/* 统计让位记录中 B 类进程数量 */
-static int memp_count_yielded_sys(const memp_yielded_entry_t *yielded, int nyielded) {
-    int cnt = 0;
-    for (int i = 0; i < nyielded; i++) {
-        if (yielded[i].is_sys) cnt++;
-    }
-    return cnt;
-}
-
-/* 设档封装：内部使用 MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES 与 set_priority() 一致，
- * 但不更新 g_set_fail_total、g_last_err_* 等全局错误统计 */
-static int mp_set_band(pid_t pid, int32_t band) {
-    memorystatus_priority_properties_t props = { band, 0 };
-    int rc = memorystatus_control(MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES,
-                                  pid, 0, &props, sizeof(props));
-    if (rc != 0) return errno != 0 ? errno : -1;
-    return 0;
 }
 
 /* 获取进程启动时间 (秒与微秒) */
@@ -1592,186 +1454,6 @@ static int memp_read_level(int *level_out, int *err_out) {
     return rc;
 }
 
-/* 单条 memp 规则匹配判定 (供 memp_match_rule 和 rst_c4_floor_reset 共同复用) */
-static int memp_rule_matches(const memp_rule_t *rule, const char *path, const char *app_bid) {
-    if (!rule) return 0;
-    if (rule->is_bid) {
-        if (app_bid && strcmp(app_bid, rule->frag + 4) == 0) {
-            return 1;
-        }
-    } else {
-        if (path && path[0] != '\0' && strstr(path, rule->frag)) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* 规则匹配：按文件顺序逐条比，取第一条匹配的规则 */
-static memp_rule_t *memp_match_rule(const char *path, const char *app_bid) {
-    for (int i = 0; i < g_nmemp_rules; i++) {
-        if (memp_rule_matches(&g_memp_rules[i], path, app_bid)) {
-            return &g_memp_rules[i];
-        }
-    }
-    return NULL;
-}
-
-static void memp_enter_fatal(const char *reason) {
-    g_memp_state = MEMP_STATE_FATAL;
-    strncpy(g_memp_fatal_reason, reason, sizeof(g_memp_fatal_reason) - 1);
-    g_memp_fatal_reason[sizeof(g_memp_fatal_reason) - 1] = '\0';
-    FILE *f = fopen(MEMP_FATAL_PATH, "w");
-    if (f) {
-        fprintf(f, "reason=%s\n", reason);
-        fflush(f);
-        fsync(fileno(f));
-        fclose(f);
-    }
-    JPLOG(JP_ERR, "MEMP fatal reason=%s", reason);
-}
-
-static void memp_enter_unsupported(const char *reason, int err) {
-    g_memp_state = MEMP_STATE_UNSUPPORTED;
-    strncpy(g_memp_unsupported_reason, reason, sizeof(g_memp_unsupported_reason) - 1);
-    g_memp_unsupported_reason[sizeof(g_memp_unsupported_reason) - 1] = '\0';
-    g_memp_last_errno = err;
-    char eb[128];
-    memp_fmt_errno(err, eb, sizeof(eb));
-    JPLOG(JP_WARN, "MEMP unsupported reason=%s errno=%s", reason, eb);
-}
-
-static void memp_enter_reset_pending_normal(int retry_count, struct timespec warn_mono) {
-    g_memp_reset_pending = MEMP_RESET_PENDING_NORMAL;
-    g_memp_reset_retry_count = retry_count;
-    g_memp_warn_monotonic = warn_mono;
-    g_memp_last_reset_retry_time = 0;
-    g_memp_reset_overdue_logged = 0;
-}
-
-static void memp_taint_save(void) {
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_TAINT_PATH);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    for (int i = 0; i < g_memp_ntaint; i++) {
-        fprintf(f, "%d %llu %llu %s\n", (int)g_memp_taint[i].pid,
-                (unsigned long long)g_memp_taint[i].tvsec,
-                (unsigned long long)g_memp_taint[i].tvusec,
-                g_memp_taint[i].frag);
-    }
-    fflush(f);
-    int serr = fsync(fileno(f));
-    int ferr = ferror(f);
-    fclose(f);
-    if (ferr || serr != 0) {
-        unlink(tmp);
-        return;
-    }
-    rename(tmp, MEMP_TAINT_PATH);
-}
-
-static void memp_taint_remove(pid_t pid) {
-    for (int i = 0; i < g_memp_ntaint; i++) {
-        if (g_memp_taint[i].pid == pid) {
-            for (int j = i; j < g_memp_ntaint - 1; j++) {
-                g_memp_taint[j] = g_memp_taint[j + 1];
-            }
-            g_memp_ntaint--;
-            memp_taint_save();
-            return;
-        }
-    }
-}
-
-static void memp_taint_add(pid_t pid, uint64_t tvsec, uint64_t tvusec, const char *frag, const char *reason) {
-    for (int i = 0; i < g_memp_ntaint; i++) {
-        if (g_memp_taint[i].pid == pid && g_memp_taint[i].tvsec == tvsec && g_memp_taint[i].tvusec == tvusec) {
-            return; /* 已在污染表 */
-        }
-    }
-    if (g_memp_ntaint >= MEMP_MAX_TAINT) {
-        pid_t dropped_pid = g_memp_taint[0].pid;
-        JPLOG(JP_DEBUG, "MEMP taint_drop pid=%d", (int)dropped_pid);
-        for (int i = 0; i < MEMP_MAX_TAINT - 1; i++) {
-            g_memp_taint[i] = g_memp_taint[i + 1];
-        }
-        g_memp_ntaint = MEMP_MAX_TAINT - 1;
-    }
-    memp_taint_entry_t *e = &g_memp_taint[g_memp_ntaint++];
-    e->pid = pid;
-    e->tvsec = tvsec;
-    e->tvusec = tvusec;
-    strncpy(e->frag, frag ? frag : "", sizeof(e->frag) - 1);
-    e->frag[sizeof(e->frag) - 1] = '\0';
-    JPLOG(JP_INFO, "MEMP taint app=%s pid=%d reason=%s", e->frag, (int)pid, reason);
-    memp_taint_save();
-}
-
-static int memp_is_tainted(pid_t pid, uint64_t tvsec, uint64_t tvusec) {
-    for (int i = 0; i < g_memp_ntaint; i++) {
-        if (g_memp_taint[i].pid == pid) {
-            if (g_memp_taint[i].tvsec == tvsec && g_memp_taint[i].tvusec == tvusec) {
-                return 1;
-            }
-            /* 身份不符：进程已变，自动清理 */
-            memp_taint_remove(pid);
-            return 0;
-        }
-    }
-    return 0;
-}
-
-static void memp_taint_load(void) {
-    g_memp_ntaint = 0;
-    FILE *f = fopen(MEMP_TAINT_PATH, "r");
-    if (!f) {
-        if (errno != ENOENT) {
-            char eb[128];
-            memp_fmt_errno(errno, eb, sizeof(eb));
-            JPLOG(JP_ERR, "MEMP taint_load_fail line=- errno=%s", eb);
-        }
-        return;
-    }
-    char line[512];
-    int line_no = 0;
-    int needs_resave = 0;
-    while (fgets(line, sizeof(line), f)) {
-        line_no++;
-        int pid = 0;
-        unsigned long long tvsec = 0, tvusec = 0;
-        char frag[256] = {0};
-        if (sscanf(line, "%d %llu %llu %255s", &pid, &tvsec, &tvusec, frag) != 4) {
-            char eb[128];
-            memp_fmt_errno(0, eb, sizeof(eb));
-            JPLOG(JP_ERR, "MEMP taint_load_fail line=%d errno=%s", line_no, eb);
-            needs_resave = 1;
-            continue;
-        }
-        uint64_t cur_sec = 0, cur_usec = 0;
-        if (memp_get_process_start_time((pid_t)pid, &cur_sec, &cur_usec) == 0 &&
-            cur_sec == tvsec && cur_usec == tvusec) {
-            if (g_memp_ntaint < MEMP_MAX_TAINT) {
-                g_memp_taint[g_memp_ntaint].pid = (pid_t)pid;
-                g_memp_taint[g_memp_ntaint].tvsec = tvsec;
-                g_memp_taint[g_memp_ntaint].tvusec = tvusec;
-                strncpy(g_memp_taint[g_memp_ntaint].frag, frag, sizeof(g_memp_taint[g_memp_ntaint].frag) - 1);
-                g_memp_taint[g_memp_ntaint].frag[sizeof(g_memp_taint[g_memp_ntaint].frag) - 1] = '\0';
-                g_memp_ntaint++;
-            } else {
-                needs_resave = 1;
-            }
-        } else {
-            /* 进程已退出或重启过，丢弃 */
-            needs_resave = 1;
-        }
-    }
-    fclose(f);
-    if (needs_resave) {
-        memp_taint_save();
-    }
-}
-
 static void mempressure_init_memcap(void) {
     uint64_t memsize = 0;
     size_t len = sizeof(memsize);
@@ -1797,20 +1479,26 @@ static void mempressure_init_memcap(void) {
     g_memp_memcap_fallback = 0;
 }
 
-static void memp_check_fatal_persist(void) {
-    if (access(MEMP_FATAL_PATH, F_OK) != 0) return;
-    FILE *f = fopen(MEMP_FATAL_PATH, "r");
+static void mempressure_write_state(void) {
+    const char *line = "state=retired fails=0 last_errno=0 reason=- tainted=0\n";
+    static char s_last_line[256] = "";
+    if (strcmp(line, s_last_line) == 0) return; /* 内容无变化不写 */
+
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_STATE_PATH);
+    FILE *f = fopen(tmp, "w");
     if (!f) return;
-    char line[128] = {0};
-    char reason[32] = "einval";
-    if (fgets(line, sizeof(line), f)) {
-        sscanf(line, "reason=%31s", reason);
-    }
+    fputs(line, f);
+    fflush(f);
+    int werr = ferror(f);
     fclose(f);
-    g_memp_state = MEMP_STATE_FATAL;
-    strncpy(g_memp_fatal_reason, reason, sizeof(g_memp_fatal_reason) - 1);
-    g_memp_fatal_reason[sizeof(g_memp_fatal_reason) - 1] = '\0';
-    JPLOG(JP_ERR, "MEMP fatal_persist reason=%s", reason);
+    if (werr) { unlink(tmp); return; }
+    if (rename(tmp, MEMP_STATE_PATH) == 0) {
+        strncpy(s_last_line, line, sizeof(s_last_line) - 1);
+        s_last_line[sizeof(s_last_line) - 1] = '\0';
+    } else {
+        unlink(tmp);
+    }
 }
 
 static void memp_check_boot_reset(void) {
@@ -1856,803 +1544,6 @@ static void memp_check_boot_reset(void) {
 static void mempressure_init(void) {
     mempressure_init_memcap();
     memp_check_boot_reset();
-    if (!MEMP_RETIRED) {
-        memp_check_fatal_persist();
-        memp_taint_load();
-        memp_floor_load();
-    }
-}
-
-static void mempressure_write_state(void) {
-    if (MEMP_RETIRED) {
-        const char *line = "state=retired fails=0 last_errno=0 reason=- tainted=0\n";
-        static char s_last_line[256] = "";
-        if (strcmp(line, s_last_line) == 0) return; /* 内容无变化不写 */
-
-        char tmp[512];
-        snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_STATE_PATH);
-        FILE *f = fopen(tmp, "w");
-        if (!f) return;
-        fputs(line, f);
-        fflush(f);
-        int werr = ferror(f);
-        fclose(f);
-        if (werr) { unlink(tmp); return; }
-        if (rename(tmp, MEMP_STATE_PATH) == 0) {
-            strncpy(s_last_line, line, sizeof(s_last_line) - 1);
-            s_last_line[sizeof(s_last_line) - 1] = '\0';
-        } else {
-            unlink(tmp);
-        }
-        return;
-    }
-
-    const char *state_str = "off";
-    const char *reason_str = "-";
-
-    if (g_memp_state == MEMP_STATE_FATAL) {
-        state_str = "fatal";
-        reason_str = g_memp_fatal_reason[0] ? g_memp_fatal_reason : "einval";
-    } else if (g_memp_state == MEMP_STATE_UNSUPPORTED) {
-        state_str = "unsupported";
-        reason_str = g_memp_unsupported_reason[0] ? g_memp_unsupported_reason : "trigger";
-    } else if (g_memp_reset_pending == MEMP_RESET_PENDING_NORMAL) {
-        state_str = "reset_pending_normal";
-    } else if (g_memp_reset_pending == MEMP_RESET_PENDING_MARKER) {
-        state_str = "reset_pending_marker";
-    } else if (g_memp_state == MEMP_STATE_DISABLED) {
-        state_str = "disabled";
-    } else if (g_nmemp_rules == 0 || g_memp_cfg_file_absent) {
-        state_str = "off";
-    } else {
-        state_str = "on";
-    }
-
-    char line[256];
-    snprintf(line, sizeof(line), "state=%s fails=%d last_errno=%d reason=%s tainted=%d\n",
-             state_str, g_memp_fails, g_memp_last_errno, reason_str, g_memp_ntaint);
-
-    static char s_last_line[256] = "";
-    if (strcmp(line, s_last_line) == 0) return; /* 内容无变化不写 */
-
-    char tmp[512];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_STATE_PATH);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
-    fputs(line, f);
-    fflush(f);
-    int werr = ferror(f);
-    fclose(f);
-    if (werr) { unlink(tmp); return; }
-    if (rename(tmp, MEMP_STATE_PATH) == 0) {
-        strncpy(s_last_line, line, sizeof(s_last_line) - 1);
-        s_last_line[sizeof(s_last_line) - 1] = '\0';
-    } else {
-        unlink(tmp);
-    }
-}
-
-static void memp_restore_yielded(memp_yielded_entry_t *yielded, int nyielded,
-                                 memorystatus_priority_entry_t *latest_list, int nlatest,
-                                 int *ok_out, int *moved_out, int *gone_out, int *rfail_out) {
-    int ok = 0, moved = 0, gone = 0, rfail = 0;
-    for (int i = 0; i < nyielded; i++) {
-        uint64_t cur_sec = 0, cur_usec = 0;
-        if (memp_get_process_start_time(yielded[i].pid, &cur_sec, &cur_usec) != 0 ||
-            cur_sec != yielded[i].tvsec || cur_usec != yielded[i].tvusec) {
-            gone++;
-            continue;
-        }
-        int cur_band = -1;
-        int found = 0;
-        if (latest_list) {
-            for (int j = 0; j < nlatest; j++) {
-                if (latest_list[j].pid == yielded[i].pid) {
-                    cur_band = latest_list[j].priority;
-                    found = 1;
-                    break;
-                }
-            }
-        }
-        if (!found || cur_band != 80) {
-            moved++;
-            continue;
-        }
-        int err = mp_set_band(yielded[i].pid, 90);
-        if (err == 0) {
-            ok++;
-        } else {
-            rfail++;
-            char eb[128];
-            memp_fmt_errno(err, eb, sizeof(eb));
-            JPLOG(JP_ERR, "MEMP restore_fail pid=%d errno=%s", (int)yielded[i].pid, eb);
-            if (yielded[i].is_sys) {
-                char pname[32];
-                memp_get_proc_name(yielded[i].pid, pname, sizeof(pname));
-                JPLOG(JP_ERR, "MEMP yield_sys_fail pid=%d name=%s step=restore errno=%s",
-                       (int)yielded[i].pid, pname, eb);
-            }
-        }
-    }
-    if (ok_out) *ok_out = ok;
-    if (moved_out) *moved_out = moved;
-    if (gone_out) *gone_out = gone;
-    if (rfail_out) *rfail_out = rfail;
-}
-
-static void memp_format_comp(memorystatus_priority_entry_t *list, int count, pid_t target_pid, char *buf, size_t sz) {
-    buf[0] = '\0';
-    size_t len = 0;
-    int first = 1;
-    for (int i = 0; i < count; i++) {
-        if (list[i].pid <= 0 || list[i].pid == target_pid) continue;
-        if (list[i].priority == 90 || list[i].priority == 100) {
-            uint64_t fp_bytes = 0;
-            int rerr = memp_get_phys_footprint(list[i].pid, &fp_bytes);
-            char pname[32];
-            memp_get_proc_name(list[i].pid, pname, sizeof(pname));
-            char item[64];
-            if (rerr == 0) {
-                snprintf(item, sizeof(item), "%s%d:%d:%.1f:%s", first ? "" : ",",
-                         (int)list[i].pid, (int)list[i].priority, (double)fp_bytes / (1024.0 * 1024.0), pname);
-            } else {
-                snprintf(item, sizeof(item), "%s%d:%d:NA:%s", first ? "" : ",",
-                         (int)list[i].pid, (int)list[i].priority, pname);
-            }
-            first = 0;
-            size_t ilen = strlen(item);
-            if (len + ilen < sz - 1) {
-                strcat(buf, item);
-                len += ilen;
-            } else {
-                break;
-            }
-        }
-    }
-    if (first) {
-        snprintf(buf, sz, "-");
-    }
-}
-
-static void memp_log_skip(memp_rule_t *rule, pid_t pid, double fp_mb, int thr_mb,
-                          const char *reason, int yielded, int yielded_sys, int err, const char *comp_str,
-                          int ok, int moved, int gone, int rfail) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (rule && rule->last_skip_sec > 0 && now.tv_sec - rule->last_skip_sec < 60) {
-        return; /* 同一规则每 60 秒最多一行 */
-    }
-    if (rule) {
-        rule->last_skip_sec = now.tv_sec;
-    }
-
-    char eb[128];
-    if (strcmp(reason, "yield_fail") == 0 || strcmp(reason, "marker_fail") == 0) {
-        memp_fmt_errno(err, eb, sizeof(eb));
-    } else {
-        snprintf(eb, sizeof(eb), "0(-)");
-        ok = moved = gone = rfail = 0;
-    }
-
-    JPLOG(JP_DEBUG, "MEMP skip app=%s pid=%d fp=%.1f thr=%d reason=%s yielded=%d yielded_sys=%d errno=%s comp=%s restored=ok:%d,moved:%d,gone:%d,rfail:%d",
-           rule ? rule->frag : "-", (int)pid, fp_mb, thr_mb, reason, yielded, yielded_sys, eb,
-           (comp_str && comp_str[0]) ? comp_str : "-", ok, moved, gone, rfail);
-}
-
-static int memp_rule_cfg_equal(const memp_rule_t *a, const memp_rule_t *b) {
-    if (!a || !b) return 0;
-    if (strcmp(a->frag, b->frag) != 0) return 0;
-    if (a->thr_mb != b->thr_mb) return 0;
-    if (a->cooldown != b->cooldown) return 0;
-    return 1;
-}
-
-static void memp_floor_format_median(const double *samples, int nsamp, char *buf, size_t sz) {
-    if (nsamp < 3 || nsamp > MEMP_MAX_FLOOR_SAMPLES) {
-        snprintf(buf, sz, "NA");
-        return;
-    }
-    double sorted[MEMP_MAX_FLOOR_SAMPLES];
-    memcpy(sorted, samples, sizeof(double) * nsamp);
-    for (int a = 0; a < nsamp - 1; a++) {
-        for (int b = 0; b < nsamp - 1 - a; b++) {
-            if (sorted[b] > sorted[b + 1]) {
-                double tmp = sorted[b];
-                sorted[b] = sorted[b + 1];
-                sorted[b + 1] = tmp;
-            }
-        }
-    }
-    /* 函数名保留 memp_floor_format_median、文件格式保留 med= 以保持向后兼容。
-     * 当前实现含义已调整为「次小值」底线统计（增加单次极低异常防护）：
-     * 保持 nsamp < 3 判 NA；对 >=3 个样本，取次小值 sorted[1]（剔除单次异常低样本如重启/重建），
-     * 避免瞬态极低值长期钉死底线导致 backoff 失真。当正常低样本持续到来或异常样本滑出窗口后底线恢复。
-     * 注意：当有效样本数恰好为 3 时，sorted[1] 就是中位数，计算结果与原中位数逻辑完全一致。
-     */
-    double min_val = sorted[1];
-    snprintf(buf, sz, "%.1f", min_val);
-}
-
-static void memp_floor_get_median_str(const char *frag, char *buf, size_t sz) {
-    if (!frag || !buf || sz == 0) return;
-    snprintf(buf, sz, "NA");
-    for (int i = 0; i < g_nmemp_floors; i++) {
-        if (strcmp(g_memp_floors[i].frag, frag) == 0) {
-            memp_floor_entry_t *fe = &g_memp_floors[i];
-            memp_floor_format_median(fe->samples, fe->nsamp, buf, sz);
-            return;
-        }
-    }
-}
-
-static void memp_floor_save(void) {
-    FILE *f = fopen(MEMP_FLOOR_TMP, "w");
-    if (!f) return;
-    fprintf(f, "# jetpilot floor v1\n");
-    for (int i = 0; i < g_nmemp_floors; i++) {
-        memp_floor_entry_t *fe = &g_memp_floors[i];
-        char med_str[32];
-        memp_floor_format_median(fe->samples, fe->nsamp, med_str, sizeof(med_str));
-        char s_buf[256] = "";
-        char *sp = s_buf;
-        size_t rem = sizeof(s_buf);
-        for (int s = 0; s < fe->nsamp; s++) {
-            int n = snprintf(sp, rem, "%s%.1f", (s > 0 ? "," : ""), fe->samples[s]);
-            if (n > 0 && (size_t)n < rem) {
-                sp += n;
-                rem -= (size_t)n;
-            }
-        }
-        /* 兼容说明：key 保持 med= 不变，实际存储的是次小值底线 */
-        fprintf(f, "%s t=%ld n=%d med=%s s=%s\n",
-                fe->frag, (long)fe->last_time, fe->nsamp, med_str, s_buf);
-    }
-    fflush(f);
-    int werr = ferror(f);
-    fclose(f);
-    if (werr) {
-        unlink(MEMP_FLOOR_TMP);
-        return;
-    }
-    if (rename(MEMP_FLOOR_TMP, MEMP_FLOOR_PATH) != 0) {
-        char eb[128];
-        memp_fmt_errno(errno, eb, sizeof(eb));
-        JPLOG(JP_ERR, "MEMP floor_save_fail errno=%s", eb);
-        unlink(MEMP_FLOOR_TMP);
-    }
-}
-
-static void memp_floor_prune(void) {
-    int non_rule_count = 0;
-    for (int i = 0; i < g_nmemp_floors; i++) {
-        int is_rule = 0;
-        for (int r = 0; r < g_nmemp_rules; r++) {
-            if (strcmp(g_memp_floors[i].frag, g_memp_rules[r].frag) == 0) {
-                is_rule = 1;
-                break;
-            }
-        }
-        if (!is_rule) non_rule_count++;
-    }
-
-    int modified = 0;
-    while (non_rule_count > 16) {
-        int oldest_idx = -1;
-        time_t oldest_time = 0;
-        for (int i = 0; i < g_nmemp_floors; i++) {
-            int is_rule = 0;
-            for (int r = 0; r < g_nmemp_rules; r++) {
-                if (strcmp(g_memp_floors[i].frag, g_memp_rules[r].frag) == 0) {
-                    is_rule = 1;
-                    break;
-                }
-            }
-            if (!is_rule) {
-                if (oldest_idx == -1 || g_memp_floors[i].last_time < oldest_time) {
-                    oldest_idx = i;
-                    oldest_time = g_memp_floors[i].last_time;
-                }
-            }
-        }
-        if (oldest_idx >= 0) {
-            for (int i = oldest_idx; i < g_nmemp_floors - 1; i++) {
-                g_memp_floors[i] = g_memp_floors[i + 1];
-            }
-            g_nmemp_floors--;
-            non_rule_count--;
-            modified = 1;
-        } else {
-            break;
-        }
-    }
-    if (modified) {
-        memp_floor_save();
-    }
-}
-
-static void memp_floor_add_sample(const char *frag, double fp_post30) {
-    if (!frag || frag[0] == '\0') return;
-    memp_floor_entry_t *entry = NULL;
-    for (int i = 0; i < g_nmemp_floors; i++) {
-        if (strcmp(g_memp_floors[i].frag, frag) == 0) {
-            entry = &g_memp_floors[i];
-            break;
-        }
-    }
-    if (!entry) {
-        if (g_nmemp_floors >= MEMP_MAX_FLOOR_ENTRIES) {
-            memp_floor_prune();
-        }
-        if (g_nmemp_floors < MEMP_MAX_FLOOR_ENTRIES) {
-            entry = &g_memp_floors[g_nmemp_floors++];
-            memset(entry, 0, sizeof(*entry));
-            strncpy(entry->frag, frag, sizeof(entry->frag) - 1);
-        } else {
-            return;
-        }
-    }
-    if (entry->nsamp < MEMP_MAX_FLOOR_SAMPLES) {
-        entry->samples[entry->nsamp++] = fp_post30;
-    } else {
-        for (int i = 0; i < MEMP_MAX_FLOOR_SAMPLES - 1; i++) {
-            entry->samples[i] = entry->samples[i + 1];
-        }
-        entry->samples[MEMP_MAX_FLOOR_SAMPLES - 1] = fp_post30;
-    }
-    entry->last_time = time(NULL);
-    memp_floor_save();
-}
-
-static void memp_floor_load(void) {
-    FILE *f = fopen(MEMP_FLOOR_PATH, "r");
-    if (!f) return;
-    char line[512];
-    int line_no = 0;
-    int is_v1 = 0;
-    int had_bad = 0;
-    g_nmemp_floors = 0;
-    while (fgets(line, sizeof(line), f)) {
-        line_no++;
-        char *p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\r' || *p == '\n' || *p == '\0') continue;
-        if (line_no == 1) {
-            if (strncmp(p, "# jetpilot floor v1", 19) == 0) {
-                is_v1 = 1;
-            } else {
-                JPLOG(JP_INFO, "MEMP floor_reset reason=version");
-                fclose(f);
-                return;
-            }
-            continue;
-        }
-        if (*p == '#') continue;
-        if (!is_v1) continue;
-
-        char frag[256] = {0};
-        long t_val = 0;
-        int n_val = 0;
-        char s_val[256] = {0};
-        char line_copy[512];
-        strncpy(line_copy, p, sizeof(line_copy) - 1);
-        line_copy[sizeof(line_copy) - 1] = '\0';
-
-        char *saveptr = NULL;
-        char *tok = strtok_r(line_copy, " \t\r\n", &saveptr);
-        if (!tok) continue;
-        strncpy(frag, tok, sizeof(frag) - 1);
-        while ((tok = strtok_r(NULL, " \t\r\n", &saveptr)) != NULL) {
-            if (strncmp(tok, "t=", 2) == 0) {
-                t_val = strtol(tok + 2, NULL, 10);
-            } else if (strncmp(tok, "n=", 2) == 0) {
-                n_val = (int)strtol(tok + 2, NULL, 10);
-            } else if (strncmp(tok, "s=", 2) == 0) {
-                strncpy(s_val, tok + 2, sizeof(s_val) - 1);
-            }
-        }
-        if (frag[0] == '\0' || n_val <= 0 || n_val > MEMP_MAX_FLOOR_SAMPLES || s_val[0] == '\0') {
-            had_bad = 1;
-            continue;
-        }
-
-        double parsed_samples[MEMP_MAX_FLOOR_SAMPLES];
-        int n_parsed_samples = 0;
-        char *sp = s_val;
-        char *subptr = NULL;
-        char *stok = strtok_r(sp, ",", &subptr);
-        while (stok && n_parsed_samples < MEMP_MAX_FLOOR_SAMPLES) {
-            char *endp = NULL;
-            double v = strtod(stok, &endp);
-            if (!endp || endp == stok) break;
-            parsed_samples[n_parsed_samples++] = v;
-            stok = strtok_r(NULL, ",", &subptr);
-        }
-
-        /* 核对 n= 与 s= 里实际样本数是否一致，以 s= 为准；不一致时把这一行当坏行跳过 */
-        if (n_parsed_samples != n_val) {
-            had_bad = 1;
-            continue;
-        }
-
-        if (g_nmemp_floors < MEMP_MAX_FLOOR_ENTRIES) {
-            memp_floor_entry_t *fe = &g_memp_floors[g_nmemp_floors++];
-            memset(fe, 0, sizeof(*fe));
-            strncpy(fe->frag, frag, sizeof(fe->frag) - 1);
-            fe->last_time = (time_t)t_val;
-            fe->nsamp = n_parsed_samples;
-            memcpy(fe->samples, parsed_samples, sizeof(double) * n_parsed_samples);
-        }
-    }
-    fclose(f);
-    if (had_bad && g_nmemp_floors == 0) {
-        JPLOG(JP_INFO, "MEMP floor_reset reason=corrupt");
-    }
-}
-
-static void memp_backoff_on_sample(const char *frag, double freed_mb) {
-    memp_rule_t *rule = NULL;
-    for (int i = 0; i < g_nmemp_rules; i++) {
-        if (strcmp(g_memp_rules[i].frag, frag) == 0) {
-            rule = &g_memp_rules[i];
-            break;
-        }
-    }
-    if (!rule) return;
-
-    int32_t base_cd = rule->cooldown > 0 ? rule->cooldown : g_memp_cooldown;
-    if (rule->eff_cd <= 0) rule->eff_cd = base_cd;
-
-    if (freed_mb < 30.0) {
-        rule->ineff++;
-        if (rule->ineff >= 3) {
-            int32_t max_limit = 1800 > base_cd ? 1800 : base_cd;
-            int32_t new_cd = rule->eff_cd * 2;
-            if (new_cd > max_limit) new_cd = max_limit;
-            rule->eff_cd = new_cd;
-            rule->ineff = 0;
-            char med_str[32] = "NA";
-            memp_floor_get_median_str(rule->frag, med_str, sizeof(med_str));
-            JPLOG(JP_INFO, "MEMP backoff app=%s cd=%d floor=%s", rule->frag, (int)rule->eff_cd, med_str);
-        }
-    } else {
-        if (rule->eff_cd != base_cd) {
-            JPLOG(JP_INFO, "MEMP backoff_reset app=%s cd=%d", rule->frag, (int)base_cd);
-        }
-        rule->eff_cd = base_cd;
-        rule->ineff = 0;
-    }
-}
-
-static void memp_post_sample(memorystatus_priority_entry_t *list, int count) {
-    if (!g_memp_post.valid) return;
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    /* 每轮采样 */
-    if (g_locked) {
-        g_memp_post.fg_ok = 0;
-    }
-    uint64_t cur_sec = 0, cur_usec = 0;
-    if (memp_get_process_start_time(g_memp_post.pid, &cur_sec, &cur_usec) != 0 ||
-        cur_sec != g_memp_post.start_tvsec || cur_usec != g_memp_post.start_tvusec) {
-        g_memp_post.fg_ok = 0;
-    } else {
-        int found = 0;
-        int cur_prio = -1;
-        if (list && count > 0) {
-            for (int i = 0; i < count; i++) {
-                if (list[i].pid == g_memp_post.pid) {
-                    found = 1;
-                    cur_prio = list[i].priority;
-                    break;
-                }
-            }
-        }
-        if (!found || cur_prio != 100) {
-            g_memp_post.fg_ok = 0;
-        }
-    }
-    g_memp_post.nsamp++;
-
-    if (now.tv_sec - g_memp_post.warn_mono_sec < 30) return;
-
-    long dt = (long)(now.tv_sec - g_memp_post.warn_mono_sec);
-    char fp_post30_buf[64] = "gone";
-    char freed_buf[64] = "NA";
-    int is_num = 0;
-    double fp_post30_val = 0.0;
-    double freed_mb = 0.0;
-
-    cur_sec = 0; cur_usec = 0;
-    if (memp_get_process_start_time(g_memp_post.pid, &cur_sec, &cur_usec) == 0 &&
-        cur_sec == g_memp_post.start_tvsec && cur_usec == g_memp_post.start_tvusec) {
-        uint64_t fp_bytes = 0;
-        int rerr = memp_get_phys_footprint(g_memp_post.pid, &fp_bytes);
-        if (rerr == 0) {
-            fp_post30_val = (double)fp_bytes / (1024.0 * 1024.0);
-            snprintf(fp_post30_buf, sizeof(fp_post30_buf), "%.1f", fp_post30_val);
-            freed_mb = g_memp_post.fp_before_mb - fp_post30_val;
-            snprintf(freed_buf, sizeof(freed_buf), "%.1f", freed_mb);
-            is_num = 1;
-        } else {
-            snprintf(fp_post30_buf, sizeof(fp_post30_buf), "NA:%d", rerr);
-        }
-    } else {
-        g_memp_post.fg_ok = 0;
-    }
-
-    JPLOG(JP_INFO, "MEMP post app=%s pid=%d fp_before=%.1f fp_post30=%s dt=%ld fg_ok=%d nsamp=%d freed=%s",
-           g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb,
-           fp_post30_buf, dt, g_memp_post.fg_ok, g_memp_post.nsamp, freed_buf);
-
-    if (g_memp_post.fg_ok == 1 && is_num) {
-        memp_floor_add_sample(g_memp_post.frag, fp_post30_val);
-        memp_backoff_on_sample(g_memp_post.frag, freed_mb);
-    }
-
-    g_memp_post.valid = 0;
-}
-
-/* 登记 post 观察槽（§八）
- * cur_band: 目标触发时的档位。当前门控要求 cur == 100（见 mempressure_check 候选进程选取），
- * 传入选中档位以便放宽门控时 band_warn 仍保持准确 */
-static void memp_post_register(const char *frag, pid_t pid, uint64_t tvsec, uint64_t tvusec, time_t warn_sec, double fp_before_mb, int cur_band) {
-    if (g_memp_post.valid) {
-        long dt = (long)(warn_sec - g_memp_post.warn_mono_sec);
-        JPLOG(JP_INFO, "MEMP post app=%s pid=%d fp_before=%.1f fp_post30=dropped dt=%ld fg_ok=0 nsamp=%d freed=NA",
-               g_memp_post.frag, (int)g_memp_post.pid, g_memp_post.fp_before_mb, dt, g_memp_post.nsamp);
-    }
-    g_memp_post.valid = 1;
-    strncpy(g_memp_post.frag, frag ? frag : "", sizeof(g_memp_post.frag) - 1);
-    g_memp_post.frag[sizeof(g_memp_post.frag) - 1] = '\0';
-    g_memp_post.pid = pid;
-    g_memp_post.start_tvsec = tvsec;
-    g_memp_post.start_tvusec = tvusec;
-    g_memp_post.warn_mono_sec = warn_sec;
-    g_memp_post.fp_before_mb = fp_before_mb;
-    g_memp_post.band_warn = cur_band;
-    g_memp_post.fg_ok = 1;
-    g_memp_post.nsamp = 0;
-}
-
-static int mempressure_load_config(void) {
-    if (MEMP_RETIRED) {
-        return 0;
-    }
-
-    FILE *f = fopen(MEMP_CONFIG_PATH, "r");
-    int file_absent = (f == NULL);
-    int new_cooldown = MEMP_DEFAULT_COOLDOWN;
-    memp_rule_t parsed_rules[MEMP_MAX_RULES];
-    int nparsed = 0;
-
-    if (f) {
-        char line[512];
-        int line_no = 0;
-        while (fgets(line, sizeof(line), f)) {
-            line_no++;
-            size_t llen = strlen(line);
-            int oversized = 0;
-            if (llen == sizeof(line) - 1 && line[llen - 1] != '\n' && !feof(f)) {
-                oversized = 1;
-                int c;
-                while ((c = fgetc(f)) != EOF && c != '\n') {}
-            }
-
-            char *p = line;
-            while (*p == ' ' || *p == '\t') p++;
-            if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0') continue;
-
-            char raw_text[512];
-            strncpy(raw_text, p, sizeof(raw_text) - 1);
-            raw_text[sizeof(raw_text) - 1] = '\0';
-            char *nl = strchr(raw_text, '\n');
-            if (nl) *nl = '\0';
-            char *cr = strchr(raw_text, '\r');
-            if (cr) *cr = '\0';
-
-            if (oversized) {
-                JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                continue;
-            }
-
-            char line_copy[512];
-            strncpy(line_copy, raw_text, sizeof(line_copy) - 1);
-            line_copy[sizeof(line_copy) - 1] = '\0';
-
-            char *tokens[10];
-            int ntokens = 0;
-            char *saveptr = NULL;
-            char *tok = strtok_r(line_copy, " \t", &saveptr);
-            while (tok) {
-                if (ntokens < 9) {
-                    tokens[ntokens] = tok;
-                }
-                ntokens++;
-                tok = strtok_r(NULL, " \t", &saveptr);
-            }
-
-            if (ntokens <= 0) continue;
-            if (ntokens > 8) {
-                JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                continue;
-            }
-
-            if (strcmp(tokens[0], "cooldown") == 0) {
-                if (ntokens != 2) {
-                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                    continue;
-                }
-                char *endp = NULL;
-                long cd = strtol(tokens[1], &endp, 10);
-                if (!endp || *endp != '\0' || cd < MEMP_MIN_COOLDOWN || cd > MEMP_MAX_COOLDOWN) {
-                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                    continue;
-                }
-                new_cooldown = (int)cd;
-            } else {
-                /* 规则行 */
-                if (nparsed >= MEMP_MAX_RULES) {
-                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                    continue;
-                }
-
-                int duplicate = 0;
-                for (int i = 0; i < nparsed; i++) {
-                    if (strcmp(parsed_rules[i].frag, tokens[0]) == 0) {
-                        duplicate = 1;
-                        break;
-                    }
-                }
-                if (duplicate) {
-                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                    continue;
-                }
-
-                int thr = MEMP_DEFAULT_THR_MB;
-                int rule_cd = 0;
-                int has_cd = 0;
-                int bad = 0;
-                int idx = 1;
-
-                if (idx < ntokens && strchr(tokens[idx], '=') == NULL) {
-                    char *endp = NULL;
-                    long val = strtol(tokens[idx], &endp, 10);
-                    if (!endp || *endp != '\0' || val < MEMP_MIN_THR_MB || (uint64_t)val > g_memp_memcap) {
-                        bad = 1;
-                    } else {
-                        thr = (int)val;
-                    }
-                    idx++;
-                }
-
-                if (bad) {
-                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                    continue;
-                }
-
-                for (; idx < ntokens; idx++) {
-                    char *eq = strchr(tokens[idx], '=');
-                    if (!eq || eq == tokens[idx]) {
-                        bad = 1;
-                        break;
-                    }
-                    *eq = '\0';
-                    char *key = tokens[idx];
-                    char *val = eq + 1;
-                    if (strcmp(key, "cooldown") != 0) {
-                        bad = 1;
-                        break;
-                    }
-                    if (has_cd) {
-                        bad = 1;
-                        break;
-                    }
-                    char *endp = NULL;
-                    long cd = strtol(val, &endp, 10);
-                    if (!endp || *endp != '\0' || cd < MEMP_MIN_COOLDOWN || cd > MEMP_MAX_COOLDOWN) {
-                        bad = 1;
-                        break;
-                    }
-                    rule_cd = (int)cd;
-                    has_cd = 1;
-                }
-
-                if (bad) {
-                    JPLOG(JP_ERR, "MEMP cfg_bad line=%d text=%s", line_no, raw_text);
-                    continue;
-                }
-
-                memp_rule_t *r = &parsed_rules[nparsed++];
-                strncpy(r->frag, tokens[0], sizeof(r->frag) - 1);
-                r->frag[sizeof(r->frag) - 1] = '\0';
-                r->thr_mb = thr;
-                r->cooldown = rule_cd;
-                r->is_bid = (strncmp(tokens[0], "bid:", 4) == 0);
-                r->last_warn_sec = 0;
-                r->last_skip_sec = 0;
-                r->ineff = 0;
-                r->eff_cd = (rule_cd > 0 ? rule_cd : new_cooldown);
-            }
-        }
-        fclose(f);
-    }
-
-    /* 检查配置是否有变 */
-    int changed = 0;
-    if (g_memp_cfg_first_load) {
-        changed = 1;
-        g_memp_cfg_first_load = 0;
-    } else if (file_absent != g_memp_cfg_file_absent) {
-        changed = 1;
-    } else if (new_cooldown != g_memp_cooldown) {
-        changed = 1;
-    } else if (nparsed != g_nmemp_rules) {
-        changed = 1;
-    } else {
-        for (int i = 0; i < nparsed; i++) {
-            if (!memp_rule_cfg_equal(&parsed_rules[i], &g_memp_rules[i])) {
-                changed = 1;
-                break;
-            }
-        }
-    }
-
-    if (changed) {
-        int rule_cd_count = 0;
-        for (int i = 0; i < nparsed; i++) {
-            if (parsed_rules[i].cooldown > 0) rule_cd_count++;
-        }
-
-        char cap_str[64];
-        if (g_memp_memcap_fallback) {
-            snprintf(cap_str, sizeof(cap_str), "2048(fallback)");
-        } else {
-            snprintf(cap_str, sizeof(cap_str), "%llu", (unsigned long long)g_memp_memcap);
-        }
-        JPLOG(JP_INFO, "MEMP cfg rules=%d cooldown=%d file=%s memcap=%s rule_cd=%d",
-               nparsed, new_cooldown, file_absent ? "absent" : "ok", cap_str, rule_cd_count);
-
-        for (int i = 0; i < nparsed; i++) {
-            char cd_str[32];
-            if (parsed_rules[i].cooldown > 0) {
-                snprintf(cd_str, sizeof(cd_str), "%d", (int)parsed_rules[i].cooldown);
-            } else {
-                snprintf(cd_str, sizeof(cd_str), "global");
-            }
-            JPLOG(JP_DEBUG, "MEMP cfg_rule i=%d app=%s thr=%d cd=%s",
-                   i, parsed_rules[i].frag, (int)parsed_rules[i].thr_mb, cd_str);
-        }
-
-        /* 继承相同片段的冷却与退避状态 */
-        for (int i = 0; i < nparsed; i++) {
-            int32_t base_cd = parsed_rules[i].cooldown > 0 ? parsed_rules[i].cooldown : new_cooldown;
-            parsed_rules[i].ineff = 0;
-            parsed_rules[i].eff_cd = base_cd;
-            for (int j = 0; j < g_nmemp_rules; j++) {
-                if (strcmp(parsed_rules[i].frag, g_memp_rules[j].frag) == 0) {
-                    parsed_rules[i].last_warn_sec = g_memp_rules[j].last_warn_sec;
-                    parsed_rules[i].last_skip_sec = g_memp_rules[j].last_skip_sec;
-                    int same_cfg = (parsed_rules[i].thr_mb == g_memp_rules[j].thr_mb &&
-                                    parsed_rules[i].cooldown == g_memp_rules[j].cooldown &&
-                                    (parsed_rules[i].cooldown > 0 || new_cooldown == g_memp_cooldown));
-                    if (same_cfg) {
-                        parsed_rules[i].ineff = g_memp_rules[j].ineff;
-                        parsed_rules[i].eff_cd = g_memp_rules[j].eff_cd > 0 ? g_memp_rules[j].eff_cd : base_cd;
-                    }
-                    break;
-                }
-            }
-        }
-        memcpy(g_memp_rules, parsed_rules, sizeof(memp_rule_t) * nparsed);
-        g_nmemp_rules = nparsed;
-        g_memp_cooldown = new_cooldown;
-        g_memp_cfg_file_absent = file_absent;
-        memp_floor_prune();
-    }
-
-    return file_absent ? -1 : 0;
 }
 
 static int restart_is_blocked_bid(const char *bid) {
@@ -4335,6 +3226,18 @@ static void *pulse_worker_thread(void *arg) {
     uint64_t fp15 = 0, fp30 = 0, fp60 = 0;
     int has_fp15 = 0, has_fp30 = 0, has_fp60 = 0;
 
+    /* 卡 P：OVERRIDDEN 跟踪与重新设限状态 */
+    int ovr_t = -1;
+    int32_t ovr_val = -1;
+    uint32_t ovr_attr = 0;
+    uint64_t fp_ovr = 0;
+    int ovr_read_fail = 0;
+    int reassert_count = 0;
+    int reassert_val = -1; /* -1: NA, 0: ok=0, 1: ok=1 */
+    int32_t expected_inactive = (int32_t)L;
+    uint64_t last_fp = fp0;
+    int last_sec = 0;
+
     for (int sec = 1; sec <= 60; sec++) {
         usleep(1000 * 1000);
         if (g_locked) was_locked = 1;
@@ -4391,6 +3294,9 @@ static void *pulse_worker_thread(void *arg) {
             break;
         }
 
+        last_fp = cur_fp;
+        last_sec = sec;
+
         if (sec == 15) { fp15 = cur_fp; has_fp15 = 1; }
         else if (sec == 30) { fp30 = cur_fp; has_fp30 = 1; }
         else if (sec == 60) { fp60 = cur_fp; has_fp60 = 1; }
@@ -4398,6 +3304,94 @@ static void *pulse_worker_thread(void *arg) {
         JPLOG(JP_DEBUG, "t=%ds fp=%llu L=%llu (%.1f%%)",
               sec, (unsigned long long)cur_fp, (unsigned long long)L,
               (double)cur_fp * 100.0 / (double)L);
+
+        /* 卡 P-1 / 卡 P-2: 每秒在读 fp 之后调用一次 pulse_get_memlimit_props(pid) */
+        memorystatus_memlimit_properties_t loop_props;
+        if (pulse_get_memlimit_props(pid, &loop_props) != 0) {
+            ovr_read_fail++;
+        } else if (loop_props.memlimit_inactive != expected_inactive) {
+            if (reassert_count == 0 && ovr_t < 0) {
+                /* 第一次发现 inactive ≠ 当前期望值 (初始为 L) */
+                ovr_t = sec;
+                ovr_val = loop_props.memlimit_inactive;
+                ovr_attr = loop_props.memlimit_inactive_attr;
+                fp_ovr = cur_fp;
+
+                int32_t band = -1;
+                pulse_get_cur_priority(pid, &band);
+
+                JPLOG(JP_INFO, "PULSE_OVERRIDE app=%s pid=%d t=%d inactive=%d/0x%x fp=%llu band=%d",
+                      bid, (int)pid, ovr_t, ovr_val, ovr_attr,
+                      (unsigned long long)fp_ovr, (int)band);
+
+                /* 计算从窗口开始到现在的 cpu_ms */
+                uint64_t now_cpu = 0;
+                int now_cpu_ok = (pulse_get_cpu_time(pid, &now_cpu) == 0);
+                uint64_t cur_cpu_ms = (cpu_start_ok && now_cpu_ok) ? pulse_calc_cpu_ms(cpu_start, now_cpu) : 0;
+
+                /* 卡 P-5: SUSPENDED 优先：cpu_ms == 0 时不重新设限、不恢复、结论仍记 SUSPENDED */
+                if (cur_cpu_ms == 0) {
+                    end_reason = "SUSPENDED";
+                    should_restore = 0;
+                    break;
+                }
+
+                /* 卡 P-2: 重新设限，最多 1 次
+                 * 条件：ovr_t <= 30，现读档位 < 90，fp_ovr > target，从窗口开始到现在的 cpu_ms > 0，且没重新设过 */
+                pulse_rule_t *rule = pulse_find_rule(bid);
+                uint64_t target_mb = rule ? (uint64_t)rule->target_mb : 0;
+
+                if (ovr_t <= 30 && band >= 0 && band < 90 && fp_ovr > target_mb) {
+                    reassert_count = 1;
+                    proc_identity_t check_reassert_ident;
+                    int reassert_ok = 0;
+                    if (pulse_get_proc_identity(pid, &check_reassert_ident) == 0 &&
+                        pulse_compare_proc_identity(&ident, &check_reassert_ident)) {
+                        memorystatus_memlimit_properties_t r_props = loop_props;
+                        r_props.memlimit_inactive = (int32_t)L;
+                        r_props.memlimit_inactive_attr &= ~MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
+                        if (pulse_set_memlimit_props(pid, &r_props) == 0) {
+                            memorystatus_memlimit_properties_t rb;
+                            if (pulse_get_memlimit_props(pid, &rb) == 0) {
+                                int rb_act_fatal = (rb.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+                                int exp_act_fatal = (r_props.memlimit_active_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+                                int rb_inact_fatal = (rb.memlimit_inactive_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
+                                if (rb.memlimit_active == r_props.memlimit_active &&
+                                    rb_act_fatal == exp_act_fatal &&
+                                    rb.memlimit_inactive == (int32_t)L &&
+                                    rb_inact_fatal == 0) {
+                                    reassert_ok = 1;
+                                }
+                            }
+                        }
+                    }
+                    JPLOG(JP_INFO, "PULSE_REASSERT ok=%d t=%d", reassert_ok, sec);
+                    if (reassert_ok) {
+                        reassert_val = 1;
+                        expected_inactive = (int32_t)L;
+                        state.orig_inactive = ovr_val;
+                        state.orig_inactive_attr = ovr_attr;
+                        pulse_save_state_file(&state);
+                        /* 继续这个窗口 */
+                    } else {
+                        reassert_val = 0;
+                        end_reason = "OVERRIDDEN";
+                        should_restore = 0;
+                        break;
+                    }
+                } else {
+                    /* 不满足条件：结束窗口，end_reason="OVERRIDDEN"，不恢复 */
+                    end_reason = "OVERRIDDEN";
+                    should_restore = 0;
+                    break;
+                }
+            } else {
+                /* 重新设限之后又被改：结束窗口，end_reason="OVERRIDDEN"，不恢复，不再重新设限 */
+                end_reason = "OVERRIDDEN";
+                should_restore = 0;
+                break;
+            }
+        }
 
         /* 5. 窗口内一旦 fp >= 0.95*L，马上 restore，记 ABORT near_limit */
         if (cur_fp * 100 >= 95 * L) {
@@ -4440,6 +3434,9 @@ static void *pulse_worker_thread(void *arg) {
             end_reason = "CPU_FAIL";
         } else if (cpu_ms == 0) {
             end_reason = "SUSPENDED";
+            if (ovr_t > 0) {
+                should_restore = 0;
+            }
         }
     }
 
@@ -4447,11 +3444,24 @@ static void *pulse_worker_thread(void *arg) {
     if (should_restore) {
         memorystatus_memlimit_properties_t pre_restore;
         if (pulse_get_memlimit_props(pid, &pre_restore) == 0 &&
-            pre_restore.memlimit_inactive != (int32_t)L) {
-            JPLOG(JP_INFO, "OVERRIDDEN app=%s pid=%d inactive=%d/0x%x",
-                  bid, (int)pid, pre_restore.memlimit_inactive, pre_restore.memlimit_inactive_attr);
-            end_reason = "OVERRIDDEN";
-            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "OVERRIDDEN");
+            pre_restore.memlimit_inactive != expected_inactive) {
+            if (ovr_t < 0) {
+                ovr_t = (last_sec > 0) ? last_sec : 1;
+                ovr_val = pre_restore.memlimit_inactive;
+                ovr_attr = pre_restore.memlimit_inactive_attr;
+                fp_ovr = last_fp;
+                int32_t band = -1;
+                pulse_get_cur_priority(pid, &band);
+                JPLOG(JP_INFO, "PULSE_OVERRIDE app=%s pid=%d t=%d inactive=%d/0x%x fp=%llu band=%d",
+                      bid, (int)pid, ovr_t, ovr_val, ovr_attr,
+                      (unsigned long long)fp_ovr, (int)band);
+            }
+            if (cpu_calc_ok && cpu_ms == 0) {
+                end_reason = "SUSPENDED";
+            } else {
+                end_reason = "OVERRIDDEN";
+            }
+            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "%s", end_reason);
             pulse_clear_state_file(pid);
         } else {
             pulse_do_restore(pid, bid, restore_verdict_str, sizeof(restore_verdict_str));
@@ -4462,6 +3472,10 @@ static void *pulse_worker_thread(void *arg) {
             snprintf(restore_verdict_str, sizeof(restore_verdict_str), "PID_REUSED");
         } else if (strcmp(end_reason, "GONE") == 0) {
             snprintf(restore_verdict_str, sizeof(restore_verdict_str), "PULSE_GONE");
+        } else if (strcmp(end_reason, "OVERRIDDEN") == 0) {
+            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "OVERRIDDEN");
+        } else if (strcmp(end_reason, "SUSPENDED") == 0) {
+            snprintf(restore_verdict_str, sizeof(restore_verdict_str), "SUSPENDED");
         }
     }
 
@@ -4521,8 +3535,10 @@ static void *pulse_worker_thread(void *arg) {
         }
     }
 
-    /* 汇总行输出 (C2-4 / M1 / D1-a) */
+    /* 汇总行输出 (C2-4 / M1 / D1-a / 卡 P) */
     char t_reach_str[32], fp15_str[32], fp30_str[32], fp60_str[32], cpu_ms_str[32], bg_lag_str[32];
+    char ovr_t_str[32], fp_ovr_str[32], reassert_str[32];
+
     if (t_reach > 0) snprintf(t_reach_str, sizeof(t_reach_str), "%d", t_reach);
     else snprintf(t_reach_str, sizeof(t_reach_str), "NA");
 
@@ -4541,12 +3557,22 @@ static void *pulse_worker_thread(void *arg) {
     if (target->bg_lag >= 0) snprintf(bg_lag_str, sizeof(bg_lag_str), "%ld", (long)target->bg_lag);
     else snprintf(bg_lag_str, sizeof(bg_lag_str), "NA");
 
+    if (ovr_t > 0) snprintf(ovr_t_str, sizeof(ovr_t_str), "%d", ovr_t);
+    else snprintf(ovr_t_str, sizeof(ovr_t_str), "NA");
+
+    if (ovr_t > 0) snprintf(fp_ovr_str, sizeof(fp_ovr_str), "%llu", (unsigned long long)fp_ovr);
+    else snprintf(fp_ovr_str, sizeof(fp_ovr_str), "NA");
+
+    if (reassert_val >= 0) snprintf(reassert_str, sizeof(reassert_str), "%d", reassert_val);
+    else snprintf(reassert_str, sizeof(reassert_str), "NA");
+
     if (g_locked) was_locked = 1;
 
-    JPLOG(JP_INFO, "PULSE app=%s pid=%d fp0=%llu L=%llu t_reach=%s fp15=%s fp30=%s fp60=%s cpu_ms=%s end=%s restore=%s bg_lag=%s locked=%d",
+    JPLOG(JP_INFO, "PULSE app=%s pid=%d fp0=%llu L=%llu t_reach=%s fp15=%s fp30=%s fp60=%s cpu_ms=%s end=%s restore=%s bg_lag=%s locked=%d ovr_t=%s fp_ovr=%s reassert=%s ovr_rf=%d",
           bid, (int)pid, (unsigned long long)fp0, (unsigned long long)L,
           t_reach_str, fp15_str, fp30_str, fp60_str, cpu_ms_str, end_reason, restore_verdict_str,
-          bg_lag_str, was_locked);
+          bg_lag_str, was_locked,
+          ovr_t_str, fp_ovr_str, reassert_str, ovr_read_fail);
 
     /* 计次与状态更新 (M6: 持锁保护) */
     pulse_get_local_date_str(today_str, sizeof(today_str));
@@ -4568,13 +3594,15 @@ static void *pulse_worker_thread(void *arg) {
         }
 
         /* 无响应判定 (C2-6): 若已完成 >= 2 次 pulse 且最近连续 2 次降幅均 <= 5MB，标记为无响应 (只标记，不停用) */
-        /* PID_REUSED、OVERRIDDEN、GONE 均不计入「没降」统计 (S7) */
+        /* PID_REUSED、GONE 均不计入「没降」统计 (S7) */
         /* SUSPENDED 也不计入 total 和 no_drop，也不触发 unresponsive (C2-T) */
         /* CPU_FAIL (读 CPU 失败) 也不计入 total 和 no_drop，不触发 unresponsive (M1) */
-        uint64_t fp_final = has_fp60 ? fp60 : (has_fp30 ? fp30 : (has_fp15 ? fp15 : fp0));
+        /* 卡 P-4: 计算 fp_final: 有 ovr_t 且这次以 OVERRIDDEN 结束，fp_final = fp_ovr; 其他情况维持原取法 */
+        uint64_t fp_final = (ovr_t > 0 && strcmp(end_reason, "OVERRIDDEN") == 0) ? fp_ovr
+                            : (has_fp60 ? fp60 : (has_fp30 ? fp30 : (has_fp15 ? fp15 : fp0)));
+        /* 卡 P-4: 从 no_drop 排除列表去掉 OVERRIDDEN, OVERRIDDEN 照常计入 total_pulses 并参与 no_drop/unresponsive 判定 */
         if (strcmp(end_reason, "GONE") != 0 && !gone_post_restore &&
             strcmp(end_reason, "PID_REUSED") != 0 &&
-            strcmp(end_reason, "OVERRIDDEN") != 0 &&
             strcmp(end_reason, "SUSPENDED") != 0 &&
             strcmp(end_reason, "CPU_FAIL") != 0) {
             if (fp_final + 5 >= fp0) {
@@ -5577,62 +4605,6 @@ static int restart_state_record_restart(const char *bid, time_t now_mono) {
     return today_count;
 }
 
-static char s_rst_kill_path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-
-/* C4: 清底线 (在 kill 那一刻，C2 状态机 IDLE 步骤 3) */
-static void rst_c4_floor_reset(pid_t old_pid, const char *bid) {
-    if (old_pid <= 0) return;
-
-    /* 获取被杀旧主进程的完整二进制路径 (优先从内核查，查不到则回退到 kill 前暂存的路径) */
-    char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-    if (proc_pidpath(old_pid, path, sizeof(path)) <= 0) {
-        if (s_rst_kill_path[0] != '\0') {
-            rst_str_copy(path, sizeof(path), s_rst_kill_path);
-        }
-    }
-    const char *app_bid = bid;
-    if (!app_bid && path[0] != '\0') {
-        app_bid = app_bid_for_path(path);
-    }
-
-    /* 如果观察槽 g_memp_post.pid 等于旧 pid，把 valid 置 0 */
-    if (g_memp_post.pid == old_pid) {
-        g_memp_post.valid = 0;
-    }
-
-    /* 遍历 memp 规则，用现有的匹配函数找出所有匹配被杀 pid 的规则 (bid 规则和路径片段规则都算) */
-    for (int i = 0; i < g_nmemp_rules; i++) {
-        memp_rule_t *rule = &g_memp_rules[i];
-        if (!memp_rule_matches(rule, path, app_bid)) {
-            continue;
-        }
-
-        /* 被清规则的 ineff 清零，eff_cd 回到 base */
-        int32_t base_cd = rule->cooldown > 0 ? rule->cooldown : g_memp_cooldown;
-        rule->ineff = 0;
-        rule->eff_cd = base_cd;
-
-        /* 清掉它们在底线表里的那一条 */
-        int cleared = 0;
-        for (int f = 0; f < g_nmemp_floors; ) {
-            if (strcmp(g_memp_floors[f].frag, rule->frag) == 0) {
-                for (int k = f; k < g_nmemp_floors - 1; k++) {
-                    g_memp_floors[k] = g_memp_floors[k + 1];
-                }
-                g_nmemp_floors--;
-                cleared = 1;
-            } else {
-                f++;
-            }
-        }
-        /* 每清一条记一行 INFO：MEMP floor_reset reason=restart bid=<b> frag=<frag>，然后 memp_floor_save() */
-        if (cleared) {
-            JPLOG(JP_INFO, "MEMP floor_reset reason=restart bid=%s frag=%s",
-                  app_bid ? app_bid : "", rule->frag);
-            memp_floor_save();
-        }
-    }
-}
 
 /* C4: 读取 band_settled (在 WAIT_SETTLE 读：距 t_launch >= 10 秒后的第一轮) */
 static int32_t rst_c4_read_band_settled(pid_t new_pid, int32_t cur_band) {
@@ -5800,7 +4772,6 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
                 if (strcmp(s_app_procs[j].bid, rule->bid) == 0) {
                     main_pid = s_app_procs[j].pid;
                     main_cur = s_app_procs[j].priority;
-                    rst_str_copy(s_rst_kill_path, sizeof(s_rst_kill_path), s_app_procs[j].path);
                     break;
                 }
             }
@@ -5938,10 +4909,6 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
               (unsigned long long)fp_mb, (int)rule->thr_mb,
               bg_sec_elapsed, (int)sys_band, today_n, kill_errno);
 
-        if (kill_errno == 0 || kill_errno == ESRCH) {
-            rst_c4_floor_reset(main_pid, rule->bid);
-        }
-        s_rst_kill_path[0] = '\0';
 
         if (kill_errno != 0 && kill_errno != ESRCH) {
             g_rst_sm.state = RST_STATE_IDLE;
@@ -5978,764 +4945,509 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
     }
 }
 
+/* =========================================================================
+ * 后台定时清理：判定与执行 (v0.8.0 卡 K)
+ * ========================================================================= */
+
+static int bgkill_rule_cfg_equal(const bgkill_rule_t *a, const bgkill_rule_t *b) {
+    if (!a || !b) return 0;
+    if (strcmp(a->bid, b->bid) != 0) return 0;
+    if (a->enabled != b->enabled) return 0;
+    if (a->min != b->min) return 0;
+    if (a->max != b->max) return 0;
+    return 1;
+}
+
+static bgkill_rule_state_t *bgkill_get_rule_state(const char *bid) {
+    if (!bid || bid[0] == '\0') return NULL;
+    for (int i = 0; i < g_nbgkill_rule_states; i++) {
+        if (strcmp(g_bgkill_rule_states[i].bid, bid) == 0) {
+            return &g_bgkill_rule_states[i];
+        }
+    }
+    if (g_nbgkill_rule_states >= BGKILL_MAX_RULES) return NULL;
+    bgkill_rule_state_t *st = &g_bgkill_rule_states[g_nbgkill_rule_states++];
+    memset(st, 0, sizeof(*st));
+    strncpy(st->bid, bid, sizeof(st->bid) - 1);
+    st->bid[sizeof(st->bid) - 1] = '\0';
+    strncpy(st->last_kill_hhmm, "-", sizeof(st->last_kill_hhmm) - 1);
+    return st;
+}
+
+static void bgkill_check_date_reset(bgkill_rule_state_t *st, const struct tm *tm_now) {
+    int y = tm_now->tm_year + 1900;
+    int m = tm_now->tm_mon + 1;
+    int d = tm_now->tm_mday;
+    if (st->today_y != y || st->today_m != m || st->today_d != d) {
+        st->today_count = 0;
+        st->today_y = y;
+        st->today_m = m;
+        st->today_d = d;
+        strncpy(st->last_kill_hhmm, "-", sizeof(st->last_kill_hhmm) - 1);
+    }
+}
+
+static void bgkill_write_status(FILE *m) {
+    if (!m) return;
+    fprintf(m, "bgkill_support=1\n");
+    fprintf(m, "bgkill_master=%s\n", g_bgkill_master ? "on" : "off");
+    fprintf(m, "bgkill_cfg_bad=%d\n", g_bgkill_cfg_bad_count);
+    for (int i = 0; i < g_nbgkill_rules; i++) {
+        bgkill_rule_t *rule = &g_bgkill_rules[i];
+        bgkill_rule_state_t *st = bgkill_get_rule_state(rule->bid);
+        int today = st ? st->today_count : 0;
+        const char *last = (st && st->last_kill_hhmm[0] != '\0') ? st->last_kill_hhmm : "-";
+        fprintf(m, "bgkill %s today=%d last=%s\n", rule->bid, today, last);
+    }
+}
+
+static int bgkill_load_config(void) {
+    int file_absent = 0;
+    FILE *f = NULL;
+    int rc = jp_config_open(BGKILL_CONFIG_PATH, &s_bgkill_cfg_stamp, "BGK", &file_absent, &f);
+
+    if (rc == 0) {
+        return g_bgkill_cfg_file_absent ? -1 : 0;
+    }
+    if (rc < 0) {
+        return g_bgkill_cfg_file_absent ? -1 : 0;
+    }
+
+    if (file_absent || !f) {
+        g_bgkill_cfg_file_absent = 1;
+        g_nbgkill_rules = 0;
+        g_bgkill_cfg_bad_count = 0;
+        return -1;
+    }
+
+    bgkill_rule_t parsed_rules[BGKILL_MAX_RULES];
+    int nparsed = 0;
+    int bad_line_count = 0;
+    int parsed_master = 1; /* default on */
+    int global_count = 0;
+
+    char line[512];
+    int line_no = 0;
+    while (fgets(line, sizeof(line), f)) {
+        line_no++;
+        size_t llen = strlen(line);
+        int oversized = 0;
+        if (llen == sizeof(line) - 1 && line[llen - 1] != '\n' && !feof(f)) {
+            oversized = 1;
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') {}
+        }
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\r' || *p == '\n' || *p == '\0') continue;
+
+        char raw_text[512];
+        strncpy(raw_text, p, sizeof(raw_text) - 1);
+        raw_text[sizeof(raw_text) - 1] = '\0';
+        char *nl = strchr(raw_text, '\n');
+        if (nl) *nl = '\0';
+        char *cr = strchr(raw_text, '\r');
+        if (cr) *cr = '\0';
+
+        if (oversized) {
+            bad_line_count++;
+            JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+            continue;
+        }
+
+        char line_copy[512];
+        strncpy(line_copy, raw_text, sizeof(line_copy) - 1);
+        line_copy[sizeof(line_copy) - 1] = '\0';
+
+        char *tokens[16];
+        int ntokens = 0;
+        char *saveptr = NULL;
+        char *tok = strtok_r(line_copy, " \t", &saveptr);
+        while (tok) {
+            if (ntokens < 15) {
+                tokens[ntokens] = tok;
+            }
+            ntokens++;
+            tok = strtok_r(NULL, " \t", &saveptr);
+        }
+
+        if (ntokens >= 1 && strcmp(tokens[0], "global") == 0) {
+            global_count++;
+            if (global_count > 1 || ntokens != 2 || (strcmp(tokens[1], "on") != 0 && strcmp(tokens[1], "off") != 0)) {
+                /* global 写了两次，或值不是 on 和 off，都按坏行处理，总开关保持 on */
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+                parsed_master = 1;
+                continue;
+            }
+            parsed_master = (strcmp(tokens[1], "on") == 0) ? 1 : 0;
+            continue;
+        }
+
+        /* 规则行格式: bid:<bid> on|off min=<分钟> max=<每天次数> (4 个 token) */
+        if (ntokens != 4) {
+            bad_line_count++;
+            JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+            continue;
+        }
+
+        if (strncmp(tokens[0], "bid:", 4) != 0) {
+            bad_line_count++;
+            JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+            continue;
+        }
+
+        const char *bid = tokens[0] + 4;
+        if (bid[0] == '\0' || strlen(bid) >= sizeof(parsed_rules[0].bid) || restart_is_blocked_bid(bid)) {
+            bad_line_count++;
+            JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+            continue;
+        }
+
+        int enabled = -1;
+        if (strcmp(tokens[1], "on") == 0) {
+            enabled = 1;
+        } else if (strcmp(tokens[1], "off") == 0) {
+            enabled = 0;
+        } else {
+            bad_line_count++;
+            JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+            continue;
+        }
+
+        int duplicate = 0;
+        for (int i = 0; i < nparsed; i++) {
+            if (strcmp(parsed_rules[i].bid, bid) == 0) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) {
+            bad_line_count++;
+            JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+            continue;
+        }
+
+        int has_min = 0, has_max = 0;
+        int32_t val_min = 0, val_max = 0;
+        int bad = 0;
+
+        for (int k = 2; k < 4; k++) {
+            char *eq = strchr(tokens[k], '=');
+            if (!eq || eq == tokens[k] || *(eq + 1) == '\0') {
+                bad = 1;
+                break;
+            }
+            *eq = '\0';
+            char *key = tokens[k];
+            char *val_str = eq + 1;
+
+            char *endp = NULL;
+            errno = 0;
+            long v = strtol(val_str, &endp, 10);
+            if (errno != 0 || !endp || *endp != '\0') {
+                bad = 1;
+                break;
+            }
+
+            if (strcmp(key, "min") == 0) {
+                if (has_min) { bad = 1; break; }
+                if (v < BGKILL_MIN_MIN || v > BGKILL_MAX_MIN) { bad = 1; break; }
+                val_min = (int32_t)v;
+                has_min = 1;
+            } else if (strcmp(key, "max") == 0) {
+                if (has_max) { bad = 1; break; }
+                if (v < BGKILL_MIN_MAX || v > BGKILL_MAX_MAX) { bad = 1; break; }
+                val_max = (int32_t)v;
+                has_max = 1;
+            } else {
+                bad = 1;
+                break;
+            }
+        }
+
+        if (bad || !has_min || !has_max) {
+            bad_line_count++;
+            JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+            continue;
+        }
+
+        if (nparsed >= BGKILL_MAX_RULES) {
+            bad_line_count++;
+            JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+            continue;
+        }
+
+        bgkill_rule_t *br = &parsed_rules[nparsed++];
+        strncpy(br->bid, bid, sizeof(br->bid) - 1);
+        br->bid[sizeof(br->bid) - 1] = '\0';
+        br->enabled = enabled;
+        br->min = val_min;
+        br->max = val_max;
+    }
+    fclose(f);
+
+    g_bgkill_cfg_bad_count = bad_line_count;
+
+    if (g_bgkill_first_load) {
+        g_bgkill_first_load = 0;
+        if (parsed_master != g_bgkill_master) {
+            g_bgkill_master = parsed_master;
+            JPLOG(JP_INFO, "%-6s master=%s", "BGK", g_bgkill_master ? "on" : "off");
+        }
+    } else {
+        if (parsed_master != g_bgkill_master) {
+            g_bgkill_master = parsed_master;
+            JPLOG(JP_INFO, "%-6s master=%s", "BGK", g_bgkill_master ? "on" : "off");
+        }
+    }
+
+    int changed = 0;
+    if (file_absent != g_bgkill_cfg_file_absent) {
+        changed = 1;
+    } else if (nparsed != g_nbgkill_rules) {
+        changed = 1;
+    } else {
+        for (int i = 0; i < nparsed; i++) {
+            if (!bgkill_rule_cfg_equal(&parsed_rules[i], &g_bgkill_rules[i])) {
+                changed = 1;
+                break;
+            }
+        }
+    }
+
+    if (changed) {
+        JPLOG(JP_INFO, "%-6s cfg rules=%d file=%s",
+              "BGK", nparsed, file_absent ? "absent" : "ok");
+        for (int i = 0; i < nparsed; i++) {
+            JPLOG(JP_DEBUG, "%-6s cfg_rule i=%d bid=%s on=%d min=%d max=%d",
+                  "BGK", i, parsed_rules[i].bid, parsed_rules[i].enabled,
+                  (int)parsed_rules[i].min, (int)parsed_rules[i].max);
+        }
+        memcpy(g_bgkill_rules, parsed_rules, sizeof(bgkill_rule_t) * nparsed);
+        g_nbgkill_rules = nparsed;
+        g_bgkill_cfg_file_absent = file_absent;
+
+        int new_nbgkill_rule_states = 0;
+        for (int i = 0; i < g_nbgkill_rule_states; i++) {
+            int found = 0;
+            for (int j = 0; j < g_nbgkill_rules; j++) {
+                if (strcmp(g_bgkill_rule_states[i].bid, g_bgkill_rules[j].bid) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (found) {
+                if (new_nbgkill_rule_states != i) {
+                    g_bgkill_rule_states[new_nbgkill_rule_states] = g_bgkill_rule_states[i];
+                }
+                new_nbgkill_rule_states++;
+            }
+        }
+        g_nbgkill_rule_states = new_nbgkill_rule_states;
+    }
+
+    return 0;
+}
+
+static int bgkill_read_current_band(pid_t pid, int32_t *band_out) {
+    if (pid <= 0 || !band_out) return -1;
+    int count = 0;
+    memorystatus_priority_entry_t *list = get_list(&count);
+    if (!list) return -1;
+    int found = 0;
+    for (int i = 0; i < count; i++) {
+        if (list[i].pid == pid) {
+            *band_out = list[i].priority;
+            found = 1;
+            break;
+        }
+    }
+    free(list);
+    return found ? 0 : -1;
+}
+
+static void bgkill_log_skip(const bgkill_rule_t *rule, bgkill_rule_state_t *st,
+                            const char *reason, time_t now_mono) {
+    int should_log = 0;
+    if (st->last_skip_mono == 0 || now_mono - st->last_skip_mono >= 60) {
+        should_log = 1;
+    } else if (strcmp(st->last_skip_reason, reason) != 0) {
+        should_log = 1;
+    }
+
+    if (should_log) {
+        st->last_skip_mono = now_mono;
+        strncpy(st->last_skip_reason, reason, sizeof(st->last_skip_reason) - 1);
+        st->last_skip_reason[sizeof(st->last_skip_reason) - 1] = '\0';
+        JPLOG(JP_DEBUG, "%-6s skip=%s bid=%s", "BGK", reason, rule->bid);
+    }
+}
+
+static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
+    if (g_bgkill_cfg_file_absent || !g_bgkill_master) {
+        for (int i = 0; i < g_nbgkill_rule_states; i++) {
+            g_bgkill_rule_states[i].tracked_pid = 0;
+            g_bgkill_rule_states[i].in_bg = 0;
+            g_bgkill_rule_states[i].bg_start_mono = 0;
+            g_bgkill_rule_states[i].bg_rounds = 0;
+        }
+        return;
+    }
+
+    /* 取不到优先级列表时不要清空已有状态，跳过本轮即可 */
+    if (!list || count <= 0) {
+        return;
+    }
+
+    rst_ensure_app_procs(list, count);
+
+    struct timespec ts_mono;
+    clock_gettime(CLOCK_MONOTONIC, &ts_mono);
+    time_t now_mono = ts_mono.tv_sec;
+
+    time_t now_wall = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now_wall, &tm_now);
+
+    for (int i = 0; i < g_nbgkill_rules; i++) {
+        bgkill_rule_t *rule = &g_bgkill_rules[i];
+        bgkill_rule_state_t *st = bgkill_get_rule_state(rule->bid);
+        if (!st) continue;
+
+        bgkill_check_date_reset(st, &tm_now);
+
+        if (!rule->enabled) {
+            st->in_bg = 0;
+            st->bg_start_mono = 0;
+            st->bg_rounds = 0;
+            st->tracked_pid = 0;
+            continue;
+        }
+
+        /* 查找该 bid 的用户 App 主进程 */
+        pid_t main_pid = 0;
+        int32_t main_cur = 0;
+        for (int j = 0; j < s_napp_procs; j++) {
+            if (strcmp(s_app_procs[j].bid, rule->bid) == 0) {
+                main_pid = s_app_procs[j].pid;
+                main_cur = s_app_procs[j].priority;
+                break;
+            }
+        }
+
+        if (main_pid <= 0) {
+            st->tracked_pid = 0;
+            st->in_bg = 0;
+            st->bg_start_mono = 0;
+            st->bg_rounds = 0;
+            continue;
+        }
+
+        /* pid 变了：清零，按新进程重新计时 */
+        if (main_pid != st->tracked_pid) {
+            st->tracked_pid = main_pid;
+            st->in_bg = (main_cur < 90) ? 1 : 0;
+            st->bg_start_mono = (main_cur < 90) ? now_mono : 0;
+            st->bg_rounds = (main_cur < 90) ? 1 : 0;
+        } else {
+            /* 档位 >= 90 清零; < 90 进入记 bg_start_mono, 之后每轮 bg_rounds++ */
+            if (main_cur >= 90) {
+                st->in_bg = 0;
+                st->bg_start_mono = 0;
+                st->bg_rounds = 0;
+            } else {
+                if (!st->in_bg) {
+                    st->in_bg = 1;
+                    st->bg_start_mono = now_mono;
+                    st->bg_rounds = 1;
+                } else {
+                    st->bg_rounds++;
+                }
+            }
+        }
+
+        /* 如果在前台，不触发也不打日志 */
+        if (main_cur >= 90 || !st->in_bg) {
+            continue;
+        }
+
+        /* 触发条件 2: 时间未满不打日志 */
+        int bg_sec_elapsed = (int)(now_mono - st->bg_start_mono);
+        if (rule->min > 0) {
+            if (bg_sec_elapsed < rule->min * 60) {
+                continue;
+            }
+        } else {
+            /* min == 0: bg_rounds >= 2 并且 now - bg_start_mono >= 5 秒 */
+            if (st->bg_rounds < 2 || bg_sec_elapsed < 5) {
+                continue;
+            }
+        }
+
+        /* 触发条件 3: pulse 进行中跳过该 pid */
+        if (g_pulse_in_progress && g_pulse_current_pid == main_pid) {
+            bgkill_log_skip(rule, st, "pulse", now_mono);
+            continue;
+        }
+
+        /* 触发条件 4: 重启状态机正在处理该 bid */
+        if (g_rst_sm.state != RST_STATE_IDLE && strcmp(g_rst_sm.bid, rule->bid) == 0) {
+            bgkill_log_skip(rule, st, "rst_busy", now_mono);
+            continue;
+        }
+
+        /* 触发条件 5: 当天次数 < max */
+        if (st->today_count >= rule->max) {
+            bgkill_log_skip(rule, st, "daymax", now_mono);
+            continue;
+        }
+
+        /* 触发条件 6: 现读一次档位 */
+        int32_t cur_band = -1;
+        if (bgkill_read_current_band(main_pid, &cur_band) != 0 || cur_band >= 90) {
+            st->in_bg = 0;
+            st->bg_start_mono = 0;
+            st->bg_rounds = 0;
+            bgkill_log_skip(rule, st, "recheck", now_mono);
+            continue;
+        }
+
+        /* 全部满足，执行 kill */
+        char fp_str[32] = "NA";
+        uint64_t fp_bytes = 0;
+        if (memp_get_phys_footprint(main_pid, &fp_bytes) == 0) {
+            snprintf(fp_str, sizeof(fp_str), "%llu", (unsigned long long)(fp_bytes / (1024 * 1024)));
+        }
+
+        int krc = kill(main_pid, SIGKILL);
+        int kill_errno = (krc == 0) ? 0 : errno;
+        if (kill_errno == 0 || kill_errno == ESRCH) {
+            st->today_count++;
+            snprintf(st->last_kill_hhmm, sizeof(st->last_kill_hhmm), "%02d:%02d", tm_now.tm_hour, tm_now.tm_min);
+        }
+        int today_n = st->today_count;
+
+        JPLOG(JP_INFO, "%-6s kill pid=%d bid=%s bg_s=%d min=%d band=%d fp=%s n=%d rc=%d",
+              "BGK", (int)main_pid, rule->bid, bg_sec_elapsed, (int)rule->min,
+              (int)cur_band, fp_str, today_n, kill_errno);
+
+        st->in_bg = 0;
+        st->bg_start_mono = 0;
+        st->bg_rounds = 0;
+        st->tracked_pid = 0;
+    }
+}
+
 static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
-    /* 自动重启与后台释放配置及判定 (v0.7.7 C2, v0.7.8 C2) */
+    /* 自动重启与后台释放配置及判定 (v0.7.7 C2, v0.7.8 C2, v0.8.0 K) */
     restart_load_config();
     pulse_load_config();
     restart_round(list, count);
+    bgkill_load_config();
+    bgkill_round(list, count);
     pulse_round(list, count);
-
-    /* v0.7.8 C3-1: E (前台释放) 已停用，跳过 E 的触发、让位、污染与修复路径 (代码保留至 0.7.9 删除) */
-    if (MEMP_RETIRED) {
-        return;
-    }
-
-    /* 1. 每一轮开头检查观察槽与采样（§八、§三-A） */
-    memp_post_sample(list, count);
-
-    /* 2. 重新加载配置（§四） */
-    mempressure_load_config();
-
-    /* 3. 检查 fatal 状态 */
-    if (g_memp_state == MEMP_STATE_FATAL) return;
-
-    /* 4. §五-1a 第一件事：复位处理 (reset_pending) */
-    if (g_memp_reset_pending == MEMP_RESET_PENDING_MARKER) {
-        if (unlink(MEMP_PENDING_PATH) == 0 || errno == ENOENT) {
-            g_memp_reset_pending = MEMP_RESET_PENDING_NONE;
-            g_memp_marker_rm_fail_count = 0;
-        } else {
-            int err = errno;
-            g_memp_marker_rm_fail_count++;
-            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-            if (g_memp_last_marker_rm_fail_time == 0 || now.tv_sec - g_memp_last_marker_rm_fail_time >= 60) {
-                g_memp_last_marker_rm_fail_time = now.tv_sec;
-                char eb[128];
-                memp_fmt_errno(err, eb, sizeof(eb));
-                JPLOG(JP_ERR, "MEMP marker_rm_fail n=%d errno=%s", g_memp_marker_rm_fail_count, eb);
-            }
-        }
-        return;
-    }
-
-    if (g_memp_reset_pending == MEMP_RESET_PENDING_NORMAL) {
-        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-        long secs_since_warn = (long)(now.tv_sec - g_memp_warn_monotonic.tv_sec);
-        if (secs_since_warn >= 600 && !g_memp_reset_overdue_logged) {
-            g_memp_reset_overdue_logged = 1;
-            JPLOG(JP_WARN, "MEMP reset_overdue secs=%ld", secs_since_warn);
-        }
-        g_memp_reset_retry_count++;
-        int v = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
-        int rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &v, sizeof(int));
-        int err = (rc != 0) ? errno : 0;
-        if (rc == 0) {
-            if (unlink(MEMP_PENDING_PATH) == 0 || errno == ENOENT) {
-                g_memp_reset_pending = MEMP_RESET_PENDING_NONE;
-                g_memp_reset_retry_count = 0;
-            } else {
-                g_memp_reset_pending = MEMP_RESET_PENDING_MARKER;
-                g_memp_marker_rm_fail_count = 1;
-                g_memp_last_marker_rm_fail_time = now.tv_sec;
-                char eb[128];
-                memp_fmt_errno(errno, eb, sizeof(eb));
-                JPLOG(JP_ERR, "MEMP marker_rm_fail n=1 errno=%s", eb);
-            }
-        } else if (err == EINVAL) {
-            memp_enter_fatal("einval");
-        } else if (err == ENOENT || err == EPERM) {
-            memp_enter_fatal("unreachable");
-        } else {
-            if (g_memp_last_reset_retry_time == 0 || now.tv_sec - g_memp_last_reset_retry_time >= 60) {
-                g_memp_last_reset_retry_time = now.tv_sec;
-                char eb[128];
-                memp_fmt_errno(err, eb, sizeof(eb));
-                JPLOG(JP_INFO, "MEMP reset_retry n=%d ret=%d errno=%s", g_memp_reset_retry_count, rc, eb);
-            }
-        }
-        return;
-    }
-
-    /* 检查停用与配置有效性 */
-    if (g_memp_state == MEMP_STATE_UNSUPPORTED || g_memp_state == MEMP_STATE_DISABLED) return;
-    if (g_nmemp_rules == 0 || g_memp_cfg_file_absent) return;
-    if (g_locked) return;
-    if (!list || count <= 0) return;
-
-    struct timespec now_ts;
-    clock_gettime(CLOCK_MONOTONIC, &now_ts);
-
-    /* 5. §五-1a 第二件事：修复（§五-6） */
-    pid_t repair_pid = 0;
-    uint64_t repair_max_fp = 0;
-    memp_rule_t *repair_rule = NULL;
-    int repair_fp_fail_skipped = 0;
-
-    for (int i = 0; i < count; i++) {
-        pid_t pid = list[i].pid;
-        int32_t cur = list[i].priority;
-        if (pid <= 0 || cur != 100) continue;
-
-        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-        if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
-        if (!memp_is_main_app_binary(path)) continue;
-
-        const char *app_bid = app_bid_for_path(path);
-        memp_rule_t *rule = memp_match_rule(path, app_bid);
-        if (!rule) continue;
-
-        uint64_t sec = 0, usec = 0;
-        if (memp_get_process_start_time(pid, &sec, &usec) != 0) continue;
-        if (!memp_is_tainted(pid, sec, usec)) continue;
-
-        /* 修复限频：同一进程每 60 秒最多一次 */
-        int recent_repair = 0;
-        for (int r = 0; r < g_memp_nrepair_seen; r++) {
-            if (g_memp_repair_seen[r].pid == pid) {
-                if (now_ts.tv_sec - g_memp_repair_seen[r].last_repair_sec < 60) {
-                    recent_repair = 1;
-                }
-                break;
-            }
-        }
-        if (recent_repair) continue;
-
-        uint64_t fp = 0;
-        if (memp_get_phys_footprint(pid, &fp) != 0) {
-            memp_log_repair_skip_fp_fail(pid, now_ts.tv_sec);
-            repair_fp_fail_skipped = 1;
-            continue;
-        }
-        if (repair_pid == 0 || fp > repair_max_fp) {
-            repair_pid = pid;
-            repair_max_fp = fp;
-            repair_rule = rule;
-        }
-    }
-
-    if (repair_fp_fail_skipped) {
-        return;
-    }
-
-    if (repair_pid > 0) {
-        /* 更新该 pid 的修复限频计时与条目指针 */
-        memp_repair_seen_t *seen_entry = NULL;
-        for (int r = 0; r < g_memp_nrepair_seen; r++) {
-            if (g_memp_repair_seen[r].pid == repair_pid) {
-                seen_entry = &g_memp_repair_seen[r];
-                seen_entry->last_repair_sec = now_ts.tv_sec;
-                break;
-            }
-        }
-        if (!seen_entry) {
-            if (g_memp_nrepair_seen < MEMP_MAX_REPAIR_SEEN) {
-                seen_entry = &g_memp_repair_seen[g_memp_nrepair_seen++];
-            } else {
-                seen_entry = &g_memp_repair_seen[0];
-            }
-            seen_entry->pid = repair_pid;
-            seen_entry->last_repair_sec = now_ts.tv_sec;
-            seen_entry->fail_count = 0;
-        }
-
-        /* 检查真实级别 */
-        int lvl = 0, lerr = 0;
-        int lrc = memp_read_level(&lvl, &lerr);
-        if (lrc != 0) {
-            if (lerr == ENOENT || lerr == EPERM) {
-                memp_enter_unsupported("level", lerr);
-            }
-            return;
-        }
-        if (lvl != 1) return; /* 非 Normal，跳过修复 */
-
-        /* 修复第 1 步：取表确认 T 仍是 100 且无其他 100 档进程 footprint >= T */
-        int rcount1 = 0;
-        memorystatus_priority_entry_t *rlist1 = get_list(&rcount1);
-        int t_is_100 = 0;
-        int comp_has_larger = 0;
-        if (rlist1) {
-            for (int i = 0; i < rcount1; i++) {
-                if (rlist1[i].pid == repair_pid && rlist1[i].priority == 100) {
-                    t_is_100 = 1;
-                    break;
-                }
-            }
-            if (t_is_100) {
-                for (int i = 0; i < rcount1; i++) {
-                    if (rlist1[i].pid <= 0 || rlist1[i].pid == repair_pid) continue;
-                    if (rlist1[i].priority == 100) {
-                        uint64_t cfp = 0;
-                        if (memp_get_phys_footprint(rlist1[i].pid, &cfp) != 0 || cfp >= repair_max_fp) {
-                            comp_has_larger = 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        char comp_buf[256] = "-";
-        if (rlist1) {
-            memp_format_comp(rlist1, rcount1, repair_pid, comp_buf, sizeof(comp_buf));
-        }
-
-        if (!t_is_100 || comp_has_larger) {
-            JPLOG(JP_DEBUG, "MEMP repair app=%s pid=%d band_before=100 band_after=%d comp=%s ret=0 errno=0(-) result=skip",
-                   repair_rule ? repair_rule->frag : "-", (int)repair_pid, t_is_100 ? 100 : 0, comp_buf);
-            if (rlist1) free(rlist1);
-            return;
-        }
-        if (rlist1) free(rlist1);
-
-        /* 修复第 2 步：写一次 NORMAL */
-        int v = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
-        int rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &v, sizeof(int));
-        int err = (rc != 0) ? errno : 0;
-        if (err == EINVAL) {
-            memp_enter_fatal("einval");
-            return;
-        }
-        if (err == ENOENT || err == EPERM) {
-            const char *reason = (err == ENOENT) ? "repair_enoent" : "repair_eperm";
-            memp_enter_unsupported(reason, err);
-            return;
-        }
-
-        /* 修复第 3 步：立即复核 */
-        int rcount2 = 0;
-        memorystatus_priority_entry_t *rlist2 = get_list(&rcount2);
-        int after_is_100 = 0;
-        int after_comp_larger = 0;
-        char band_after_str[32] = "gone";
-        if (rlist2) {
-            for (int i = 0; i < rcount2; i++) {
-                if (rlist2[i].pid == repair_pid) {
-                    snprintf(band_after_str, sizeof(band_after_str), "%d", (int)rlist2[i].priority);
-                    if (rlist2[i].priority == 100) after_is_100 = 1;
-                    break;
-                }
-            }
-            if (after_is_100) {
-                for (int i = 0; i < rcount2; i++) {
-                    if (rlist2[i].pid <= 0 || rlist2[i].pid == repair_pid) continue;
-                    if (rlist2[i].priority == 100) {
-                        uint64_t cfp = 0;
-                        if (memp_get_phys_footprint(rlist2[i].pid, &cfp) != 0 || cfp >= repair_max_fp) {
-                            after_comp_larger = 1;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        char comp_buf2[256] = "-";
-        if (rlist2) {
-            memp_format_comp(rlist2, rcount2, repair_pid, comp_buf2, sizeof(comp_buf2));
-            free(rlist2);
-        }
-
-        char eb[128];
-        memp_fmt_errno(err, eb, sizeof(eb));
-
-        if (rc == 0 && after_is_100 && !after_comp_larger) {
-            if (seen_entry) seen_entry->fail_count = 0;
-            memp_taint_remove(repair_pid);
-            JPLOG(JP_INFO, "MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=ok",
-                   repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb);
-        } else {
-            int n = seen_entry ? ++seen_entry->fail_count : 1;
-            JPLOG(JP_INFO, "MEMP repair app=%s pid=%d band_before=100 band_after=%s comp=%s ret=%d errno=%s result=retry n=%d",
-                   repair_rule ? repair_rule->frag : "-", (int)repair_pid, band_after_str, comp_buf2, rc, eb, n);
-        }
-        return; /* 修复已执行 sysctl，本轮结束 */
-    }
-
-    /* 6. §五-1a 第三件事：触发（§五-1） */
-    pid_t target_pid = 0;
-    uint64_t target_sec = 0, target_usec = 0;
-    uint64_t target_fp_bytes = 0;
-    memp_rule_t *target_rule = NULL;
-
-    for (int i = 0; i < count; i++) {
-        pid_t pid = list[i].pid;
-        int32_t cur = list[i].priority;
-        if (pid <= 0 || cur != 100) continue;
-
-        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-        if (proc_pidpath(pid, path, sizeof(path)) <= 0) continue;
-
-        /* 一次性诊断：记录首个档位 100 且路径包含 /containers/Bundle/Application/ 的进程主二进制判定结果 */
-        static int fg_first_logged = 0;
-        if (!fg_first_logged && cur == 100 && strstr(path, "/containers/Bundle/Application/") != NULL) {
-            fg_first_logged = 1;
-            JPLOG(JP_DEBUG, "MEMP fg_first pid=%d main=%d path=%s", (int)pid, memp_is_main_app_binary(path), path);
-        }
-
-        if (!memp_is_main_app_binary(path)) continue;
-
-        const char *app_bid = app_bid_for_path(path);
-        memp_rule_t *rule = memp_match_rule(path, app_bid);
-        if (!rule) continue;
-
-        uint64_t fp_bytes = 0;
-        int rerr = memp_get_phys_footprint(pid, &fp_bytes);
-        if (rerr != 0) {
-            if (rerr != ESRCH) {
-                int recent_fail = 0;
-                for (int fidx = 0; fidx < g_memp_nrusage_fail_seen; fidx++) {
-                    if (g_memp_rusage_fail_seen[fidx].pid == pid) {
-                        if (now_ts.tv_sec - g_memp_rusage_fail_seen[fidx].last_fail_sec < 60) {
-                            recent_fail = 1;
-                        }
-                        break;
-                    }
-                }
-                if (!recent_fail) {
-                    int fidx = 0;
-                    for (; fidx < g_memp_nrusage_fail_seen; fidx++) {
-                        if (g_memp_rusage_fail_seen[fidx].pid == pid) break;
-                    }
-                    if (fidx >= g_memp_nrusage_fail_seen) {
-                        if (g_memp_nrusage_fail_seen < MEMP_MAX_RUSAGE_FAIL_SEEN) {
-                            fidx = g_memp_nrusage_fail_seen++;
-                        } else {
-                            fidx = 0;
-                        }
-                    }
-                    g_memp_rusage_fail_seen[fidx].pid = pid;
-                    g_memp_rusage_fail_seen[fidx].last_fail_sec = now_ts.tv_sec;
-                    char eb[128];
-                    memp_fmt_errno(rerr, eb, sizeof(eb));
-                    JPLOG(JP_ERR, "MEMP rusage_fail pid=%d errno=%s", (int)pid, eb);
-                }
-            }
-            continue;
-        }
-
-        uint64_t thr_bytes = (uint64_t)rule->thr_mb * 1024ULL * 1024ULL;
-        if (fp_bytes <= thr_bytes) continue;
-
-        /* 初次认作目标日志（§九 target） */
-        int seen_target = 0;
-        for (int s = 0; s < g_memp_nseen_targets; s++) {
-            if (g_memp_seen_targets[s] == pid) {
-                seen_target = 1;
-                break;
-            }
-        }
-        if (!seen_target) {
-            if (g_memp_nseen_targets < MEMP_MAX_SEEN_TARGETS) {
-                g_memp_seen_targets[g_memp_nseen_targets++] = pid;
-            } else {
-                g_memp_seen_targets[0] = pid;
-            }
-            JPLOG(JP_DEBUG, "MEMP target app=%s pid=%d rule=%s path=%s",
-                   rule->frag, (int)pid, rule->frag, path);
-        }
-
-        uint64_t sec = 0, usec = 0;
-        if (memp_get_process_start_time(pid, &sec, &usec) != 0) continue;
-
-        /* 条件 4：目标不在污染表里 */
-        if (memp_is_tainted(pid, sec, usec)) continue;
-
-        /* 条件 5：该规则有效冷却已过 */
-        int32_t eff_cd = rule->eff_cd > 0 ? rule->eff_cd : (rule->cooldown > 0 ? rule->cooldown : g_memp_cooldown);
-        if (rule->last_warn_sec > 0 && now_ts.tv_sec - rule->last_warn_sec < eff_cd) continue;
-
-        /* 同一轮有多个目标超过阈值时，取 footprint 最大的一个 */
-        if (target_pid == 0 || fp_bytes > target_fp_bytes) {
-            target_pid = pid;
-            target_sec = sec;
-            target_usec = usec;
-            target_fp_bytes = fp_bytes;
-            target_rule = rule;
-        }
-    }
-
-    if (target_pid == 0) return;
-
-    double fp_before_mb = (double)target_fp_bytes / (1024.0 * 1024.0);
-
-    /* 条件 6：读真实压力级别 */
-    int lvl = 0, lerr = 0;
-    int lrc = memp_read_level(&lvl, &lerr);
-    if (lrc != 0) {
-        if (lerr == ENOENT || lerr == EPERM) {
-            memp_enter_unsupported("level", lerr);
-        } else {
-            memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                          "level_unread", 0, 0, 0, "-", 0, 0, 0, 0);
-        }
-        return;
-    }
-    if (lvl != 1) {
-        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      "real_pressure", 0, 0, 0, "-", 0, 0, 0, 0);
-        return;
-    }
-
-    /* 条件 7 & §五-2 步骤 2：让位（§三-3 / 勘误 3） */
-    memp_yielded_entry_t yield_candidates[MEMP_MAX_YIELD + 1];
-    int k = 0;
-    pid_t self_pid = getpid();
-    for (int i = 0; i < count; i++) {
-        pid_t pid = list[i].pid;
-        int32_t cur = list[i].priority;
-        if (pid <= 0 || pid == target_pid || cur != 90) continue;
-
-        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
-        int have_path = (proc_pidpath(pid, path, sizeof(path)) > 0);
-
-        /* 判定是否为 A 类（受保护且目标档位为 90 的用户 App） */
-        int is_a = 0;
-        if (have_path && strstr(path, "/var/containers/Bundle/Application/")) {
-            const char *app_bid = app_bid_for_path(path);
-            int32_t prot_target = 0;
-            const char *frag = NULL;
-            if (path_matches(path, app_bid, g_protect, g_nprotect, &prot_target, &frag)) {
-                if (prot_target == 90) {
-                    is_a = 1;
-                }
-            }
-        }
-
-        int is_sys = 0;
-        if (is_a) {
-            is_sys = 0;
-        } else if (pid != self_pid) {
-            /* B 类：非 T、非 A 类、非 daemon 自己的其他所有 90 档进程 */
-            is_sys = 1;
-        } else {
-            /* daemon 自身排除在 B 类之外 */
-            continue;
-        }
-
-        if (k < MEMP_MAX_YIELD) {
-            yield_candidates[k].pid = pid;
-            yield_candidates[k].is_sys = is_sys;
-            yield_candidates[k].tvsec = 0;
-            yield_candidates[k].tvusec = 0;
-            k++;
-        } else {
-            k++; /* 溢出标记 */
-        }
-    }
-
-    if (k > MEMP_MAX_YIELD) {
-        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      "yield_full", 0, 0, 0, "-", 0, 0, 0, 0);
-        return;
-    }
-
-    /* 逐个读启动时间 */
-    for (int i = 0; i < k; i++) {
-        if (memp_get_process_start_time(yield_candidates[i].pid,
-                                        &yield_candidates[i].tvsec,
-                                        &yield_candidates[i].tvusec) != 0) {
-            memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                          "yield_nostart", 0, 0, 0, "-", 0, 0, 0, 0);
-            return;
-        }
-    }
-
-    /* 逐个设为 80 */
-    memp_yielded_entry_t yielded[MEMP_MAX_YIELD];
-    int nyielded = 0;
-    int yield_failed = 0;
-    int yield_fail_err = 0;
-    for (int i = 0; i < k; i++) {
-        int err = mp_set_band(yield_candidates[i].pid, 80);
-        if (err == 0) {
-            yielded[nyielded++] = yield_candidates[i];
-        } else {
-            yield_failed = 1;
-            yield_fail_err = err;
-            if (yield_candidates[i].is_sys) {
-                char pname[32];
-                memp_get_proc_name(yield_candidates[i].pid, pname, sizeof(pname));
-                char eb[128];
-                memp_fmt_errno(err, eb, sizeof(eb));
-                JPLOG(JP_ERR, "MEMP yield_sys_fail pid=%d name=%s step=down errno=%s",
-                       (int)yield_candidates[i].pid, pname, eb);
-            }
-            break;
-        }
-    }
-
-    if (yield_failed) {
-        int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
-        memp_restore_yielded(yielded, nyielded, list, count, &r_ok, &r_moved, &r_gone, &r_rfail);
-        int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
-        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      "yield_fail", nyielded, nyielded_sys, yield_fail_err, "-", r_ok, r_moved, r_gone, r_rfail);
-        return;
-    }
-
-    /* 条件 7 & §五-2 步骤 3：门控（§三-4） */
-    struct timespec gate_start;
-    clock_gettime(CLOCK_MONOTONIC, &gate_start);
-    int gate_count = 0;
-    memorystatus_priority_entry_t *gate_list = get_list(&gate_count);
-
-    const char *gate_reason = NULL;
-    int fg_others = 0;
-    if (!gate_list) {
-        gate_reason = "comp_unread";
-    } else {
-        int t_found_in_100 = 0;
-        for (int i = 0; i < gate_count; i++) {
-            if (gate_list[i].pid == target_pid) {
-                if (gate_list[i].priority == 100) t_found_in_100 = 1;
-                break;
-            }
-        }
-        if (!t_found_in_100) {
-            gate_reason = "fg_lost";
-        } else {
-            for (int i = 0; i < gate_count; i++) {
-                pid_t cpid = gate_list[i].pid;
-                int32_t cband = gate_list[i].priority;
-                if (cpid <= 0 || cpid == target_pid) continue;
-
-                if (cband == 90) {
-                    gate_reason = "comp90";
-                    break;
-                }
-                if (cband == 100) {
-                    fg_others++;
-                    uint64_t cfp = 0;
-                    if (memp_get_phys_footprint(cpid, &cfp) != 0) {
-                        gate_reason = "comp_unread";
-                        break;
-                    }
-                    if (cfp >= target_fp_bytes) {
-                        gate_reason = "comp100";
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (gate_reason != NULL) {
-        int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
-        memp_restore_yielded(yielded, nyielded, gate_list, gate_count, &r_ok, &r_moved, &r_gone, &r_rfail);
-        char comp_buf[256] = "-";
-        if (gate_list) memp_format_comp(gate_list, gate_count, target_pid, comp_buf, sizeof(comp_buf));
-        int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
-        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      gate_reason, nyielded, nyielded_sys, 0, comp_buf, r_ok, r_moved, r_gone, r_rfail);
-        if (gate_list) free(gate_list);
-        return;
-    }
-
-    /* 门控通过！执行触发序列 (§五-2 步骤 4–14) */
-    /* 步骤 4：写崩溃标记 */
-    char marker_line[512];
-    snprintf(marker_line, sizeof(marker_line), "%d %llu %llu %s\n",
-             (int)target_pid, (unsigned long long)target_sec, (unsigned long long)target_usec, target_rule->frag);
-    FILE *mf = fopen(MEMP_PENDING_PATH, "w");
-    int marker_err = 0;
-    if (!mf) {
-        marker_err = errno != 0 ? errno : -1;
-    } else {
-        fputs(marker_line, mf);
-        fflush(mf);
-        if (ferror(mf) || fsync(fileno(mf)) != 0) marker_err = errno != 0 ? errno : -1;
-        fclose(mf);
-    }
-
-    if (marker_err != 0) {
-        unlink(MEMP_PENDING_PATH);
-        int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
-        memp_restore_yielded(yielded, nyielded, gate_list, gate_count, &r_ok, &r_moved, &r_gone, &r_rfail);
-        char comp_buf[256] = "-";
-        if (gate_list) memp_format_comp(gate_list, gate_count, target_pid, comp_buf, sizeof(comp_buf));
-        int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
-        memp_log_skip(target_rule, target_pid, fp_before_mb, target_rule->thr_mb,
-                      "marker_fail", nyielded, nyielded_sys, marker_err, comp_buf, r_ok, r_moved, r_gone, r_rfail);
-        if (gate_list) free(gate_list);
-        return;
-    }
-
-    /* 步骤 5：写 WARN */
-    int wv = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_WARN;
-    int warn_rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &wv, sizeof(int));
-    int warn_err = (warn_rc != 0) ? errno : 0;
-    struct timespec warn_mono;
-    clock_gettime(CLOCK_MONOTONIC, &warn_mono);
-
-    /* 步骤 6：立即复核快照，得到 recheck */
-    int recheck_count = 0;
-    memorystatus_priority_entry_t *recheck_list = get_list(&recheck_count);
-    long gate_ms = (warn_mono.tv_sec - gate_start.tv_sec) * 1000 +
-                   (warn_mono.tv_nsec - gate_start.tv_nsec) / 1000000;
-    if (gate_ms < 0) gate_ms = 0;
-
-    int recheck_same = 1;
-    if (!recheck_list || !gate_list) {
-        recheck_same = 0;
-    } else {
-        /* 比对 90/100 pid 集合 */
-        int g90_100[128], ng = 0;
-        int r90_100[128], nr = 0;
-        for (int i = 0; i < gate_count && ng < 128; i++) {
-            if (gate_list[i].priority == 90 || gate_list[i].priority == 100) {
-                g90_100[ng++] = gate_list[i].pid;
-            }
-        }
-        for (int i = 0; i < recheck_count && nr < 128; i++) {
-            if (recheck_list[i].priority == 90 || recheck_list[i].priority == 100) {
-                r90_100[nr++] = recheck_list[i].pid;
-            }
-        }
-        if (ng != nr) {
-            recheck_same = 0;
-        } else {
-            for (int i = 0; i < ng; i++) {
-                int found = 0;
-                for (int j = 0; j < nr; j++) {
-                    if (g90_100[i] == r90_100[j]) { found = 1; break; }
-                }
-                if (!found) { recheck_same = 0; break; }
-            }
-        }
-    }
-    const char *recheck_str = recheck_same ? "same" : "changed";
-
-    int nyielded_sys = memp_count_yielded_sys(yielded, nyielded);
-    char web[128];
-    memp_fmt_errno(warn_err, web, sizeof(web));
-    JPLOG(JP_WARN, "MEMP warn app=%s pid=%d fp_before=%.1f thr=%d yielded=%d yielded_sys=%d fg_others=%d gate_ms=%ld ret=%d errno=%s recheck=%s",
-           target_rule->frag, (int)target_pid, fp_before_mb, target_rule->thr_mb,
-           nyielded, nyielded_sys, fg_others, gate_ms, warn_rc, web, recheck_str);
-
-    if (gate_list) free(gate_list);
-    if (recheck_list) free(recheck_list);
-
-    /* 步骤 7：等待 5 秒 */
-    int early_stop = 0;
-    for (int s = 0; s < 5; s++) {
-        sleep(1);
-        if (should_stop()) {
-            early_stop = 1;
-            break;
-        }
-    }
-
-    /* 步骤 8：读 fp_after5 */
-    char fp_after5_buf[64] = "gone";
-    uint64_t cur_tsec = 0, cur_tusec = 0;
-    if (memp_get_process_start_time(target_pid, &cur_tsec, &cur_tusec) == 0 &&
-        cur_tsec == target_sec && cur_tusec == target_usec) {
-        uint64_t afp = 0;
-        int rerr = memp_get_phys_footprint(target_pid, &afp);
-        if (rerr == 0) {
-            snprintf(fp_after5_buf, sizeof(fp_after5_buf), "%.1f", (double)afp / (1024.0 * 1024.0));
-        } else {
-            snprintf(fp_after5_buf, sizeof(fp_after5_buf), "NA:%d", rerr);
-        }
-    }
-
-    /* 步骤 9：取档位表得到 band_now，紧接着写 NORMAL */
-    int step9_count = 0;
-    memorystatus_priority_entry_t *step9_list = get_list(&step9_count);
-    int band_now = -1;
-    int found_in_step9 = 0;
-    if (step9_list) {
-        for (int i = 0; i < step9_count; i++) {
-            if (step9_list[i].pid == target_pid) {
-                band_now = step9_list[i].priority;
-                found_in_step9 = 1;
-                break;
-            }
-        }
-    }
-
-    char band_now_buf[32] = "gone";
-    if (found_in_step9) {
-        snprintf(band_now_buf, sizeof(band_now_buf), "%d", band_now);
-    }
-    int stuck = (found_in_step9 && band_now == 100) ? 0 : 1;
-
-    int nv = (TEST_LOW_MEMORY_TRIGGER_ONE << 16) | DISPATCH_MEMORYPRESSURE_NORMAL;
-    int normal_rc = sysctlbyname("kern.memorypressure_manual_trigger", NULL, NULL, &nv, sizeof(int));
-    int normal_err = (normal_rc != 0) ? errno : 0;
-
-    /* 步骤 10：还原让位 */
-    int r_ok = 0, r_moved = 0, r_gone = 0, r_rfail = 0;
-    memp_restore_yielded(yielded, nyielded, step9_list, step9_count, &r_ok, &r_moved, &r_gone, &r_rfail);
-
-    char neb[128];
-    memp_fmt_errno(normal_err, neb, sizeof(neb));
-    JPLOG(JP_INFO, "MEMP normal app=%s pid=%d fp_after5=%s band_now=%s stuck=%d early_stop=%d ret=%d errno=%s yielded=%d yielded_sys=%d restored=ok:%d,moved:%d,gone:%d,rfail:%d",
-           target_rule->frag, (int)target_pid, fp_after5_buf, band_now_buf, stuck, early_stop,
-           normal_rc, neb, nyielded, nyielded_sys, r_ok, r_moved, r_gone, r_rfail);
-
-    if (step9_list) free(step9_list);
-
-    /* 步骤 11：错误分类与污染记入 */
-    if (stuck == 1) {
-        memp_taint_add(target_pid, target_sec, target_usec, target_rule->frag, "stuck");
-    }
-    if (normal_rc == -1) {
-        memp_taint_add(target_pid, target_sec, target_usec, target_rule->frag, "normal_fail");
-    }
-    if (strcmp(recheck_str, "changed") == 0) {
-        memp_taint_add(target_pid, target_sec, target_usec, target_rule->frag, "recheck");
-    }
-
-    if (normal_rc == 0) {
-        if (unlink(MEMP_PENDING_PATH) != 0 && errno != ENOENT) {
-            g_memp_reset_pending = MEMP_RESET_PENDING_MARKER;
-            g_memp_marker_rm_fail_count = 1;
-            g_memp_last_marker_rm_fail_time = 0;
-            char meb[128];
-            memp_fmt_errno(errno, meb, sizeof(meb));
-            JPLOG(JP_ERR, "MEMP marker_rm_fail n=1 errno=%s", meb);
-        }
-        g_memp_fails = 0;
-    } else {
-        g_memp_last_errno = normal_err;
-        if (normal_err == EINVAL) {
-            memp_enter_fatal("einval");
-        } else if (warn_rc == 0 || warn_err == EINVAL) {
-            /* WARN 进了测试态 */
-            if (normal_err == ENOENT || normal_err == EPERM) {
-                memp_enter_fatal("unreachable");
-            } else {
-                memp_enter_reset_pending_normal(1, warn_mono);
-                char reb[128];
-                memp_fmt_errno(normal_err, reb, sizeof(reb));
-                JPLOG(JP_INFO, "MEMP reset_retry n=1 ret=%d errno=%s", normal_rc, reb);
-            }
-        } else {
-            /* WARN 没进测试态 */
-            unlink(MEMP_PENDING_PATH);
-            if (warn_err == ENOENT || warn_err == EPERM) {
-                memp_enter_unsupported("trigger", warn_err);
-            }
-        }
-
-        if (warn_rc != 0 || normal_rc != 0) {
-            g_memp_fails++;
-            if (g_memp_fails >= 3 && g_memp_state != MEMP_STATE_UNSUPPORTED && g_memp_state != MEMP_STATE_FATAL) {
-                g_memp_state = MEMP_STATE_DISABLED;
-                char deb[128];
-                memp_fmt_errno(g_memp_last_errno, deb, sizeof(deb));
-                JPLOG(JP_WARN, "MEMP disabled fails=3 last_errno=%s", deb);
-            }
-        }
-    }
-
-    /* 步骤 12：登记 post 观察槽（§八）——当前门控确保 target_pid 处于 100 档（见 2275 行） */
-    memp_post_register(target_rule->frag, target_pid, target_sec, target_usec, warn_mono.tv_sec, fp_before_mb, 100);
-
-    /* 步骤 13：记录冷却起点 */
-    target_rule->last_warn_sec = warn_mono.tv_sec;
 }
 
 /* ========================================================================= */
