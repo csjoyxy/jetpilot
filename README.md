@@ -1,12 +1,97 @@
 # JetPilot
 
+![Release](https://img.shields.io/github/v/release/csjoyxy/jetpilot)
+![Platform](https://img.shields.io/badge/Platform-iOS%2016.4.1%20(TrollStore)-lightgrey)
+
 原名 JetsamPilot，v0.6.0 起改名。从旧版升级请看下方《从 JetsamPilot 升级》。
 
-TrollStore 应用 + root 常驻进程：周期性把受保护 App 的 Jetsam 档位抬到目标值，让系统在内存紧张时先杀别的进程。默认规则把 Reynard 保在 90 档。
+**TrollStore 应用 + root 常驻进程：周期性把受保护 App 的 Jetsam 档位抬到目标值，让系统在内存紧张时先杀别的进程。默认规则把 Reynard 保在 90 档。**
 
-目标设备：iPhone 11 / iOS 16.4.1（档位数值自 iOS 16 起整体 ×10：后台 30，前台 100）。
+目标系统：iOS 16.4.1（档位数值自 iOS 16 起整体 ×10：后台 30，前台 100）。
 
-## 仓库结构
+---
+
+## 目录
+
+- 1. 工作原理
+- 2. 系统架构与数据流
+- 3. 安全边界
+- 4. 规则配置
+- 5. 超内存重启（v0.7.7）
+- 6. 仓库结构
+- 7. 开发者流程
+- 8. 安装与升级
+- 9. 发版门禁与真机验收
+- 10. 版本历史
+- 11. 已知限制
+
+---
+
+## 1. 工作原理
+
+iOS 用 Jetsam 按内存档位（band）决定内存紧张时先杀谁：档位越低越先被杀。前台 App 是 100 档，后台一般是 30 档。系统不会主动帮你保住某个后台 App——JetPilot 做的就是**每 5–10 秒把规则里的 App 档位重新抬回目标值**，让它在内存紧张时排在被杀队列的后面。
+
+核心语义只有三条：
+
+- **前台永远优先**：守护进程绝不碰前台 App 的档位，档位封顶 95，永不触及前台 100。
+- **后台按规则保**：`protect` 抬档位，`demote` 在 App 不在前台时降到 30（见第 4 节）。
+- **内存真告急时后台都可以杀**：JetPilot 不是"永不杀"，它只做框架、不写死每个 App 的优先级，档位由用户自己在 App 里排。
+
+## 2. 系统架构与数据流
+
+```
+App 界面 (main.m)
+   │  编辑规则、启动/停止守护进程、看状态
+   ▼
+/var/mobile/Library/JetPilot/config.txt ──► 守护进程 jetpilotd (root)
+                                            │  每 5–10 秒轮询
+                                            ├─► memorystatus_control：按规则重设档位
+                                            ├─► status.txt：当前档位 / 被杀统计（原子写入）
+                                            └─► 日志（5 档等级，写日志页）
+```
+
+- 规则保存后 5–10 秒内生效，不用重启守护进程。
+- 守护进程只读自己的配置文件和系统内存状态，**不联网、无遥测**。
+
+## 3. 安全边界
+
+- **只碰用户 App**：守护进程只操作 `/var/containers/Bundle/Application/` 下的用户 App，绝不动系统进程。
+- **档位封顶 95**：任何规则都不能把档位抬到 100，不会跟前台抢。
+- **重启有门槛**：超内存重启只在系统档位 ≤30 时触发，后台播放、通话中的 App 不会被杀（见第 5 节）。
+- **配置原子写入**：`status.txt` 原子写入，App 连续保存不会把规则阈值或冷却还原为旧值（v0.7.3 修复）。
+- **发版流程**：先审后推——改动先过评审、推 review 分支跑 CI、绿了再终审、真机验证通过才合 main 打 tag（见第 9 节）。
+
+## 4. 规则配置
+
+App 内「保存规则」写入 `/var/mobile/Library/JetPilot/config.txt`，常驻进程 5–10 秒内生效：
+
+```
+# protect <路径片段 或 bid:Bundle ID> <档位，最高 95>
+# demote  <路径片段>   （不在前台时降到 30）
+
+protect Reynard.app/ 90
+protect bid:<目标 App 的 Bundle ID> 90
+```
+
+Bundle ID 可在 Filza 里打开该 App 的 Info.plist，看 CFBundleIdentifier。
+
+其它配置（App 内两页独立配置）：
+
+- **进程优先级**：保护 / 降级规则，降级目标档位可选 0–30。
+- **内存释放**：按规则冷却与底线退避。
+- **内存压力触发**（v0.7.0）：前台 App 内存压力触发，由 `mempressure.txt` 独立配置；另有只读内存限额诊断（前台 / 后台 / 后台 60 秒三读数）。
+
+## 5. 超内存重启（v0.7.7 新增第三个 Tab）
+
+App 在后台驻留超时且内存占用超过阈值时，自动终止并按设定拉起。
+
+- 默认阈值 800 MB、后台 10 分钟、每天最多 3 次、自动拉起默认开。
+- 只在系统档位 ≤30 时触发，后台播放、通话不会被杀。
+- 升级后请在 App 里停止并重新启动守护进程，否则新功能不生效。
+
+> 已知限制：重启只杀系统档位 ≤30 的 App；微信、支付宝稳态档位钉在 75，稳态下重启基本触发不了（见第 11 节）。
+
+## 6. 仓库结构
 
 ```
 src/
@@ -15,11 +100,13 @@ src/
   jetpilotd.c               # 常驻进程：每 5–10 秒按规则重设 jetsam 档位
   entitlements-app.plist    # App 权限（persona-mgmt 拉起 root 子进程）
   entitlements-daemon.plist # 守护进程权限（memorystatus / jetsam.modify-priority）
+scripts/
+  check-release.sh          # 发版门禁：静态检查脚本，提交前必跑
 .github/workflows/
   build-jetpilot.yml        # Actions：macos-latest 编译 → 打包 .tipa → 上传产物
 ```
 
-## 开发者流程
+## 7. 开发者流程
 
 1. 从 `origin/main` 开 `review/<版本>` 分支改代码，用推送脚本推到 GitHub；
 2. CI 出包，真机验证通过；
@@ -27,31 +114,38 @@ src/
 4. Actions 自动把 JetPilot.tipa 挂到 Release；
 5. 手机上从 Release 下载 .tipa，用 TrollStore 安装，打开点「启动」。
 
-## 规则配置
+## 8. 安装与升级
 
-App 内「保存规则」写入 `/var/mobile/Library/JetPilot/config.txt`，常驻进程 5–10 秒内生效：
+手机上从 Release 下载 .tipa，用 TrollStore 安装，打开点「启动」。
 
-```
-# protect <路径片段 或 bid:Bundle ID> <档位，最高 95>
-# demote  <路径片段>   （不在前台时降到 30）
-protect Reynard.app/ 90
-protect bid:<目标 App 的 Bundle ID> 90
-```
-
-Bundle ID 可在 Filza 里打开该 App 的 Info.plist，看 CFBundleIdentifier。
-
-守护进程只碰 `/var/containers/Bundle/Application/` 下的用户 App，绝不动系统进程；档位封顶 95，永不触及前台 100。
-
-## 从 JetsamPilot 升级
+### 从 JetsamPilot 升级
 
 1. 在 TrollStore 删除 JetsamPilot；
 2. 安装 JetPilot.tipa，打开后重新添加规则并启动。
 
 新版是新的 Bundle ID 和配置目录，不导入旧规则。
+
 删除旧 App 不会删掉 `/var/mobile/Library/JetsamPilot/`，留着不影响新版，想清理可用 Filza 删除。
 
-## 版本历史
+## 9. 发版门禁与真机验收
 
+每个版本发版前必须过三道关：
+
+1. **评审**：改动先过评审（方案 + 预审 diff），再推 review 分支；
+2. **CI**：`check-release.sh` 门禁 + Actions 编译出包，全绿；
+3. **真机验收**：在目标系统（iOS 16.4.1）上装机实测通过，才合 main 打 tag。
+
+v0.7.7 真机验收通过后发版（main `cf0bde8`，tag `v0.7.7`）。
+
+## 10. 版本历史
+
+- **v0.8.0**（2026-11-20）：删除 E 规则；新增后台定时清理（按后台时长自动结束）；后台释放支持限额被改写后重设一次。
+- **v0.7.9**（2026-11-19）：重启阈值下限降到 50MB、释放目标下限降到 100MB；释放最小间隔可设 0 分钟；目标值校验放宽。
+- **v0.7.8**（2026-11-19）：新增后台释放（pulse）：App 切后台后把内存压到目标值以下；E 方案停用。
+- **v0.7.7**（2026-11-12）：新增第三个 Tab「超内存重启」：后台驻留超时且内存超阈值时自动终止并拉起（默认 800 MB / 10 分钟 / 每天最多 3 次，自动拉起默认开）；只在系统档位 ≤30 时触发。
+- **v0.7.6**（2026-11-12）：日志等级 5 档放日志页；当前档位可点进看全部进程；被杀统计挪到主页底部。
+- **v0.7.5**（2026-11-12）：日志等级可选；RAISE 日志去重；原档位快照；阈值提示；降级卡片显示运行状态。
+- **v0.7.4**（2026-11-12）：降级规则目标档位可选（0–30 档）；App 列表加规则时可选保护或降级；导出日志打包成 zip；内存压力底线取最低值。
 - **v0.7.3**（2026-11-07）：修复连续保存时规则阈值或冷却被还原为旧值的问题。
 - **v0.7.2**（2026-11-06）：App 支持进程优先级与内存释放两页独立配置；内存释放支持按规则冷却与底线退避。
 - **v0.7.1**（2026-11-06）：只读记录目标应用内存限额诊断。
@@ -69,7 +163,8 @@ Bundle ID 可在 Filza 里打开该 App 的 Info.plist，看 CFBundleIdentifier�
 - **v0.2.0**（2026-11-03）：UI 重做；新增 App 图标。
 - **v0.1.0**（2026-11-03）：首版。
 
-## 已知未做
+## 11. 已知限制
 
 - 锁屏省电逻辑（state=1=锁屏）按社区常用语义实现，未在真机逐行核实；若行为反了，看 README 版本历史回退。
 - 守护进程部分权限需求按 XNU 一般规则推断，未在 16.4.1 上逐行核实；若 `memorystatus_control` 报 EPERM，看守护进程 stderr 排查。
+- 重启只杀系统档位 ≤30 的 App；微信、支付宝稳态档位钉在 75，稳态下重启基本触发不了。
