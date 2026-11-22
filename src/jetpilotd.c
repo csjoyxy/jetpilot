@@ -244,6 +244,56 @@ static const char *loglevel_to_str(int lvl) {
     }
 }
 
+/* --------------------------------------------------------------------------
+ * P0-1: root 写路径统一防符号链接（对齐 pulse.state 参考实现并加强）
+ *
+ * 所有以 root 身份落盘的文件都必须经由此助手打开。四道防线：
+ *   1) CONFIG_DIR 用 lstat 校验：必须是目录，且本身不能是符号链接；
+ *   2) open 带 O_NOFOLLOW|O_CLOEXEC：目标为符号链接时内核直接返回 ELOOP，绝不跟随；
+ *   3) open 前 lstat + open 后 fstat 双重校验：属主必须是 root、且不能有组/其他写位；
+ *      前置校验在 O_TRUNC 生效之前完成，避免"校验失败却已截断文件"；
+ *   4) 任何异常一律返回 NULL（拒绝写入），调用方不得回退到 fopen/unlink 重建等不安全写法。
+ * append=1 用 O_APPEND（日志）；append=0 用 O_TRUNC（原子替换的状态文件临时文件）。
+ * -------------------------------------------------------------------------- */
+static FILE *jp_secure_fopen(const char *path, mode_t mode, int append) {
+    struct stat dir_st;
+    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
+        return NULL;
+    }
+
+    /* 打开前校验：符号链接/非普通文件/非 root 属主/组或他人可写，一律拒绝。
+     * 必须在 O_TRUNC 生效前完成，避免校验失败时目标已被截断。 */
+    struct stat pre;
+    if (lstat(path, &pre) == 0) {
+        if (S_ISLNK(pre.st_mode) || !S_ISREG(pre.st_mode) ||
+            pre.st_uid != 0 || (pre.st_mode & 0022) != 0) {
+            return NULL;
+        }
+    } else if (errno != ENOENT) {
+        return NULL;
+    }
+
+    int flags = O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC | (append ? O_APPEND : O_TRUNC);
+    int fd = open(path, flags, mode);
+    if (fd < 0) return NULL;
+
+    /* 打开后再基于 fd 校验一次（防止 lstat→open 之间被替换），并强制回写预期权限。 */
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & 0022) != 0 ||
+        fchmod(fd, mode) != 0) {
+        close(fd);
+        return NULL;
+    }
+
+    FILE *f = fdopen(fd, append ? "a" : "w");
+    if (!f) {
+        close(fd);
+        return NULL;
+    }
+    return f;
+}
+
 static void jp_log_write(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #define JPLOG(lvl, fmt, ...) do { \
     if (g_loglevel != JP_LOG_OFF && (lvl) <= g_loglevel) { \
@@ -256,18 +306,23 @@ static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void jp_log_write(const char *fmt, ...) {
     pthread_mutex_lock(&s_log_mutex);
     struct stat st;
-    int existed = (stat(LOG_PATH, &st) == 0);
+    /* lstat：不跟随符号链接；仅当确认为普通文件且超限才轮转。
+     * LOG_PATH 若是符号链接则不轮转，后续 jp_secure_fopen 会 ELOOP 拒绝写入。 */
+    int existed = (lstat(LOG_PATH, &st) == 0 && S_ISREG(st.st_mode));
     if (existed && st.st_size > LOG_MAX_BYTES) {
-        rename(LOG_PATH, LOG_OLD_PATH);          /* 覆盖旧的 .1 */
-        existed = 0;
+        /* .1 若为符号链接，先摘掉链接本身（unlink 不跟随），再轮转，避免把链接当目标 */
+        struct stat old_st;
+        if (lstat(LOG_OLD_PATH, &old_st) == 0 && S_ISLNK(old_st.st_mode)) {
+            unlink(LOG_OLD_PATH);
+        }
+        rename(LOG_PATH, LOG_OLD_PATH);          /* 覆盖旧的 .1；rename 不跟随末段符号链接 */
     }
-    FILE *f = fopen(LOG_PATH, "a");
+    /* P0-1：日志写入统一走安全打开（O_NOFOLLOW + root 属主/权限校验）。
+     * 拒绝写入时直接返回，不回退到 fopen。0644 保留原日志可读性语义。 */
+    FILE *f = jp_secure_fopen(LOG_PATH, 0644, 1);
     if (!f) {
         pthread_mutex_unlock(&s_log_mutex);
         return;
-    }
-    if (!existed) {
-        fchmod(fileno(f), 0644);
     }
     time_t t = time(NULL);
     struct tm tm_val;
@@ -1056,7 +1111,8 @@ static void write_status(int protected_now, int demoted_pids,
     /* 3. 写盘：先写临时文件再 rename，原子替换：App 永远读不到写一半的 status.txt */
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "%s.tmp", STATUS_PATH);
-    FILE *f = fopen(tmp, "w");
+    /* P0-1：临时文件走安全打开，symlink/属主/权限异常一律拒绝，不回退 fopen */
+    FILE *f = jp_secure_fopen(tmp, 0600, 0);
     if (!f) { free(body); return; }
     time_t t = time(NULL);
     struct tm tm_val;
@@ -1486,7 +1542,8 @@ static void mempressure_write_state(void) {
 
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_STATE_PATH);
-    FILE *f = fopen(tmp, "w");
+    /* P0-1：临时文件走安全打开，symlink/属主/权限异常一律拒绝，不回退 fopen */
+    FILE *f = jp_secure_fopen(tmp, 0600, 0);
     if (!f) return;
     fputs(line, f);
     fflush(f);
@@ -2580,21 +2637,10 @@ static int pulse_set_memlimit_props(pid_t pid, const memorystatus_memlimit_prope
 static int pulse_save_state_file(const pulse_saved_state_t *st) {
     if (!st || st->pid <= 0) return -1;
 
-    struct stat dir_st;
-    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
-        return -1;
-    }
-
-    int fd = open(PULSE_STATE_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-    if (fd < 0) return -1;
-    fchmod(fd, 0600);
-
-    FILE *f = fdopen(fd, "w");
-    if (!f) {
-        close(fd);
-        unlink(PULSE_STATE_TMP_PATH);
-        return -1;
-    }
+    /* P0-1 参考实现：统一走 jp_secure_fopen，除原 O_NOFOLLOW 外再加强
+     * open 前 lstat + open 后 fstat 的 root 属主/权限校验，异常一律拒绝写入。 */
+    FILE *f = jp_secure_fopen(PULSE_STATE_TMP_PATH, 0600, 0);
+    if (!f) return -1;
     fprintf(f, "pid=%d\n", st->pid);
     if (st->bid[0] != '\0') {
         fprintf(f, "bid=%s\n", st->bid);
@@ -4324,7 +4370,8 @@ static int restart_state_load(void) {
 }
 
 static void restart_state_save(void) {
-    FILE *f = fopen(RESTART_STATE_TMP_PATH, "w");
+    /* P0-1：临时文件走安全打开，symlink/属主/权限异常一律拒绝，不回退 fopen */
+    FILE *f = jp_secure_fopen(RESTART_STATE_TMP_PATH, 0600, 0);
     if (!f) return;
 
     fprintf(f, "v1\n");
@@ -5593,6 +5640,14 @@ int main(int argc, char *argv[]) {
         JPLOG(JP_WARN, "LOCK_FAIL errno=%d", errno);
         return 1;
     }
+    /* P0-1：与写路径统一——O_NOFOLLOW 之外再用 fstat 校验 root 属主/非组其他可写 */
+    struct stat lock_st;
+    if (fstat(lock_fd, &lock_st) != 0 || !S_ISREG(lock_st.st_mode) ||
+        lock_st.st_uid != 0 || (lock_st.st_mode & 0022) != 0) {
+        close(lock_fd);
+        JPLOG(JP_WARN, "LOCK_FAIL reason=stat");
+        return 1;
+    }
     fchmod(lock_fd, 0600);
     if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK || errno == EAGAIN) {
@@ -5609,7 +5664,8 @@ int main(int argc, char *argv[]) {
     }
     (void)lock_fd; /* 锁在进程退出（含 SIGKILL）时由内核自动释放，生命周期内保持打开，不删除 lock 文件 */
 
-    FILE *pf = fopen(PID_PATH, "w");
+    /* P0-1：pid 文件走安全打开，symlink/属主/权限异常一律拒绝，不回退 fopen */
+    FILE *pf = jp_secure_fopen(PID_PATH, 0600, 0);
     if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
 
     setsid();  /* 脱离拉起它的 App 会话 */
@@ -5658,7 +5714,8 @@ int main(int argc, char *argv[]) {
 
         FILE *bf = NULL;
         if (handle_bands_req) {
-            bf = fopen(BANDS_TMP_PATH, "w");
+            /* P0-1：临时文件走安全打开，symlink/属主/权限异常一律拒绝，不回退 fopen */
+            bf = jp_secure_fopen(BANDS_TMP_PATH, 0600, 0);
             if (bf) {
                 time_t bt = time(NULL);
                 struct tm btm;
