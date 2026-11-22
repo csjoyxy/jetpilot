@@ -1593,6 +1593,9 @@ typedef struct {
 static bgkill_rule_t g_bgkill_rules[BGKILL_MAX_RULES];
 static int g_nbgkill_rules = 0;
 static int g_bgkill_master = 1;
+/* T3-IMP 3.2: bgkill 自然档安全门槛开关（bgkill.txt 的 bandgate=0 可关闭，
+ * 无需重编包即回滚新门禁；默认 1 = 开启，与 restart 的 <= BAND_BACKGROUND 契约一致） */
+static int g_bgkill_bandgate = 1;
 static int g_bgkill_first_load = 1;
 static int g_bgkill_cfg_file_absent = 1;
 static int g_bgkill_cfg_bad_count = 0;
@@ -5480,6 +5483,7 @@ static void bgkill_write_status(FILE *m) {
     if (!m) return;
     fprintf(m, "bgkill_support=1\n");
     fprintf(m, "bgkill_master=%s\n", g_bgkill_master ? "on" : "off");
+    fprintf(m, "bgkill_bandgate=%s\n", g_bgkill_bandgate ? "on" : "off");
     fprintf(m, "bgkill_cfg_bad=%d\n", g_bgkill_cfg_bad_count);
     for (int i = 0; i < g_nbgkill_rules; i++) {
         bgkill_rule_t *rule = &g_bgkill_rules[i];
@@ -5506,6 +5510,7 @@ static int bgkill_load_config(void) {
         g_bgkill_cfg_file_absent = 1;
         g_nbgkill_rules = 0;
         g_bgkill_cfg_bad_count = 0;
+        g_bgkill_bandgate = 1;   /* 配置消失时回到安全的默认门禁 */
         return -1;
     }
 
@@ -5513,7 +5518,9 @@ static int bgkill_load_config(void) {
     int nparsed = 0;
     int bad_line_count = 0;
     int parsed_master = 1; /* default on */
+    int parsed_bandgate = 1;
     int global_count = 0;
+    int bandgate_count = 0;
 
     char line[512];
     int line_no = 0;
@@ -5571,6 +5578,21 @@ static int bgkill_load_config(void) {
                 continue;
             }
             parsed_master = (strcmp(tokens[1], "on") == 0) ? 1 : 0;
+            continue;
+        }
+
+        /* T3-IMP 3.2: 回滚开关 bandgate=0/1（单行，控制字，非规则行） */
+        if (ntokens >= 1 && strncmp(tokens[0], "bandgate=", 9) == 0) {
+            bandgate_count++;
+            const char *bv = tokens[0] + 9;
+            if (bandgate_count > 1 || ntokens != 1 ||
+                (strcmp(bv, "0") != 0 && strcmp(bv, "1") != 0)) {
+                bad_line_count++;
+                JPLOG(JP_ERR, "%-6s cfg_bad line=%d text=%s", "BGK", line_no, raw_text);
+                parsed_bandgate = 1;   /* 非法值按安全默认处理 */
+                continue;
+            }
+            parsed_bandgate = (strcmp(bv, "0") == 0) ? 0 : 1;
             continue;
         }
 
@@ -5679,18 +5701,17 @@ static int bgkill_load_config(void) {
 
     g_bgkill_cfg_bad_count = bad_line_count;
 
-    if (g_bgkill_first_load) {
-        g_bgkill_first_load = 0;
-        if (parsed_master != g_bgkill_master) {
-            g_bgkill_master = parsed_master;
-            JPLOG(JP_INFO, "%-6s master=%s", "BGK", g_bgkill_master ? "on" : "off");
-        }
-    } else {
-        if (parsed_master != g_bgkill_master) {
-            g_bgkill_master = parsed_master;
-            JPLOG(JP_INFO, "%-6s master=%s", "BGK", g_bgkill_master ? "on" : "off");
-        }
+    /* master 与 bandgate 都是单值控制字：配置变更即时生效，不必重启 */
+    if (parsed_master != g_bgkill_master) {
+        g_bgkill_master = parsed_master;
+        JPLOG(JP_INFO, "%-6s master=%s", "BGK", g_bgkill_master ? "on" : "off");
     }
+    if (parsed_bandgate != g_bgkill_bandgate) {
+        g_bgkill_bandgate = parsed_bandgate;
+        JPLOG(JP_INFO, "%-6s bandgate=%s", "BGK",
+              g_bgkill_bandgate ? "on" : "off");
+    }
+    g_bgkill_first_load = 0;
 
     int changed = 0;
     if (file_absent != g_bgkill_cfg_file_absent) {
@@ -5898,7 +5919,7 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
             continue;
         }
 
-        /* 触发条件 6: 现读一次档位（前台快筛；≤ BAND_BACKGROUND 的真门槛在 3.2 加入） */
+        /* 触发条件 6: 现读一次档位（前台快筛） */
         int32_t cur_band = -1;
         if (bgkill_read_current_band(main_pid, &cur_band) != 0 ||
             cur_band >= BAND_PROTECT_DEFAULT) {
@@ -5907,6 +5928,23 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
             st->bg_rounds = 0;
             bgkill_log_skip(rule, st, "recheck", now_mono);
             continue;
+        }
+
+        /* 触发条件 7 (T3-IMP 3.2): 系统自然档位安全门槛，与 restart 共用回退链。
+         * 自然档 > BAND_BACKGROUND（如微信/支付宝稳态 75、后台播放、通话）不杀。
+         * bandgate=0 时整段短路，行为回到 v0.8.1（无需重编包）。 */
+        int32_t sys_band = cur_band;
+        if (g_bgkill_bandgate) {
+            sys_band = jp_natural_band(main_pid, cur_band);
+            if (!jp_kill_allowed(sys_band)) {
+                st->in_bg = 0;
+                st->bg_start_mono = 0;
+                st->bg_rounds = 0;
+                bgkill_log_skip(rule, st, "band", now_mono);
+                JPLOG(JP_DEBUG, "%-6s skip=band bid=%s sys_band=%d cur_band=%d",
+                      "BGK", rule->bid, (int)sys_band, (int)cur_band);
+                continue;
+            }
         }
 
         /* 全部满足，执行 kill */
@@ -5924,9 +5962,9 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
         }
         int today_n = st->today_count;
 
-        JPLOG(JP_INFO, "%-6s kill pid=%d bid=%s bg_s=%d min=%d band=%d fp=%s n=%d rc=%d",
+        JPLOG(JP_INFO, "%-6s kill pid=%d bid=%s bg_s=%d min=%d band=%d sys_band=%d fp=%s n=%d rc=%d",
               "BGK", (int)main_pid, rule->bid, bg_sec_elapsed, (int)rule->min,
-              (int)cur_band, fp_str, today_n, kill_errno);
+              (int)cur_band, (int)sys_band, fp_str, today_n, kill_errno);
 
         st->in_bg = 0;
         st->bg_start_mono = 0;

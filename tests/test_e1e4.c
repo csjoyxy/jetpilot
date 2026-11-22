@@ -669,6 +669,10 @@ int main(void) {
     assert(jp_snapshot_fresh(t0, t0) && jp_snapshot_fresh(t0, t0 + JP_SNAPSHOT_TTL_SECS));
     assert(!jp_snapshot_fresh(t0, t0 + JP_SNAPSHOT_TTL_SECS + 1) &&
            !jp_snapshot_fresh(0, t0));
+    /* 3.2 门槛边界：自然后台 <= BAND_BACKGROUND 允许，31 及以上一律拒绝 */
+    assert(jp_kill_allowed(BAND_BACKGROUND));
+    assert(!jp_kill_allowed(BAND_BACKGROUND + 1));
+    assert(!jp_kill_allowed(BAND_PROTECT_DEFAULT));
     applied_set_ex(100, 90, 40);
     applied_t *ttl_a = applied_find(100);
     assert(ttl_a->orig_seen_mono > 0 && ttl_a->band_seen_mono > 0 &&
