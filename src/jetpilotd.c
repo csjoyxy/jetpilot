@@ -248,6 +248,51 @@ static const char *loglevel_to_str(int lvl) {
     }
 }
 
+/* --------------------------------------------------------------------------
+ * INT1: root 写路径安全加固（移植 T1 d75def5，保留远端 M1 原子提交）
+ *
+ * 所有以 root 落盘的文件在 open 前/后都经过下列两道校验，缺一不可：
+ *   1) jp_secure_precheck: CONFIG_DIR lstat 必须是真实目录且非符号链接；目标
+ *      若存在，必须是普通文件、root 属主、且组/其他不可写 (& 0022)。ENOENT
+ *      允许（首次创建）；其余 lstat 错误一律拒绝。前置校验在 O_TRUNC 生效
+ *      之前完成，避免"校验失败却已截断文件"。
+ *   2) jp_secure_fd_check: open(O_NOFOLLOW) 后基于 fd 再校验一次（防
+ *      lstat→open 竞态替换），并 fchmod 回调用方给定的预期 mode。
+ * 任何异常一律拒绝写入，调用方不得回退 fopen/unlink 重建等不安全写法。
+ * -------------------------------------------------------------------------- */
+
+/* 打开前校验：0 = 允许写入，非 0 = 拒绝 */
+static int jp_secure_precheck(const char *path) {
+    struct stat dir_st;
+    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) ||
+        !S_ISDIR(dir_st.st_mode)) {
+        return -1;
+    }
+
+    struct stat pre;
+    if (lstat(path, &pre) == 0) {
+        if (S_ISLNK(pre.st_mode) || !S_ISREG(pre.st_mode) ||
+            pre.st_uid != 0 || (pre.st_mode & 0022) != 0) {
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+    return 0;
+}
+
+/* 打开后复核并强制回写预期权限：0 = 允许写入，非 0 = 拒绝 */
+static int jp_secure_fd_check(int fd, mode_t mode) {
+    struct stat st;
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & 0022) != 0 ||
+        fchmod(fd, mode) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static void jp_log_write(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 #define JPLOG(lvl, fmt, ...) do { \
     if (g_loglevel != JP_LOG_OFF && (lvl) <= g_loglevel) { \
@@ -259,19 +304,34 @@ static pthread_mutex_t s_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void jp_log_write(const char *fmt, ...) {
     pthread_mutex_lock(&s_log_mutex);
-    struct stat st;
-    int existed = (stat(LOG_PATH, &st) == 0);
-    if (existed && st.st_size > LOG_MAX_BYTES) {
-        rename(LOG_PATH, LOG_OLD_PATH);          /* 覆盖旧的 .1 */
-        existed = 0;
-    }
-    FILE *f = fopen(LOG_PATH, "a");
-    if (!f) {
+    /* INT1：日志路径先过安全前置校验——symlink/非普通文件/非 root 属主/
+     * 组或其他可写时直接拒绝写入（也不轮转），绝不回退 fopen。 */
+    if (jp_secure_precheck(LOG_PATH) != 0) {
         pthread_mutex_unlock(&s_log_mutex);
         return;
     }
-    if (!existed) {
-        fchmod(fileno(f), 0644);
+    struct stat st;
+    /* lstat：不跟随符号链接；仅当确认为普通文件且超限才轮转 */
+    if (lstat(LOG_PATH, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > LOG_MAX_BYTES) {
+        /* .1 若为符号链接，先摘掉链接本身（unlink 不跟随），再轮转，避免写穿链接目标 */
+        struct stat old_st;
+        if (lstat(LOG_OLD_PATH, &old_st) == 0 && S_ISLNK(old_st.st_mode)) {
+            unlink(LOG_OLD_PATH);
+        }
+        rename(LOG_PATH, LOG_OLD_PATH);          /* 覆盖旧的 .1；rename 不跟随末段符号链接 */
+    }
+    /* INT1：O_APPEND + O_NOFOLLOW 打开，fstat 复核并 fchmod 回 0644（保留远端权限位） */
+    FILE *f = NULL;
+    int log_fd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (log_fd >= 0) {
+        if (jp_secure_fd_check(log_fd, 0644) == 0) {
+            f = fdopen(log_fd, "a");
+        }
+        if (!f) close(log_fd);
+    }
+    if (!f) {
+        pthread_mutex_unlock(&s_log_mutex);
+        return;
     }
     time_t t = time(NULL);
     struct tm tm_val;
@@ -1120,8 +1180,12 @@ static void write_status(int protected_now, int demoted_pids,
      * fsync 数据 → rename → fsync 目录），App 永远读不到写一半的 status.txt */
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "%s.tmp", STATUS_PATH);
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    /* INT1：root 写路径安全加固——先 lstat 校验，再 O_NOFOLLOW 打开，最后 fstat
+     * 复核并 fchmod 回 0644；异常一律拒绝写入，不回退 fopen。 */
+    if (jp_secure_precheck(tmp) != 0) { free(body); return; }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (fd < 0) { free(body); return; }
+    if (jp_secure_fd_check(fd, 0644) != 0) { close(fd); unlink(tmp); free(body); return; }
     FILE *f = fdopen(fd, "w");
     if (!f) { close(fd); unlink(tmp); free(body); return; }
     time_t t = time(NULL);
@@ -1558,8 +1622,11 @@ static void mempressure_write_state(void) {
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_STATE_PATH);
     /* M1: O_NOFOLLOW + 统一原子提交（原 fopen("w") 缺 O_NOFOLLOW、rename 前缺 fsync） */
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    /* INT1：lstat/fstat 双重 root 属主+权限校验，异常拒绝写入，不回退 fopen；0644 保持原权限位 */
+    if (jp_secure_precheck(tmp) != 0) return;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (fd < 0) return;
+    if (jp_secure_fd_check(fd, 0644) != 0) { close(fd); unlink(tmp); return; }
     FILE *f = fdopen(fd, "w");
     if (!f) { close(fd); unlink(tmp); return; }
     fputs(line, f);
@@ -2860,14 +2927,18 @@ static int pulse_set_memlimit_props(pid_t pid, const memorystatus_memlimit_prope
 static int pulse_save_state_file(const pulse_saved_state_t *st) {
     if (!st || st->pid <= 0) return -1;
 
-    struct stat dir_st;
-    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
+    /* INT1：原 lstat(CONFIG_DIR) 检查并入 jp_secure_precheck——同时校验目标
+     * symlink/类型/root 属主/组或其他可写；异常一律拒绝写入，不回退 fopen。 */
+    if (jp_secure_precheck(PULSE_STATE_TMP_PATH) != 0) return -1;
+
+    /* M1 原子替换保持 O_NOFOLLOW；0600 保持远端原权限位 */
+    int fd = open(PULSE_STATE_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    if (jp_secure_fd_check(fd, 0600) != 0) {
+        close(fd);
+        unlink(PULSE_STATE_TMP_PATH);
         return -1;
     }
-
-    int fd = open(PULSE_STATE_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-    if (fd < 0) return -1;
-    fchmod(fd, 0600);
 
     FILE *f = fdopen(fd, "w");
     if (!f) {
@@ -4634,8 +4705,11 @@ static int restart_state_load(void) {
 
 static void restart_state_save(void) {
     /* M1: O_NOFOLLOW 打开 tmp（原 fopen("w") 缺 O_NOFOLLOW） */
-    int fd = open(RESTART_STATE_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    /* INT1：lstat 前置校验（symlink/类型/root 属主/组或其他可写），异常拒绝写入 */
+    if (jp_secure_precheck(RESTART_STATE_TMP_PATH) != 0) return;
+    int fd = open(RESTART_STATE_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
     if (fd < 0) return;
+    if (jp_secure_fd_check(fd, 0644) != 0) { close(fd); unlink(RESTART_STATE_TMP_PATH); return; }
     FILE *f = fdopen(fd, "w");
     if (!f) { close(fd); unlink(RESTART_STATE_TMP_PATH); return; }
 
@@ -5897,8 +5971,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     /* 单实例锁 (C1)：通过 flock 确保互斥，避免读写 pid 文件的竞态及 pid 复用误判 */
-    struct stat dir_st;
-    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
+    /* INT1：CONFIG_DIR + lock 路径 lstat 校验（symlink/类型/root 属主/组或其他可写） */
+    if (jp_secure_precheck(LOCK_PATH) != 0) {
         JPLOG(JP_WARN, "LOCK_FAIL reason=dir");
         return 1;
     }
@@ -5907,7 +5981,12 @@ int main(int argc, char *argv[]) {
         JPLOG(JP_WARN, "LOCK_FAIL errno=%d", errno);
         return 1;
     }
-    fchmod(lock_fd, 0600);
+    /* INT1：fstat 复核（防 lstat→open 竞态）并 fchmod 回 0600，异常直接拒绝启动 */
+    if (jp_secure_fd_check(lock_fd, 0600) != 0) {
+        close(lock_fd);
+        JPLOG(JP_WARN, "LOCK_FAIL reason=stat");
+        return 1;
+    }
     if (flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK || errno == EAGAIN) {
             int file_pid = -1;   /* 读不到就是 -1 */
@@ -5927,15 +6006,22 @@ int main(int argc, char *argv[]) {
      * 窗口）+ O_NOFOLLOW + fsync，App 存活探测不再读到半截 pid */
     char pid_tmp[512];
     snprintf(pid_tmp, sizeof(pid_tmp), "%s.tmp", PID_PATH);
-    int pid_fd = open(pid_tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
-    if (pid_fd >= 0) {
-        FILE *pf = fdopen(pid_fd, "w");
-        if (pf) {
-            fprintf(pf, "%d\n", getpid());
-            (void)jp_atomic_commit(pf, pid_tmp, PID_PATH);
-        } else {
-            close(pid_fd);
-            unlink(pid_tmp);
+    /* INT1：lstat 前置校验 + O_NOFOLLOW + fstat 复核（0644 保持远端权限位）；
+     * 异常拒绝写入、清掉 tmp，不回退 fopen。 */
+    if (jp_secure_precheck(pid_tmp) == 0) {
+        int pid_fd = open(pid_tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (pid_fd >= 0) {
+            FILE *pf = NULL;
+            if (jp_secure_fd_check(pid_fd, 0644) == 0) {
+                pf = fdopen(pid_fd, "w");
+            }
+            if (pf) {
+                fprintf(pf, "%d\n", getpid());
+                (void)jp_atomic_commit(pf, pid_tmp, PID_PATH);
+            } else {
+                close(pid_fd);
+                unlink(pid_tmp);
+            }
         }
     }
 
@@ -5992,12 +6078,16 @@ int main(int argc, char *argv[]) {
         if (handle_bands_req) {
             /* M1（Chief 裁定纳入）：open(O_NOFOLLOW)+fdopen 替换 fopen("w")，
              * 堵符号链接写穿；末尾统一走 jp_atomic_commit（fsync+rename+目录 fsync） */
-            int bfd = open(BANDS_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
-            if (bfd < 0) {
-                bf = NULL;
-            } else {
-                bf = fdopen(bfd, "w");
-                if (!bf) { close(bfd); unlink(BANDS_TMP_PATH); }
+            /* INT1：lstat 前置校验 + O_NOFOLLOW + fstat 复核 + fchmod 回 0644；
+             * 异常一律拒绝写入、清理 tmp，不回退 fopen。 */
+            if (jp_secure_precheck(BANDS_TMP_PATH) == 0) {
+                int bfd = open(BANDS_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+                if (bfd >= 0) {
+                    if (jp_secure_fd_check(bfd, 0644) == 0) {
+                        bf = fdopen(bfd, "w");
+                    }
+                    if (!bf) { close(bfd); unlink(BANDS_TMP_PATH); }
+                }
             }
             if (bf) {
                 time_t bt = time(NULL);
