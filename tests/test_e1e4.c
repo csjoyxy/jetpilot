@@ -53,6 +53,9 @@ _Static_assert(BAND_MAX_PROTECT < BAND_FOREGROUND &&
                BAND_PROTECT_DEFAULT == BAND_FOREGROUND - 10,
                "band constants drift: protect/candidate/foreground mismatch");
 
+/* T3-IMP 3.3: applied 快照新鲜度上限（= SLOW_MAX_SECS） */
+#define JP_SNAPSHOT_TTL_SECS 240
+
 typedef struct memorystatus_priority_entry {
     pid_t    pid;
     int32_t  priority;
@@ -133,6 +136,11 @@ typedef struct {
     int     orig_known;
     int32_t sys_band;
     int     sys_band_known;
+    /* ---- T3-IMP 3.3: 快照新鲜度（CLOCK_MONOTONIC 秒，纯内存/不落盘） ---- */
+    time_t  band_seen_mono;
+    time_t  orig_seen_mono;
+    time_t  sys_band_seen_mono;
+    int     claim_origin;
     /* ---- E1 新增：快轮身份缓存（慢轮填充/刷新，快轮只读不改） ----
      * 静态约 64 × 4.4KB ≈ 280KB BSS，守护进程可接受（设计 §2.2 二选一取静态） */
     int     has_identity;   /* 1 = 以下身份字段有效（慢轮建条目时填） */
@@ -154,6 +162,37 @@ static applied_t *applied_find(pid_t pid) {
     return NULL;
 }
 
+/* T3-IMP 3.3 快照新鲜度助手（与 src/jetpilotd.c 同段逐字节提取） */
+static time_t applied_mono_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+static int jp_snapshot_fresh(time_t seen_mono, time_t now_mono) {
+    return seen_mono > 0 && now_mono >= seen_mono &&
+           (now_mono - seen_mono) <= JP_SNAPSHOT_TTL_SECS;
+}
+static int jp_read_current_band(pid_t pid, int32_t *band_out) {
+    if (pid <= 0 || !band_out) return -1;
+    memorystatus_priority_properties_t props;
+    memset(&props, 0, sizeof(props));
+    if (memorystatus_control(MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES,
+                             pid, 0, &props, sizeof(props)) != 0) return -1;
+    *band_out = props.priority;
+    return 0;
+}
+static void applied_note_sys_band(applied_t *a, int32_t cur) {
+    if (!a) return;
+    a->sys_band = cur;
+    a->sys_band_known = 1;
+    a->sys_band_seen_mono = applied_mono_now();
+}
+static int jp_attribution_trusted(const applied_t *a, time_t now_mono) {
+    if (!a) return 0;
+    if (!a->has_identity && !a->claim_origin) return 0;
+    return jp_snapshot_fresh(a->band_seen_mono, now_mono);
+}
+
 /* T3-IMP 判定入口（与 src/jetpilotd.c 同段逐字节提取） */
 static int jp_is_foreground(int32_t band) {
     return band >= BAND_FOREGROUND;
@@ -165,9 +204,14 @@ static int jp_kill_allowed(int32_t natural_band) {
     return natural_band <= BAND_BACKGROUND;
 }
 static int32_t jp_natural_band(pid_t pid, int32_t cur_now) {
+    time_t now = applied_mono_now();
     applied_t *a = applied_find(pid);
-    if (a && a->sys_band_known) return a->sys_band;
-    if (a && a->orig_known) return a->orig;
+    if (a && a->sys_band_known && jp_snapshot_fresh(a->sys_band_seen_mono, now))
+        return a->sys_band;
+    if (a && a->orig_known && jp_snapshot_fresh(a->orig_seen_mono, now))
+        return a->orig;
+    int32_t live = cur_now;
+    if (jp_read_current_band(pid, &live) == 0) return live;
     return cur_now;
 }
 
@@ -177,35 +221,45 @@ static int32_t jp_natural_band(pid_t pid, int32_t cur_now) {
  */
 static void applied_set_ex(pid_t pid, int32_t band, int32_t cur_before) {
     applied_t *a = applied_find(pid);
+    time_t now = applied_mono_now();
     if (!a) {
-        if (g_napplied >= MAX_APPLIED) return;  /* 表满就不记，只是失去降档能力 */
+        if (g_napplied >= MAX_APPLIED) return;
         a = &g_applied[g_napplied++];
         a->pid = pid;
         a->orig = cur_before;
         a->orig_known = 1;
+        a->orig_seen_mono = now;
         a->sys_band = 0;
         a->sys_band_known = 0;
-        a->has_identity = 0;   /* E1: 身份缓存由慢轮调用点随后填充 */
-        g_applied_creates++;   /* E2: 空转判定（仅计数，不改既有语义） */
+        a->sys_band_seen_mono = now;
+        a->claim_origin = 0;
+        a->has_identity = 0;
+        g_applied_creates++;
     }
     a->band = band;
+    a->band_seen_mono = now;
     a->seen = 1;
 }
 
 static void applied_set(pid_t pid, int32_t band) {
     applied_t *a = applied_find(pid);
+    time_t now = applied_mono_now();
     if (!a) {
         if (g_napplied >= MAX_APPLIED) return;
         a = &g_applied[g_napplied++];
         a->pid = pid;
         a->orig = 0;
         a->orig_known = 0;
+        a->orig_seen_mono = now;
         a->sys_band = 0;
         a->sys_band_known = 0;
-        a->has_identity = 0;   /* E1: 同上 */
-        g_applied_creates++;   /* E2: 同上 */
+        a->sys_band_seen_mono = now;
+        a->claim_origin = 0;
+        a->has_identity = 0;
+        g_applied_creates++;
     }
     a->band = band;
+    a->band_seen_mono = now;
     a->seen = 1;
 }
 
@@ -244,7 +298,7 @@ static void applied_remove(pid_t pid) {
 #define BACKOFF_BASE_SECS 5
 #define BACKOFF_MAX_SECS  60
 #define SLOW_BASE_SECS    30
-#define SLOW_MAX_SECS     240
+#define SLOW_MAX_SECS     JP_SNAPSHOT_TTL_SECS
 
 /* E4: 快轮模式（三级兜底链）
  *   CMD3     命令 3 按 pid 定向查档位（正常路径，私有 API，不得硬依赖）
@@ -327,18 +381,18 @@ static void applied_fill_identity(applied_t *a, const char *path, const char *fr
  * 返回 1 表示发生了一次重断言（E2 空转判定用）。 */
 static int fast_reassert_one(applied_t *a, int32_t cur) {
     if (jp_is_foreground(cur)) {
-        if (cur != a->band) { a->sys_band = cur; a->sys_band_known = 1; }
+        if (cur != a->band) applied_note_sys_band(a, cur);
         return 0;
     }
     int do_reassert = (a->kind == 0) ? (cur < a->target) : (cur > a->target);
     if (!do_reassert) {
         /* 不重断言：仅记录系统档位漂移观察（与慢轮 prev->sys_band 语义一致） */
-        if (cur != a->band) { a->sys_band = cur; a->sys_band_known = 1; }
+        if (cur != a->band) applied_note_sys_band(a, cur);
         return 0;
     }
     if (set_priority(a->pid, a->target) == 0) {
         g_reassert_count++;
-        a->sys_band = cur; a->sys_band_known = 1;   /* P3-1: 动作前记漂移观察，与慢轮语义对齐 */
+        applied_note_sys_band(a, cur);
         applied_set_ex(a->pid, a->target, cur);  /* 已有条目只更新 band，身份缓存保留 */
         act_log_success((a->kind == 0) ? ACT_KIND_RAISE : ACT_KIND_DEMOTE,
                         a->pid, a->path, a->frag, cur, a->target);
@@ -608,6 +662,33 @@ int main(void) {
     assert(g_fast_mode == FAST_MODE_LISTSCAN && actions == 1);
     assert(mock_nset == 1 && mock_set_pid[0] == 100 && mock_set_band[0] == 90);
     printf("[G] P2 recovery OK (sleep/failed-legacy -> listscan, env-forced excluded, fast works again)\n");
+
+    /* ===== H. T3-IMP 3.3: 快照 TTL / 现读兜底 / 归属可信条件 ===== */
+    reset_all();
+    time_t t0 = applied_mono_now();
+    assert(jp_snapshot_fresh(t0, t0) && jp_snapshot_fresh(t0, t0 + JP_SNAPSHOT_TTL_SECS));
+    assert(!jp_snapshot_fresh(t0, t0 + JP_SNAPSHOT_TTL_SECS + 1) &&
+           !jp_snapshot_fresh(0, t0));
+    applied_set_ex(100, 90, 40);
+    applied_t *ttl_a = applied_find(100);
+    assert(ttl_a->orig_seen_mono > 0 && ttl_a->band_seen_mono > 0 &&
+           ttl_a->sys_band_seen_mono > 0);
+    ttl_a->sys_band = 75; ttl_a->sys_band_known = 1;
+    assert(jp_natural_band(100, 20) == 75);
+    assert(!jp_kill_allowed(jp_natural_band(100, 20)));   /* 自然档 75 > 后台上界 */
+    /* 快照全部过期 → 现读 cmd3 → 仍失败则回退手头 cur */
+    ttl_a->sys_band_seen_mono = 0; ttl_a->orig_seen_mono = 0;
+    mock_nprio = 1; mock_prio_pid[0] = 100; mock_prio_val[0] = 20;
+    assert(jp_natural_band(100, 30) == 20);
+    assert(jp_kill_allowed(jp_natural_band(100, 30)));
+    mock_nprio = 0;
+    assert(jp_natural_band(100, 30) == 30);
+    /* 归属：无身份且无 CLAIM 来源不可信；CLAIM 可信但过 TTL 后失效 */
+    assert(!jp_attribution_trusted(ttl_a, t0));
+    ttl_a->claim_origin = 1;
+    assert(jp_attribution_trusted(ttl_a, t0));
+    assert(!jp_attribution_trusted(ttl_a, t0 + JP_SNAPSHOT_TTL_SECS + 1));
+    printf("[H] snapshot TTL / live-read fallback / attribution trust OK\n");
 
     printf("ALL E1/E4 HARNESS TESTS OK\n");
     return 0;
