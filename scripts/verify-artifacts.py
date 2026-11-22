@@ -44,6 +44,10 @@ EXTRA_SEARCH_PATHS = [
 ]
 
 
+class CorruptTipaError(Exception):
+    """tipa 包损坏或不可读（zip 损坏 / 缺 Payload），携带路径与原因的清晰错误。"""
+
+
 def find_tool(name: str) -> str | None:
     path = shutil.which(name)
     if path:
@@ -367,15 +371,19 @@ def fetch_reference_tipa(ref_path: str | None, ref_url: str | None) -> str | Non
 
 
 def extract_app_dir(tipa_path: str, extract_dir: str) -> str:
-    with zipfile.ZipFile(tipa_path, "r") as z:
-        z.extractall(extract_dir)
+    try:
+        with zipfile.ZipFile(tipa_path, "r") as z:
+            z.extractall(extract_dir)
+    except (zipfile.BadZipFile, OSError) as e:
+        # BadZipFile 处理：损坏/截断的 zip 不再抛 traceback，转为清晰的失败信息
+        raise CorruptTipaError(f"cannot extract tipa (corrupt or unreadable zip?): {tipa_path}: {e}") from e
     app_dir = os.path.join(extract_dir, "Payload", "JetPilot.app")
     if not os.path.isdir(app_dir):
         cand = os.path.join(extract_dir, "JetPilot.app")
         if os.path.isdir(cand):
             app_dir = cand
         else:
-            raise FileNotFoundError(f"Payload/JetPilot.app not found inside {tipa_path}")
+            raise CorruptTipaError(f"Payload/JetPilot.app not found inside {tipa_path}")
     return app_dir
 
 
@@ -714,7 +722,16 @@ def verify_tipa_package(
     failures = []
     codesign_warnings = []
     try:
-        app_dir = extract_app_dir(tipa_path, temp_dir)
+        try:
+            app_dir = extract_app_dir(tipa_path, temp_dir)
+        except CorruptTipaError as e:
+            # BadZipFile / 缺 Payload：打印清晰的一行错误，按 UNVERIFIED 走既有
+            # 退出码约定（默认 exit 2；--allow-unverified 时 exit 0），无 traceback
+            print(f"[FAIL] {e}")
+            failures.append(str(e))
+            results["jetpilotd"] = {}
+            results["JetPilot"] = {}
+            return False, results, failures, codesign_warnings
         daemon_bin = os.path.join(app_dir, "jetpilotd")
         app_bin = os.path.join(app_dir, "JetPilot")
 

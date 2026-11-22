@@ -994,6 +994,50 @@ static const char *proc_label_log(const char *path) {
 
 /* status.txt 按需写：内容不变时最多每 STATUS_HEARTBEAT_SECS 秒写一次（心跳），省写盘 */
 #define STATUS_HEARTBEAT_SECS 60
+
+/* =========================================================================
+ * M1 原子写统一：状态文件统一提交助手
+ * ========================================================================= */
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+
+/* M1: 提交 tmp 内容到 final——fflush → ferror → fsync(数据) → fclose →
+ * rename → fsync(CONFIG_DIR 目录)。rename 前数据已落盘、rename 后目录项
+ * 已落盘，崩溃/掉电不会再出现「旧文件被空/截断文件替换」；任一步失败清
+ * 理 tmp 并返回 -1，旧版本目标文件保持完整。所有状态文件都在 CONFIG_DIR，
+ * 目录 fsync 只对该目录做一次。 */
+static int jp_atomic_commit(FILE *f, const char *tmp_path, const char *final_path) {
+    if (!f || !tmp_path || !final_path) {
+        if (f) fclose(f);
+        if (tmp_path) unlink(tmp_path);
+        return -1;
+    }
+    if (fflush(f) != 0 || ferror(f)) {
+        fclose(f);
+        unlink(tmp_path);
+        return -1;
+    }
+    if (fsync(fileno(f)) != 0) {
+        fclose(f);
+        unlink(tmp_path);
+        return -1;
+    }
+    fclose(f);
+    if (rename(tmp_path, final_path) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+    int dfd = open(CONFIG_DIR, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) {
+        (void)fsync(dfd);
+        close(dfd);
+    }
+    /* 目录 fsync 尽力而为：rename 已提交不可回滚，目录 fsync 失败不改变
+     * 返回值（数据 fsync + rename 已保证崩溃安全的目标文件内容） */
+    return 0;
+}
+
 static char  *g_last_body = NULL;   /* 上次成功写盘的内容（不含 updated= 行） */
 static size_t g_last_body_len = 0;
 static time_t g_last_write = 0;     /* 上次成功写盘的 CLOCK_MONOTONIC 秒 */
@@ -1053,21 +1097,23 @@ static void write_status(int protected_now, int demoted_pids,
                memcmp(body, g_last_body, blen) == 0;
     if (same && now.tv_sec - g_last_write < STATUS_HEARTBEAT_SECS) { free(body); return; }
 
-    /* 3. 写盘：先写临时文件再 rename，原子替换：App 永远读不到写一半的 status.txt */
+    /* 3. 写盘：O_NOFOLLOW 打开 tmp，走 jp_atomic_commit 统一原子替换（M1：
+     * fsync 数据 → rename → fsync 目录），App 永远读不到写一半的 status.txt */
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "%s.tmp", STATUS_PATH);
-    FILE *f = fopen(tmp, "w");
-    if (!f) { free(body); return; }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (fd < 0) { free(body); return; }
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp); free(body); return; }
     time_t t = time(NULL);
     struct tm tm_val;
     localtime_r(&t, &tm_val);
     char ts[64]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_val);
     fprintf(f, "updated=%s\n", ts);
     fwrite(body, 1, blen, f);
-    int werr = ferror(f);  /* 必须在 fclose 之前查 */
-    fclose(f);
-    if (werr) { unlink(tmp); free(body); return; }  /* 写坏了就不转正，保留旧 status.txt */
-    if (rename(tmp, STATUS_PATH) != 0) { unlink(tmp); free(body); return; }
+    /* ferror 检查、fsync、fclose、rename、目录 fsync 统一交给 jp_atomic_commit；
+     * 失败就不转正，保留旧 status.txt */
+    if (jp_atomic_commit(f, tmp, STATUS_PATH) != 0) { free(body); return; }
     /* 4. 成功才记账；失败下轮重试 */
     free(g_last_body);
     g_last_body = body; g_last_body_len = blen;
@@ -1157,6 +1203,13 @@ static restart_rule_t g_restart_rules[RESTART_MAX_RULES];
 static int g_nrestart_rules = 0;
 static int g_restart_cfg_file_absent = 1;
 static int g_restart_cfg_first_load = 1;
+
+/* H2 规则数组撕裂读：g_restart_rules / g_pulse_rules / g_bgkill_rules 的
+ * 配置加载 memcpy 与 worker 可达读点互斥。
+ * 锁序说明：s_rule_lock 与 s_pulse_mutex 从不嵌套持有——worker 拿 rd 锁的
+ * 代码段内不含 s_pulse_mutex，主线程 load_config 只持 wr 锁不碰 s_pulse_mutex。
+ * 新代码请保持两锁互不嵌套，勿在其中一把的临界区内再取另一把。 */
+static pthread_rwlock_t s_rule_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* =========================================================================
  * 超内存自动重启：状态持久化与状态机定义 (v0.7.7 C2)
@@ -1486,19 +1539,15 @@ static void mempressure_write_state(void) {
 
     char tmp[512];
     snprintf(tmp, sizeof(tmp), "%s.tmp", MEMP_STATE_PATH);
-    FILE *f = fopen(tmp, "w");
-    if (!f) return;
+    /* M1: O_NOFOLLOW + 统一原子提交（原 fopen("w") 缺 O_NOFOLLOW、rename 前缺 fsync） */
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp); return; }
     fputs(line, f);
-    fflush(f);
-    int werr = ferror(f);
-    fclose(f);
-    if (werr) { unlink(tmp); return; }
-    if (rename(tmp, MEMP_STATE_PATH) == 0) {
-        strncpy(s_last_line, line, sizeof(s_last_line) - 1);
-        s_last_line[sizeof(s_last_line) - 1] = '\0';
-    } else {
-        unlink(tmp);
-    }
+    if (jp_atomic_commit(f, tmp, MEMP_STATE_PATH) != 0) return;
+    strncpy(s_last_line, line, sizeof(s_last_line) - 1);
+    s_last_line[sizeof(s_last_line) - 1] = '\0';
 }
 
 static void memp_check_boot_reset(void) {
@@ -1889,8 +1938,11 @@ static int restart_load_config(void) {
                   (int)parsed_rules[i].bg_sec, (int)parsed_rules[i].max_count,
                   (int)parsed_rules[i].relaunch);
         }
+        /* H2: 整块替换规则数组必须在写锁内完成（worker 可能正在读） */
+        pthread_rwlock_wrlock(&s_rule_lock);
         memcpy(g_restart_rules, parsed_rules, sizeof(restart_rule_t) * nparsed);
         g_nrestart_rules = nparsed;
+        pthread_rwlock_unlock(&s_rule_lock);
         g_restart_cfg_file_absent = file_absent;
 
         /* 压实 g_rst_rule_states 槽位，删除规则后槽位复用且计数递减 (C1-M5 / N4) */
@@ -1963,14 +2015,21 @@ static int pulse_is_supported_app(pid_t pid, const char *path, const char *bid) 
     return 1;
 }
 
-static pulse_rule_t *pulse_find_rule(const char *bid) {
-    if (!bid || bid[0] == '\0') return NULL;
+/* H2: 按 bid 取 pulse 规则快照。worker 可达（pulse_worker_thread 内调用），
+ * 数组访问必须在读锁内完成并整体拷贝到 out，锁外只用快照，
+ * 杜绝与配置加载 memcpy 的撕裂读。找到返回 1，否则 0。 */
+static int pulse_find_rule(const char *bid, pulse_rule_t *out) {
+    if (!bid || bid[0] == '\0' || !out) return 0;
+    pthread_rwlock_rdlock(&s_rule_lock);
     for (int i = 0; i < g_npulse_rules; i++) {
         if (strcmp(g_pulse_rules[i].bid, bid) == 0) {
-            return &g_pulse_rules[i];
+            *out = g_pulse_rules[i];
+            pthread_rwlock_unlock(&s_rule_lock);
+            return 1;
         }
     }
-    return NULL;
+    pthread_rwlock_unlock(&s_rule_lock);
+    return 0;
 }
 
 static int pulse_load_config(void) {
@@ -2191,8 +2250,11 @@ static int pulse_load_config(void) {
                   (int)parsed_rules[i].target_mb, (int)parsed_rules[i].n_min,
                   (int)parsed_rules[i].daymax, (int)parsed_rules[i].delay_s);
         }
+        /* H2: 整块替换规则数组必须在写锁内完成（worker 可能正在读） */
+        pthread_rwlock_wrlock(&s_rule_lock);
         memcpy(g_pulse_rules, parsed_rules, sizeof(pulse_rule_t) * nparsed);
         g_npulse_rules = nparsed;
+        pthread_rwlock_unlock(&s_rule_lock);
         g_pulse_cfg_file_absent = file_absent;
     }
 
@@ -2320,6 +2382,9 @@ static int pulse_get_footprint_mb(pid_t pid, uint64_t *fp_mb_out) {
  *   out_fp: 读取到的当前物理内存占用 (MB)
  *   out_skip_ctrl: 1 表示满足前置条件但因频控 (n / daymax / 全局上限) 跳过，可供对照组采样
  */
+/* 复审 P3：本函数无锁直读 g_restart_rules（条件 6），是全文件唯一无锁
+ * 直读规则数组的点——仅允许主线程调用（pulse_round），勿被 worker 线程
+ * 复用；worker 侧读规则一律走 pulse_find_rule / pulse_revalidate_conditions */
 static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st,
                                  pid_t pid, int32_t cur, const char *path,
                                  time_t now_mono, uint64_t *out_fp, int *out_skip_ctrl) {
@@ -2402,14 +2467,9 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
 static int pulse_revalidate_conditions(pid_t pid, const char *bid, uint64_t *out_fp) {
     if (pid <= 0 || !bid || bid[0] == '\0') return 0;
 
-    const pulse_rule_t *rule = NULL;
-    for (int i = 0; i < g_npulse_rules; i++) {
-        if (strcmp(g_pulse_rules[i].bid, bid) == 0) {
-            rule = &g_pulse_rules[i];
-            break;
-        }
-    }
-    if (!rule || !rule->enabled) return 0;
+    /* H2: 读锁内取规则快照；锁外只用快照（enabled/daymax/target_mb 的使用都在锁外） */
+    pulse_rule_t rule_snap;
+    if (!pulse_find_rule(bid, &rule_snap) || !rule_snap.enabled) return 0;
 
     char today_str[16] = {0};
     pulse_get_local_date_str(today_str, sizeof(today_str));
@@ -2420,7 +2480,7 @@ static int pulse_revalidate_conditions(pid_t pid, const char *bid, uint64_t *out
 
     pthread_mutex_lock(&s_pulse_mutex);
     pulse_app_state_t *st = pulse_get_app_state(bid, today_str);
-    int invalid = (!st || st->tripped_today || st->day_count >= rule->daymax ||
+    int invalid = (!st || st->tripped_today || st->day_count >= rule_snap.daymax ||
                    g_pulse_global_today_count >= PULSE_GLOBAL_DAYMAX);
     if (invalid) {
         pthread_mutex_unlock(&s_pulse_mutex);
@@ -2445,16 +2505,21 @@ static int pulse_revalidate_conditions(pid_t pid, const char *bid, uint64_t *out
 
     uint64_t cur_fp = 0;
     if (pulse_get_footprint_mb(pid, &cur_fp) != 0) return 0;
-    if (cur_fp <= (uint64_t)rule->target_mb) return 0;
+    if (cur_fp <= (uint64_t)rule_snap.target_mb) return 0;
 
+    /* H2: 重启规则数组读锁——锁内只读值、锁外判断，保证单次 unlock。
+     * （复审修复：原写法在「匹配且 fp ≤ thr_mb」路径下循环内 unlock 后
+     * break 又落到循环外 unlock，双重 unlock 属 POSIX 未定义行为） */
+    pthread_rwlock_rdlock(&s_rule_lock);
+    int over_thr = 0;
     for (int r = 0; r < g_nrestart_rules; r++) {
         if (strcmp(g_restart_rules[r].bid, bid) == 0) {
-            if (cur_fp > (uint64_t)g_restart_rules[r].thr_mb) {
-                return 0;
-            }
+            over_thr = (cur_fp > (uint64_t)g_restart_rules[r].thr_mb);
             break;
         }
     }
+    pthread_rwlock_unlock(&s_rule_lock);
+    if (over_thr) return 0;
 
     if (out_fp) *out_fp = cur_fp;
     return 1;
@@ -2476,12 +2541,16 @@ typedef struct {
 static pulse_queue_entry_t g_pulse_queue[PULSE_MAX_QUEUE];
 static int g_npulse_queue = 0;
 
-static volatile int   g_pulse_in_progress = 0;
-static volatile pid_t g_pulse_current_pid = 0;
-static char           g_pulse_current_bid[128] = {0};
+/* H1 并发原子性：in_progress/pid/running 全部原子化。
+ * running 是 worker 完成的唯一权威信号：worker 先清逻辑态，最后
+ * atomic_store(running,0,release)；主循环以 atomic_load(running,acquire)==0
+ * 判定旧线程已收尾，才允许 join/spawn。 */
+static _Atomic int   g_pulse_in_progress = 0;
+static _Atomic pid_t g_pulse_current_pid = 0;
+static char          g_pulse_current_bid[128] = {0}; /* H1 范围确认：全文件只写不读，无撕裂读风险，保持原样 */
 static pthread_t      g_pulse_thread;
 static _Atomic int    g_pulse_thread_running = 0;
-static int            g_pulse_thread_has_handle = 0;
+static int            g_pulse_thread_has_handle = 0; /* 仅主线程读写，安全 */
 
 static void pulse_queue_remove_at(int idx) {
     if (idx < 0 || idx >= g_npulse_queue) return;
@@ -2608,10 +2677,8 @@ static int pulse_save_state_file(const pulse_saved_state_t *st) {
     fprintf(f, "orig_inactive=%d\n", st->orig_inactive);
     fprintf(f, "orig_inactive_attr=%u\n", st->orig_inactive_attr);
     fprintf(f, "suspect=%d\n", st->suspect);
-    fclose(f);
-
-    if (rename(PULSE_STATE_TMP_PATH, PULSE_STATE_PATH) != 0) {
-        unlink(PULSE_STATE_TMP_PATH);
+    /* M1: 统一原子提交——原实现缺 fsync（数据与目录）；O_NOFOLLOW/fchmod 保留 */
+    if (jp_atomic_commit(f, PULSE_STATE_TMP_PATH, PULSE_STATE_PATH) != 0) {
         return -1;
     }
     return 0;
@@ -3104,7 +3171,9 @@ static int pulse_get_cur_priority(pid_t pid, int32_t *prio_out) {
 
 static void *pulse_worker_thread(void *arg) {
     pulse_queue_entry_t *target = (pulse_queue_entry_t *)arg;
-    if (!target) return NULL;
+    /* 复审 P3：判空失败也要走收尾——直接 return 会绕过 thread_done，
+     * running 恒 1 使 spawn 守卫永久 defer（free(NULL) 安全） */
+    if (!target) goto thread_done;
 
     pid_t pid = target->pid;
     const char *bid = target->bid;
@@ -3338,8 +3407,10 @@ static void *pulse_worker_thread(void *arg) {
 
                 /* 卡 P-2: 重新设限，最多 1 次
                  * 条件：ovr_t <= 30，现读档位 < 90，fp_ovr > target，从窗口开始到现在的 cpu_ms > 0，且没重新设过 */
-                pulse_rule_t *rule = pulse_find_rule(bid);
-                uint64_t target_mb = rule ? (uint64_t)rule->target_mb : 0;
+                /* H2: 读锁内取规则快照，锁外用快照判定 */
+                pulse_rule_t rule_snap;
+                int have_rule = pulse_find_rule(bid, &rule_snap);
+                uint64_t target_mb = have_rule ? (uint64_t)rule_snap.target_mb : 0;
 
                 if (ovr_t <= 30 && band >= 0 && band < 90 && fp_ovr > target_mb) {
                     reassert_count = 1;
@@ -3624,10 +3695,12 @@ static void *pulse_worker_thread(void *arg) {
     pthread_mutex_unlock(&s_pulse_mutex);
 
 thread_done:
-    g_pulse_in_progress = 0;
-    g_pulse_current_pid = 0;
+    /* H1: 先清逻辑态，最后清 running；running=0(release) 是 worker 完成的
+     * 唯一权威信号，此后本线程不再写任何共享 pulse 状态 */
+    atomic_store_explicit(&g_pulse_in_progress, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_pulse_current_pid, 0, memory_order_relaxed);
     g_pulse_current_bid[0] = '\0';
-    g_pulse_thread_running = 0;
+    atomic_store_explicit(&g_pulse_thread_running, 0, memory_order_release);
     free(target);
     return NULL;
 }
@@ -3644,7 +3717,8 @@ typedef struct {
  * 从头到尾只读，不写任何档位/内存限制。秒级时钟采样，误差超过 +-2s 记 NA */
 static void *pulse_ctrl_worker_thread(void *arg) {
     pulse_ctrl_arg_t *carg = (pulse_ctrl_arg_t *)arg;
-    if (!carg) return NULL;
+    /* 复审 P3：同 pulse worker——判空失败也要走 ctrl_done 收尾（不 free） */
+    if (!carg) goto ctrl_done;
 
     pid_t pid = carg->pid;
     char bid[128];
@@ -3764,10 +3838,11 @@ static void *pulse_ctrl_worker_thread(void *arg) {
     pthread_mutex_unlock(&s_pulse_mutex);
 
 ctrl_done:
-    g_pulse_in_progress = 0;
-    g_pulse_current_pid = 0;
+    /* H1: 同 pulse worker——先清逻辑态，最后 running=0(release) */
+    atomic_store_explicit(&g_pulse_in_progress, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_pulse_current_pid, 0, memory_order_relaxed);
     g_pulse_current_bid[0] = '\0';
-    g_pulse_thread_running = 0;
+    atomic_store_explicit(&g_pulse_thread_running, 0, memory_order_release);
     return NULL;
 }
 
@@ -3790,8 +3865,10 @@ static void rst_ensure_app_procs(memorystatus_priority_entry_t *list, int count)
 static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     if (g_npulse_rules == 0 || g_pulse_cfg_file_absent) return;
 
-    /* 回收已结束的 pulse 工作线程 (M4) */
-    if (g_pulse_thread_has_handle && !g_pulse_thread_running) {
+    /* 回收已结束的 pulse 工作线程 (M4)；H1: running 用 acquire 读，
+     * 为 0 时 worker 的收尾写（清逻辑态）对主线程全部可见，join 安全 */
+    if (g_pulse_thread_has_handle &&
+        !atomic_load_explicit(&g_pulse_thread_running, memory_order_acquire)) {
         pthread_join(g_pulse_thread, NULL);
         g_pulse_thread_has_handle = 0;
     }
@@ -3926,7 +4003,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         int eligible = pulse_check_candidate(rule, st, main_pid, main_cur, main_path,
                                              now_mono, &cand_fp, &skip_ctrl);
         if (eligible) {
-            if (g_pulse_in_progress && g_pulse_current_pid == main_pid) {
+            if (atomic_load_explicit(&g_pulse_in_progress, memory_order_acquire) &&
+                atomic_load_explicit(&g_pulse_current_pid, memory_order_acquire) == main_pid) {
                 continue;
             }
             int in_queue = 0;
@@ -3961,7 +4039,21 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     pulse_sort_queue();
 
     /* 4. 若全局无 pulse 正在进行，且队列非空，弹出最大者并启动异步线程 */
-    while (!g_pulse_in_progress && g_npulse_queue > 0) {
+    while (atomic_load_explicit(&g_pulse_in_progress, memory_order_acquire) == 0 &&
+           g_npulse_queue > 0) {
+        /* H1 spawn/join 守卫：旧 worker 仍在收尾（has_handle && running==1）→
+         * 本轮不 spawn，条目保留在队列下轮重试，绝不 pthread_create 覆写未
+         * join 的旧句柄（否则旧 joinable 线程泄漏，且旧线程最后的 running=0
+         * 会清掉新线程的状态）。running==0（acquire）时 worker 收尾写已全部
+         * 可见，join 安全；此后主循环内再无其他写者，create 时 running 必为
+         * 0，spawn 路径永不与未 join 的旧 joinable 线程并存。 */
+        if (g_pulse_thread_has_handle) {
+            if (atomic_load_explicit(&g_pulse_thread_running, memory_order_acquire)) {
+                break; /* 旧 worker 仍在收尾：下轮重试 */
+            }
+            pthread_join(g_pulse_thread, NULL);
+            g_pulse_thread_has_handle = 0;
+        }
         pulse_queue_entry_t target = g_pulse_queue[0];
         pulse_queue_remove_at(0);
 
@@ -3983,30 +4075,27 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             return;
         }
 
-        g_pulse_in_progress = 1;
-        g_pulse_current_pid = target.pid;
+        atomic_store_explicit(&g_pulse_in_progress, 1, memory_order_relaxed);
+        atomic_store_explicit(&g_pulse_current_pid, target.pid, memory_order_relaxed);
         rst_str_copy(g_pulse_current_bid, sizeof(g_pulse_current_bid), target.bid);
 
         pulse_queue_entry_t *thread_arg = (pulse_queue_entry_t *)malloc(sizeof(pulse_queue_entry_t));
         if (thread_arg) {
             *thread_arg = target;
-            if (g_pulse_thread_has_handle && !g_pulse_thread_running) {
-                pthread_join(g_pulse_thread, NULL);
-                g_pulse_thread_has_handle = 0;
-            }
-            g_pulse_thread_running = 1;
+            /* H1: 先置 running(release) 再 create，作为新 worker 状态的权威置位 */
+            atomic_store_explicit(&g_pulse_thread_running, 1, memory_order_release);
             if (pthread_create(&g_pulse_thread, NULL, pulse_worker_thread, thread_arg) == 0) {
                 g_pulse_thread_has_handle = 1;
             } else {
-                g_pulse_thread_running = 0;
+                atomic_store_explicit(&g_pulse_thread_running, 0, memory_order_relaxed);
                 free(thread_arg);
-                g_pulse_in_progress = 0;
-                g_pulse_current_pid = 0;
+                atomic_store_explicit(&g_pulse_in_progress, 0, memory_order_relaxed);
+                atomic_store_explicit(&g_pulse_current_pid, 0, memory_order_relaxed);
                 g_pulse_current_bid[0] = '\0';
             }
         } else {
-            g_pulse_in_progress = 0;
-            g_pulse_current_pid = 0;
+            atomic_store_explicit(&g_pulse_in_progress, 0, memory_order_relaxed);
+            atomic_store_explicit(&g_pulse_current_pid, 0, memory_order_relaxed);
             g_pulse_current_bid[0] = '\0';
         }
         break;
@@ -4014,9 +4103,21 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
 
     /* 5. 若全局无 pulse 正在进行且队列为空，可启动对照组只读采样线程 (M5 / Q2)
      * 跟 pulse 共用「全局同时只做 1 个」名额，排队时 pulse 优先 */
-    if (!g_pulse_in_progress && g_npulse_queue == 0 && best_ctrl_pid > 0) {
+    if (atomic_load_explicit(&g_pulse_in_progress, memory_order_acquire) == 0 &&
+        g_npulse_queue == 0 && best_ctrl_pid > 0) {
         if (g_got_sigterm || g_pulse_stop_requested) {
             return;
+        }
+
+        /* H1: 同 pulse 的 spawn/join 守卫——旧 worker 仍在收尾（has_handle &&
+         * running==1）则本轮不启动对照采样（best_ctrl 下轮会重新评估），绝不
+         * pthread_create 覆写未 join 的旧句柄 */
+        if (g_pulse_thread_has_handle) {
+            if (atomic_load_explicit(&g_pulse_thread_running, memory_order_acquire)) {
+                return; /* 旧 worker 仍在收尾：下轮重试 */
+            }
+            pthread_join(g_pulse_thread, NULL);
+            g_pulse_thread_has_handle = 0;
         }
 
         pulse_ctrl_arg_t *carg = (pulse_ctrl_arg_t *)malloc(sizeof(pulse_ctrl_arg_t));
@@ -4026,15 +4127,12 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             carg->bg_lag = best_ctrl_lag;
             carg->locked = g_locked;
 
-            g_pulse_in_progress = 1;
-            g_pulse_current_pid = best_ctrl_pid;
+            atomic_store_explicit(&g_pulse_in_progress, 1, memory_order_relaxed);
+            atomic_store_explicit(&g_pulse_current_pid, best_ctrl_pid, memory_order_relaxed);
             rst_str_copy(g_pulse_current_bid, sizeof(g_pulse_current_bid), best_ctrl_bid);
 
-            if (g_pulse_thread_has_handle && !g_pulse_thread_running) {
-                pthread_join(g_pulse_thread, NULL);
-                g_pulse_thread_has_handle = 0;
-            }
-            g_pulse_thread_running = 1;
+            /* H1: 先置 running(release) 再 create，作为新 worker 状态的权威置位 */
+            atomic_store_explicit(&g_pulse_thread_running, 1, memory_order_release);
             if (pthread_create(&g_pulse_thread, NULL, pulse_ctrl_worker_thread, carg) == 0) {
                 g_pulse_thread_has_handle = 1;
                 pthread_mutex_lock(&s_pulse_mutex);
@@ -4044,10 +4142,10 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 }
                 pthread_mutex_unlock(&s_pulse_mutex);
             } else {
-                g_pulse_thread_running = 0;
+                atomic_store_explicit(&g_pulse_thread_running, 0, memory_order_relaxed);
                 free(carg);
-                g_pulse_in_progress = 0;
-                g_pulse_current_pid = 0;
+                atomic_store_explicit(&g_pulse_in_progress, 0, memory_order_relaxed);
+                atomic_store_explicit(&g_pulse_current_pid, 0, memory_order_relaxed);
                 g_pulse_current_bid[0] = '\0';
             }
         }
@@ -4324,8 +4422,11 @@ static int restart_state_load(void) {
 }
 
 static void restart_state_save(void) {
-    FILE *f = fopen(RESTART_STATE_TMP_PATH, "w");
-    if (!f) return;
+    /* M1: O_NOFOLLOW 打开 tmp（原 fopen("w") 缺 O_NOFOLLOW） */
+    int fd = open(RESTART_STATE_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(RESTART_STATE_TMP_PATH); return; }
 
     fprintf(f, "v1\n");
 
@@ -4357,18 +4458,13 @@ static void restart_state_save(void) {
                 g_rst_last[i].bid, g_rst_last[i].boot_uuid, (long long)g_rst_last[i].mono_sec);
     }
 
-    fflush(f);
-    int berr = ferror(f);
-    fclose(f);
-
-    if (berr) {
-        unlink(RESTART_STATE_TMP_PATH);
-    } else {
-        rename(RESTART_STATE_TMP_PATH, RESTART_STATE_PATH);
-        struct stat st;
-        if (stat(RESTART_STATE_PATH, &st) == 0) {
-            g_rst_state_mtime = st.st_mtime;
-        }
+    /* M1: 统一原子提交——fsync 数据 → rename → fsync 目录；失败保留旧状态文件 */
+    if (jp_atomic_commit(f, RESTART_STATE_TMP_PATH, RESTART_STATE_PATH) != 0) {
+        return;
+    }
+    struct stat st;
+    if (stat(RESTART_STATE_PATH, &st) == 0) {
+        g_rst_state_mtime = st.st_mtime;
     }
 }
 
@@ -4786,7 +4882,9 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
         }
 
         /* C2-2: pulse 进行期间，0.7.7 重启规则跳过该 pid */
-        if (g_pulse_in_progress && g_pulse_current_pid == main_pid) {
+        /* H1: 原子读，消除与 worker 收尾竞态下的 UB */
+        if (atomic_load_explicit(&g_pulse_in_progress, memory_order_acquire) &&
+            atomic_load_explicit(&g_pulse_current_pid, memory_order_acquire) == main_pid) {
             restart_log_skip(rule, r_state, "pulse_in_progress", main_cur, now_mono);
             continue;
         }
@@ -5225,8 +5323,11 @@ static int bgkill_load_config(void) {
                   "BGK", i, parsed_rules[i].bid, parsed_rules[i].enabled,
                   (int)parsed_rules[i].min, (int)parsed_rules[i].max);
         }
+        /* H2: 整块替换规则数组必须在写锁内完成（worker 可能正在读） */
+        pthread_rwlock_wrlock(&s_rule_lock);
         memcpy(g_bgkill_rules, parsed_rules, sizeof(bgkill_rule_t) * nparsed);
         g_nbgkill_rules = nparsed;
+        pthread_rwlock_unlock(&s_rule_lock);
         g_bgkill_cfg_file_absent = file_absent;
 
         int new_nbgkill_rule_states = 0;
@@ -5387,7 +5488,9 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
         }
 
         /* 触发条件 3: pulse 进行中跳过该 pid */
-        if (g_pulse_in_progress && g_pulse_current_pid == main_pid) {
+        /* H1: 原子读，消除与 worker 收尾竞态下的 UB */
+        if (atomic_load_explicit(&g_pulse_in_progress, memory_order_acquire) &&
+            atomic_load_explicit(&g_pulse_current_pid, memory_order_acquire) == main_pid) {
             bgkill_log_skip(rule, st, "pulse", now_mono);
             continue;
         }
@@ -5609,8 +5712,21 @@ int main(int argc, char *argv[]) {
     }
     (void)lock_fd; /* 锁在进程退出（含 SIGKILL）时由内核自动释放，生命周期内保持打开，不删除 lock 文件 */
 
-    FILE *pf = fopen(PID_PATH, "w");
-    if (pf) { fprintf(pf, "%d\n", getpid()); fclose(pf); }
+    /* M1: pid 文件改为 tmp+rename 原子替换（原直接 fopen("w") 存在 torn write
+     * 窗口）+ O_NOFOLLOW + fsync，App 存活探测不再读到半截 pid */
+    char pid_tmp[512];
+    snprintf(pid_tmp, sizeof(pid_tmp), "%s.tmp", PID_PATH);
+    int pid_fd = open(pid_tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (pid_fd >= 0) {
+        FILE *pf = fdopen(pid_fd, "w");
+        if (pf) {
+            fprintf(pf, "%d\n", getpid());
+            (void)jp_atomic_commit(pf, pid_tmp, PID_PATH);
+        } else {
+            close(pid_fd);
+            unlink(pid_tmp);
+        }
+    }
 
     setsid();  /* 脱离拉起它的 App 会话 */
     struct sigaction sa;
@@ -5658,7 +5774,15 @@ int main(int argc, char *argv[]) {
 
         FILE *bf = NULL;
         if (handle_bands_req) {
-            bf = fopen(BANDS_TMP_PATH, "w");
+            /* M1（Chief 裁定纳入）：open(O_NOFOLLOW)+fdopen 替换 fopen("w")，
+             * 堵符号链接写穿；末尾统一走 jp_atomic_commit（fsync+rename+目录 fsync） */
+            int bfd = open(BANDS_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+            if (bfd < 0) {
+                bf = NULL;
+            } else {
+                bf = fdopen(bfd, "w");
+                if (!bf) { close(bfd); unlink(BANDS_TMP_PATH); }
+            }
             if (bf) {
                 time_t bt = time(NULL);
                 struct tm btm;
@@ -5873,13 +5997,9 @@ int main(int argc, char *argv[]) {
         }
 
         if (bf) {
-            int berr = ferror(bf);
-            fclose(bf);
-            if (berr) {
-                unlink(BANDS_TMP_PATH);
-            } else {
-                rename(BANDS_TMP_PATH, BANDS_PATH);
-            }
+            /* M1: 统一原子提交——ferror 检查、fsync、fclose、rename、目录 fsync
+             * 都在助手内；失败清理 tmp，旧 bands.txt 保持完整（瞬态快照，下轮再生） */
+            (void)jp_atomic_commit(bf, BANDS_TMP_PATH, BANDS_PATH);
         }
 
         int demoted_pids = 0;
@@ -5908,10 +6028,11 @@ int main(int argc, char *argv[]) {
          * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
     }
 
-    if (g_pulse_thread_running) {
+    /* H1: 关停路径改原子读 running；为 0 时旧 worker 必已收尾，join 立即返回 */
+    if (atomic_load_explicit(&g_pulse_thread_running, memory_order_acquire)) {
         g_pulse_stop_requested = 1;
         pthread_join(g_pulse_thread, NULL);
-        g_pulse_thread_running = 0;
+        atomic_store_explicit(&g_pulse_thread_running, 0, memory_order_relaxed);
         g_pulse_thread_has_handle = 0;
     } else if (g_pulse_thread_has_handle) {
         pthread_join(g_pulse_thread, NULL);
@@ -5920,7 +6041,7 @@ int main(int argc, char *argv[]) {
 
     act_dedup_flush_all();
     JPLOG(JP_INFO, "STOP");
-    pf = fopen(PID_PATH, "r");
+    FILE *pf = fopen(PID_PATH, "r");
     if (pf) {
         int cur_pid = 0;
         if (fscanf(pf, "%d", &cur_pid) == 1 && cur_pid == (int)getpid()) {
