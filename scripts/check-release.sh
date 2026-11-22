@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -u
+# P0-2: -e 逐处审计过（python3 版本提取、verify-artifacts 调用、JPLOG 计数均已加保护），见各处注释
+set -euo pipefail
 
 # scripts/check-release.sh: Release verification script for JetPilot
 #
@@ -73,8 +74,9 @@ elif [ ! -f "$JETPILOTD_C" ]; then
 else
     # Extract CFBundleShortVersionString and CFBundleVersion
     if command -v python3 >/dev/null 2>&1; then
-        short_ver=$(python3 -c "import plistlib; p=plistlib.load(open('$INFO_PLIST', 'rb')); print(p.get('CFBundleShortVersionString', ''))")
-        bundle_ver=$(python3 -c "import plistlib; p=plistlib.load(open('$INFO_PLIST', 'rb')); print(p.get('CFBundleVersion', ''))")
+        # P0-2: set -e 保护。python3 解析失败（损坏 plist 等）时置空，走下方 [FAIL] Version mismatch 的显式报错路径
+        short_ver=$(python3 -c "import plistlib; p=plistlib.load(open('$INFO_PLIST', 'rb')); print(p.get('CFBundleShortVersionString', ''))") || short_ver=""
+        bundle_ver=$(python3 -c "import plistlib; p=plistlib.load(open('$INFO_PLIST', 'rb')); print(p.get('CFBundleVersion', ''))") || bundle_ver=""
     else
         short_ver=$(sed -n 's/.*<key>CFBundleShortVersionString<\/key><string>\([^<]*\)<\/string>.*/\1/p' "$INFO_PLIST")
         bundle_ver=$(sed -n 's/.*<key>CFBundleVersion<\/key><string>\([^<]*\)<\/string>.*/\1/p' "$INFO_PLIST")
@@ -144,14 +146,14 @@ if [ -n "$ARTIFACT_PATH" ]; then
         echo "[FAIL] Missing verification script at $SCRIPT_DIR/verify-artifacts.py"
         FAILED=1
     else
-        python3 "$SCRIPT_DIR/verify-artifacts.py" --tipa "$ARTIFACT_PATH" --allow-unverified
-        ver_rc=$?
-        status_file="${ARTIFACT_PATH}.verification"
+        # P0-1: --allow-unverified 已移除。UNVERIFIED 由 verify-artifacts.py 以 exit 2 报出，属硬失败，
+        # 不再存在「带 UNVERIFIED 状态文件仍 exit 0」的路径，据此删除下方 WARN 分支与结尾 PASSED(UNVERIFIED) 特殊文案。
+        # P0-2: set -e 下先落变量再取退出码，避免 python3 非零退出导致脚本中途裸退。
+        ver_rc=0
+        python3 "$SCRIPT_DIR/verify-artifacts.py" --tipa "$ARTIFACT_PATH" || ver_rc=$?
         if [ $ver_rc -ne 0 ]; then
             echo "[FAIL] Verification script execution failed (exit $ver_rc) for $ARTIFACT_PATH"
             FAILED=1
-        elif [ -f "$status_file" ] && grep -q "^STATUS: UNVERIFIED" "$status_file"; then
-            echo "[WARN] Artifact verification completed with errors; marked as UNVERIFIED ($ARTIFACT_PATH)"
         else
             echo "[OK] Artifact entitlements and signature verification passed for $ARTIFACT_PATH"
         fi
@@ -163,12 +165,27 @@ fi
 # -----------------------------------------------------------------------------
 # Check 4: JPLOG counts per level (diagnostic only)
 # -----------------------------------------------------------------------------
+# F1 修复 (P0-2)：grep -c 零匹配时 exit 1 且已输出 "0"，旧写法 `|| echo 0` 会再补一行，变量成两行 "0"。
+# jplog_count：零匹配干净返回 0；grep 真实错误（exit>=2）显式报错并置 FAILED（诊断项，不中断后续检查）。
+jplog_count() {
+    local pattern="$1" file="$2" out rc
+    rc=0
+    out=$(grep -cE "$pattern" "$file" 2>/dev/null) || rc=$?
+    if [ "$rc" -le 1 ]; then
+        printf '%s\n' "${out:-0}"
+    else
+        echo "[FAIL] JPLOG count grep error (exit $rc) for pattern: $pattern" >&2
+        FAILED=1
+        printf 'ERR\n'
+    fi
+}
+
 echo "--- Check 4: JPLOG Counts per Level ---"
 if [ -f "$JETPILOTD_C" ]; then
-    cnt_err=$(grep -cE 'JPLOG\s*\(\s*JP_ERR\b' "$JETPILOTD_C" 2>/dev/null || echo 0)
-    cnt_warn=$(grep -cE 'JPLOG\s*\(\s*JP_WARN\b' "$JETPILOTD_C" 2>/dev/null || echo 0)
-    cnt_info=$(grep -cE 'JPLOG\s*\(\s*JP_INFO\b' "$JETPILOTD_C" 2>/dev/null || echo 0)
-    cnt_debug=$(grep -cE 'JPLOG\s*\(\s*JP_DEBUG\b' "$JETPILOTD_C" 2>/dev/null || echo 0)
+    cnt_err=$(jplog_count 'JPLOG\s*\(\s*JP_ERR\b' "$JETPILOTD_C")
+    cnt_warn=$(jplog_count 'JPLOG\s*\(\s*JP_WARN\b' "$JETPILOTD_C")
+    cnt_info=$(jplog_count 'JPLOG\s*\(\s*JP_INFO\b' "$JETPILOTD_C")
+    cnt_debug=$(jplog_count 'JPLOG\s*\(\s*JP_DEBUG\b' "$JETPILOTD_C")
 
     echo "JPLOG(ERR):   $cnt_err"
     echo "JPLOG(WARN):  $cnt_warn"
@@ -186,10 +203,7 @@ if [ "$FAILED" -ne 0 ]; then
     echo "Result: Release check FAILED"
     exit 1
 else
-    if [ -n "$ARTIFACT_PATH" ] && [ -f "${ARTIFACT_PATH}.verification" ] && grep -q "^STATUS: UNVERIFIED" "${ARTIFACT_PATH}.verification"; then
-        echo "Result: Release check PASSED (Artifact status: UNVERIFIED)"
-    else
-        echo "Result: Release check PASSED"
-    fi
+    # P0-1: UNVERIFIED 现在必然走 verify-artifacts.py exit 2 → 上面的 FAILED 分支，此处只剩纯 PASSED
+    echo "Result: Release check PASSED"
     exit 0
 fi
