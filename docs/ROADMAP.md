@@ -45,16 +45,16 @@ JetPilot = TrollStore 应用 + root 常驻守护进程（Objective-C，iOS 16.4.
 
 | 编号 | 优化项 | 状态 |
 |---|---|---|
-| E1 | 快慢双节奏扫描（快轮只查已知受保护 pid，省掉每轮上百次 proc_pidpath） | 已批准，实现中 |
-| E2 | 自适应退避（空转才慢、有事即快） | 已批准，实现中 |
-| E3 | status 按需写（变化才写 + bands.req 时写） | 已批准，实现中 |
+| E1 | 快慢双节奏扫描（快轮只查已知受保护 pid，省掉每轮上百次 proc_pidpath） | ✅ 已实现（批次2，待验收） |
+| E2 | 自适应退避（空转才慢、有事即快） | ✅ 已实现（批次2，待验收） |
+| E3 | status 按需写（变化才写 + bands.req 时写） | ✅ 已实现（批次2，待验收） |
 | E4 | 核实 memorystatus_control 是否支持按 pid 定向查档位 | ✅ 已核实（命令 3 支持；须真机验证，三级兜底） |
 
 ## 执行批次
 
 1. ✅ 批次0：P0-1 / P0-2 门禁修复（工程师，已完成并验证）
 2. ✅ 批次1：H1/H2（含 spawn 路径）+ M1（六处写点含 fsync）+ BadZipFile 优雅报错 —— 已完成；审查链：代码审核员揪出双解锁 bug 与 1 P2 + 5 P3，互审员独立抽查补 bands.txt 漏点，架构师复核关闭
-3. 🔄 批次2：省电优化 E1–E4（设计已批准：docs/optimization-design.md，工程师实现中）
+3. 🔄 批次2：省电优化 E1–E4 —— 实现完成，全链通过：设计批准（docs/optimization-design.md）→ 工程师实现（src/jetpilotd.c +310/-18，三个提交单元 E4+E1 / E2 / E3）→ 架构师复核揪出 SLEEP/LEGACY 永久休眠缺口（已修）与 CLAIM kind=0 偏差（已采纳修正）→ 代码审核通过（1 P2 seen 残留已修 + 3 P3）→ 互审员独立抽查通过（harness 入库流程缺口已补齐）→ 回归 harness 九场景入库 tests/（可复现）。待 Chief 验收后关闭
 4. 📋 批次3：CI 测试台（G1）+ 脚本加固 F2–F5
 5. 📋 后续：M2/M3、L1–L4、工程师补充的易错点
 
