@@ -216,7 +216,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define BANDS_TAKEN_PATH CONFIG_DIR "/bands.req.taken"
 #define BANDS_PATH       CONFIG_DIR "/bands.txt"
 #define BANDS_TMP_PATH   CONFIG_DIR "/bands.txt.tmp"
-#define JP_VERSION   "0.8.0"
+#define JP_VERSION   "0.8.1"
 #ifndef JP_COMMIT
 #define JP_COMMIT    "dev"
 #endif
