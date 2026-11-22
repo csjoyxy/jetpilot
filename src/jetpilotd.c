@@ -181,11 +181,18 @@ extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buf
  * 探测或运行失败自动降级，最坏回退每轮全表扫的现状。 */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES  3
 
-/* iOS 16+ 档位参考值 */
-#define BAND_IDLE        0
-#define BAND_BACKGROUND  30
-#define BAND_FOREGROUND  100
-#define BAND_MAX_PROTECT 95   /* 封顶，永不触及前台 100 与系统档 */
+/* iOS 16+ 档位参考值 —— T3-IMP: 档位数值的唯一权威来源（模块内零字面量） */
+#define BAND_IDLE            0
+#define BAND_BACKGROUND      30  /* 自然后台上界 / kill 允许上界 */
+#define BAND_PROTECT_DEFAULT 90  /* 保护规则默认目标 (= BAND_FOREGROUND - 10) */
+#define BAND_MAX_PROTECT     95  /* 保护封顶，永不触及前台档与系统抬升档 */
+#define BAND_FOREGROUND      100 /* 前台：保护环绝不触碰 */
+#define BAND_SYSTEM_ELEVATED 120 /* 系统抬升档（原字面量 120） */
+
+/* 常量关系固化，防后续模块漂移 */
+_Static_assert(BAND_MAX_PROTECT < BAND_FOREGROUND &&
+               BAND_PROTECT_DEFAULT == BAND_FOREGROUND - 10,
+               "band constants drift: protect/candidate/foreground mismatch");
 
 typedef struct memorystatus_priority_entry {
     pid_t    pid;
@@ -565,7 +572,7 @@ static void act_log_success(int kind, pid_t pid, const char *path, const char *f
 #define MAX_RULES 32
 typedef struct {
     char    frag[256];
-    int32_t target;   /* 目标档位：protect 为 30–95，demote 为 0–30 */
+    int32_t target;   /* 目标档位：protect 为 BAND_BACKGROUND..BAND_MAX_PROTECT，demote 为 BAND_IDLE..BAND_BACKGROUND */
     int     is_bid;   /* 1 = 按 Bundle ID 匹配；0 = 按路径片段匹配 */
 } rule_t;
 
@@ -666,7 +673,7 @@ static char     g_last_err_time[64] = "";
 
 /* 记录每个 pid 最后一次由我们设置的档位：
  * 只有当前档位等于我们上次设的值时才允许往下调，
- * 避免把系统给的前台 100 等档位误降 */
+ * 避免把系统给的前台档（BAND_FOREGROUND）等档位误降 */
 #define MAX_APPLIED 64
 typedef struct {
     pid_t   pid;
@@ -695,6 +702,34 @@ static applied_t *applied_find(pid_t pid) {
     for (int i = 0; i < g_napplied; i++)
         if (g_applied[i].pid == pid) return &g_applied[i];
     return NULL;
+}
+
+/* =========================================================================
+ * T3-IMP: 前后台 / kill 判定的唯一权威入口（模块调用点禁止档位字面量）
+ * 阈值语义与原 v0.8.1 逐点等价：前台保护环用 BAND_FOREGROUND，
+ * 重启/bgkill 的"可操作"快筛用 BAND_PROTECT_DEFAULT，kill 下界用 BAND_BACKGROUND。
+ * 注意：本组判定保持 I4 —— "保护环可操作(BAND_FOREGROUND)" 与
+ * "自然后台可杀(BAND_BACKGROUND)" 不得互相替代。
+ * ========================================================================= */
+static int jp_is_foreground(int32_t band) {
+    return band >= BAND_FOREGROUND;
+}
+
+static int jp_is_candidate(int32_t band) {
+    return band >= BAND_IDLE && band <= BAND_MAX_PROTECT;
+}
+
+static int jp_kill_allowed(int32_t natural_band) {
+    return natural_band <= BAND_BACKGROUND;
+}
+
+/* 自然档位回退链 sys_band -> orig -> cur（restart 与 bgkill 共用）。
+ * 3.1 阶段行为与原 restart 内联代码完全等价；3.3 在此处加 TTL/现读兜底。 */
+static int32_t jp_natural_band(pid_t pid, int32_t cur_now) {
+    applied_t *a = applied_find(pid);
+    if (a && a->sys_band_known) return a->sys_band;
+    if (a && a->orig_known) return a->orig;
+    return cur_now;
 }
 
 /* applied_set_ex:
@@ -911,8 +946,8 @@ static int load_config(void) {
         if (n < 2) continue;
         int is_bid = (strncmp(frag, "bid:", 4) == 0);
         if (strcmp(verb, "protect") == 0 && g_nprotect < MAX_RULES) {
-            if (n < 3 || band <= 0) band = BAND_FOREGROUND - 10; /* 默认 90 */
-            if (band < BAND_BACKGROUND) band = BAND_BACKGROUND;   /* 与 App 滑杆最小值 30 一致 */
+            if (n < 3 || band <= 0) band = BAND_PROTECT_DEFAULT; /* 默认保护档 */
+            if (band < BAND_BACKGROUND) band = BAND_BACKGROUND;   /* 与 App 滑杆最小值一致 */
             if (band > BAND_MAX_PROTECT) band = BAND_MAX_PROTECT;
             strncpy(g_protect[g_nprotect].frag, frag, 255);
             g_protect[g_nprotect].target = band;
@@ -920,8 +955,8 @@ static int load_config(void) {
             if (is_bid) g_has_bid_rules = 1;
             g_nprotect++;
         } else if (strcmp(verb, "demote") == 0 && g_ndemote < MAX_RULES) {
-            if (n < 3) band = BAND_BACKGROUND;                    /* 默认 30 */
-            if (band < BAND_IDLE) band = BAND_IDLE;               /* 夹到 0–30 */
+            if (n < 3) band = BAND_BACKGROUND;                    /* 默认后台档 */
+            if (band < BAND_IDLE) band = BAND_IDLE;               /* 夹到自然后台区间 */
             if (band > BAND_BACKGROUND) band = BAND_BACKGROUND;
             strncpy(g_demote[g_ndemote].frag, frag, 255);
             g_demote[g_ndemote].target = band;
@@ -1861,10 +1896,10 @@ static void applied_fill_identity(applied_t *a, const char *path, const char *fr
 /* E1: 快轮单条重断言。漂移响应矩阵与慢轮严格一致（不得比慢轮更激进）：
  *   protect: 仅 cur < target 时重新抬档（RAISE）；系统抬到 target 之上 = 慢轮 SKIP 语义，不动
  *   demote:  仅非前台且 cur > target 时压回（DEMOTE）；系统压到 target 之下不反向抬高
- *   前台档位（>=100）一律不碰，交慢轮。
+ *   前台档位（BAND_FOREGROUND 及以上）一律不碰，交慢轮。
  * 返回 1 表示发生了一次重断言（E2 空转判定用）。 */
 static int fast_reassert_one(applied_t *a, int32_t cur) {
-    if (cur >= BAND_FOREGROUND) {
+    if (jp_is_foreground(cur)) {
         if (cur != a->band) { a->sys_band = cur; a->sys_band_known = 1; }
         return 0;
     }
@@ -2545,9 +2580,9 @@ static int pulse_load_config(void) {
 typedef struct {
     char    bid[128];
     pid_t   tracked_pid;
-    int     in_bg;              /* 1: 当前处于 0..95 档 */
-    time_t  bg_start_mono;      /* 进入 0..95 档的单调时间 (秒) */
-    time_t  last_fg_seen_mono;  /* 上次在前台(100档)看到的单调时间 (秒) (D1-a) */
+    int     in_bg;              /* 1: 当前处于候选档区间（jp_is_candidate） */
+    time_t  bg_start_mono;      /* 进入候选档区间的单调时间 (秒) */
+    time_t  last_fg_seen_mono;  /* 上次在前台档(BAND_FOREGROUND)看到的单调时间 (秒) (D1-a) */
     time_t  bg_lag;             /* 切后台时的估计延迟秒数，src=now 时为 -1 (NA) (D1-a) */
     time_t  last_pulse_mono;    /* 上次完成 pulse 的单调时间 (秒) */
     time_t  last_ctrl_start_mono; /* 上次启动对照组采样的单调时间 (秒) */
@@ -2673,10 +2708,10 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
     if (!rule->enabled) return 0;
     if (!pulse_is_supported_app(pid, path, rule->bid)) return 0;
 
-    /* 当前档位检查：必须在 0..95 档；其他值一律不处理 (M3 / C2-1) */
-    if (cur < 0 || cur > 95) return 0;
+    /* 当前档位检查：必须在候选档区间；其他值一律不处理 (M3 / C2-1) */
+    if (!jp_is_candidate(cur)) return 0;
 
-    /* 条件 2: 同一个 pid 连续在 0..95 档满 delay_s 秒 (C2-T) */
+    /* 条件 2: 同一个 pid 连续在候选档区间满 delay_s 秒 (C2-T) */
     if (!st->in_bg || st->tracked_pid != pid || st->bg_start_mono <= 0) return 0;
     time_t elapsed_sec = now_mono - st->bg_start_mono;
     if (elapsed_sec < (time_t)rule->delay_s) return 0;
@@ -3688,13 +3723,15 @@ static void *pulse_worker_thread(void *arg) {
                 }
 
                 /* 卡 P-2: 重新设限，最多 1 次
-                 * 条件：ovr_t <= 30，现读档位 < 90，fp_ovr > target，从窗口开始到现在的 cpu_ms > 0，且没重新设过 */
+                 * 条件：ovr_t <= BAND_BACKGROUND，现读档位 < BAND_PROTECT_DEFAULT，
+                 * fp_ovr > target，从窗口开始到现在的 cpu_ms > 0，且没重新设过 */
                 /* H2: 读锁内取规则快照，锁外用快照判定 */
                 pulse_rule_t rule_snap;
                 int have_rule = pulse_find_rule(bid, &rule_snap);
                 uint64_t target_mb = have_rule ? (uint64_t)rule_snap.target_mb : 0;
 
-                if (ovr_t <= 30 && band >= 0 && band < 90 && fp_ovr > target_mb) {
+                if (ovr_t <= BAND_BACKGROUND && band >= BAND_IDLE &&
+                    band < BAND_PROTECT_DEFAULT && fp_ovr > target_mb) {
                     reassert_count = 1;
                     proc_identity_t check_reassert_ident;
                     int reassert_ok = 0;
@@ -3856,7 +3893,7 @@ static void *pulse_worker_thread(void *arg) {
             }
 
             int32_t cur_prio = -1;
-            if (pulse_get_cur_priority(pid, &cur_prio) == 0 && cur_prio == 100) {
+            if (pulse_get_cur_priority(pid, &cur_prio) == 0 && cur_prio == BAND_FOREGROUND) {
                 break; /* 采样期间回到前台，停止采样 */
             }
 
@@ -4062,7 +4099,8 @@ static void *pulse_ctrl_worker_thread(void *arg) {
         }
 
         int32_t cur_prio = -1;
-        if (pulse_get_cur_priority(pid, &cur_prio) == 0 && (cur_prio == 100 || cur_prio == 120)) {
+        if (pulse_get_cur_priority(pid, &cur_prio) == 0 &&
+            (cur_prio == BAND_FOREGROUND || cur_prio == BAND_SYSTEM_ELEVATED)) {
             break; /* 回前台或后台音频，停止采样 */
         }
 
@@ -4173,7 +4211,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     uint64_t best_ctrl_fp = 0;
     time_t best_ctrl_lag = -1;
 
-    /* 1. 维护队列：若队列中的 App 已回前台 (cur == 100)、处于 120 档或进程消失，移出队列 */
+    /* 1. 维护队列：若队列中的 App 已回前台 (BAND_FOREGROUND)、
+     * 处于系统抬升档或进程消失，移出队列 */
     for (int q = g_npulse_queue - 1; q >= 0; q--) {
         pid_t qpid = g_pulse_queue[q].pid;
         int found = 0;
@@ -4185,7 +4224,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 break;
             }
         }
-        if (!found || qcur == 100 || qcur == 120) {
+        if (!found || qcur == BAND_FOREGROUND || qcur == BAND_SYSTEM_ELEVATED) {
             pulse_queue_remove_at(q);
         } else {
             uint64_t cfp = 0;
@@ -4228,7 +4267,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         }
 
         /* 档位状态推进与 delay 计时 (Q2 / delay 裁定 / D1-a) */
-        if (main_cur == 100) {
+        if (main_cur == BAND_FOREGROUND) {
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->last_fg_seen_mono = now_mono;
@@ -4237,7 +4276,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
             st->tracked_pid = main_pid;
-        } else if (main_cur == 120) {
+        } else if (main_cur == BAND_SYSTEM_ELEVATED) {
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->last_fg_seen_mono = 0;
@@ -4245,7 +4284,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
             st->tracked_pid = main_pid;
-        } else if (main_cur >= 0 && main_cur <= 95) {
+        } else if (jp_is_candidate(main_cur)) {
             if (st->tracked_pid != main_pid) {
                 st->tracked_pid = main_pid;
                 st->in_bg = 1;
@@ -4270,7 +4309,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 }
             }
         } else {
-            /* 其他值一律不处理：不在 0..95 档，不累计进入后台 delay 计时 (M3) */
+            /* 其他值一律不处理：不在候选档区间，不累计进入后台 delay 计时 (M3) */
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->last_fg_seen_mono = 0;
@@ -5176,16 +5215,16 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
 
         if (main_pid != r_state->tracked_pid) {
             r_state->tracked_pid = main_pid;
-            r_state->in_bg = (main_cur < 90) ? 1 : 0;
-            r_state->bg_start_mono = (main_cur < 90) ? now_mono : 0;
+            r_state->in_bg = (main_cur < BAND_PROTECT_DEFAULT) ? 1 : 0;
+            r_state->bg_start_mono = (main_cur < BAND_PROTECT_DEFAULT) ? now_mono : 0;
             r_state->sample_count = 0;
         }
 
         int bg_sec_elapsed = 0;
         const char *skip_reason = NULL;
 
-        /* 判定 1: 后台计时 (任何一轮档位 >= 90，后台计时清零；连续低于 90 满 bg 秒) */
-        if (main_cur >= 90) {
+        /* 判定 1: 后台计时 (任何一轮档位 >= BAND_PROTECT_DEFAULT，后台计时清零；连续低于该档满 bg 秒) */
+        if (main_cur >= BAND_PROTECT_DEFAULT) {
             r_state->in_bg = 0;
             r_state->bg_start_mono = 0;
             r_state->sample_count = 0;
@@ -5201,14 +5240,10 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
             }
         }
 
-        /* 判定 2: 系统档位 (回退链: sys_band -> orig -> cur; <= 30 允许杀) */
-        applied_t *a = applied_find(main_pid);
-        int32_t sys_band = 0;
-        if (a && a->sys_band_known) sys_band = a->sys_band;
-        else if (a && a->orig_known) sys_band = a->orig;
-        else sys_band = main_cur;
+        /* 判定 2: 系统自然档位（统一回退链 jp_natural_band；<= BAND_BACKGROUND 才允许杀） */
+        int32_t sys_band = jp_natural_band(main_pid, main_cur);
 
-        if (!skip_reason && sys_band > BAND_BACKGROUND) {
+        if (!skip_reason && !jp_kill_allowed(sys_band)) {
             skip_reason = "band";
             r_state->sample_count = 0;
         }
@@ -5734,12 +5769,12 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
         /* pid 变了：清零，按新进程重新计时 */
         if (main_pid != st->tracked_pid) {
             st->tracked_pid = main_pid;
-            st->in_bg = (main_cur < 90) ? 1 : 0;
-            st->bg_start_mono = (main_cur < 90) ? now_mono : 0;
-            st->bg_rounds = (main_cur < 90) ? 1 : 0;
+            st->in_bg = (main_cur < BAND_PROTECT_DEFAULT) ? 1 : 0;
+            st->bg_start_mono = (main_cur < BAND_PROTECT_DEFAULT) ? now_mono : 0;
+            st->bg_rounds = (main_cur < BAND_PROTECT_DEFAULT) ? 1 : 0;
         } else {
-            /* 档位 >= 90 清零; < 90 进入记 bg_start_mono, 之后每轮 bg_rounds++ */
-            if (main_cur >= 90) {
+            /* 档位 >= BAND_PROTECT_DEFAULT 清零; 低于该档进入记 bg_start_mono, 之后每轮 bg_rounds++ */
+            if (main_cur >= BAND_PROTECT_DEFAULT) {
                 st->in_bg = 0;
                 st->bg_start_mono = 0;
                 st->bg_rounds = 0;
@@ -5754,8 +5789,8 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
             }
         }
 
-        /* 如果在前台，不触发也不打日志 */
-        if (main_cur >= 90 || !st->in_bg) {
+        /* 如果在前台快筛区，不触发也不打日志（真门槛在条件 6 的 jp_kill_allowed） */
+        if (main_cur >= BAND_PROTECT_DEFAULT || !st->in_bg) {
             continue;
         }
 
@@ -5792,9 +5827,10 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
             continue;
         }
 
-        /* 触发条件 6: 现读一次档位 */
+        /* 触发条件 6: 现读一次档位（前台快筛；≤ BAND_BACKGROUND 的真门槛在 3.2 加入） */
         int32_t cur_band = -1;
-        if (bgkill_read_current_band(main_pid, &cur_band) != 0 || cur_band >= 90) {
+        if (bgkill_read_current_band(main_pid, &cur_band) != 0 ||
+            cur_band >= BAND_PROTECT_DEFAULT) {
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->bg_rounds = 0;
@@ -6152,7 +6188,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 /* 首轮认领：上个实例记录过、且当前档位仍等于它设的值 */
-                if (!prev && g_nold_targets > 0 && cur < BAND_FOREGROUND) {
+                if (!prev && g_nold_targets > 0 && !jp_is_foreground(cur)) {
                     int32_t ot = 0, oorig = 0;
                     int ok = 0;
                     if (old_target_find(pid, &ot, &oorig, &ok) && cur == ot) {
@@ -6213,7 +6249,7 @@ int main(int argc, char *argv[]) {
                                    "RAISE", (int)pid, proc_label_log(path), frag, (int)cur, (int)target,
                                    g_last_err_no, strerror(g_last_err_no));
                         }
-                    } else if (cur > target && cur < BAND_FOREGROUND) {
+                    } else if (cur > target && !jp_is_foreground(cur)) {
                         if (prev && prev->band == cur) {
                             /* 高于目标且是我们（或旧实例）设的：跟着降 */
                             int rc = set_priority(pid, target);
@@ -6261,7 +6297,7 @@ int main(int argc, char *argv[]) {
                         }
                     }
                     /* 只在非前台且当前档位高于目标档位时降 */
-                    if (cur < BAND_FOREGROUND && cur > demote_target) {
+                    if (!jp_is_foreground(cur) && cur > demote_target) {
                         int rc = set_priority(pid, demote_target);
                         if (rc == 0) {
                             slow_actions++;   /* E2: 空转判定 */
@@ -6278,9 +6314,9 @@ int main(int argc, char *argv[]) {
                                    g_last_err_no, strerror(g_last_err_no));
                         }
                     }
-                } else if (prev && prev->band == cur && cur < BAND_FOREGROUND) {
+                } else if (prev && prev->band == cur && !jp_is_foreground(cur)) {
                     if (cur > BAND_BACKGROUND) {
-                        /* 原逻辑：protect 抬过的档位还回普通后台 (30) */
+                        /* 原逻辑：protect 抬过的档位还回普通后台 (BAND_BACKGROUND) */
                         int rc = set_priority(pid, BAND_BACKGROUND);
                         if (rc == 0) {
                             slow_actions++;   /* E2: 空转判定（RETURN 也是动作） */
@@ -6296,7 +6332,7 @@ int main(int argc, char *argv[]) {
                                    g_last_err_no, strerror(g_last_err_no));
                         }
                     } else {
-                        /* cur <= 30：demote 压过的，或已经是 30；不动档位，只把记录忘掉，交还系统 */
+                        /* cur <= BAND_BACKGROUND：demote 压过的，或已是后台档；不动档位，只把记录忘掉，交还系统 */
                         applied_remove(pid);
                         prev = NULL;
                     }

@@ -42,10 +42,16 @@ typedef struct {
 } jp_file_stamp_t;
 static unsigned long g_reassert_count = 0;
 
-#define BAND_IDLE        0
-#define BAND_BACKGROUND  30
-#define BAND_FOREGROUND  100
-#define BAND_MAX_PROTECT 95   /* 封顶，永不触及前台 100 与系统档 */
+#define BAND_IDLE            0
+#define BAND_BACKGROUND      30  /* 自然后台上界 / kill 允许上界 */
+#define BAND_PROTECT_DEFAULT 90  /* 保护规则默认目标 (= BAND_FOREGROUND - 10) */
+#define BAND_MAX_PROTECT     95  /* 保护封顶，永不触及前台档与系统抬升档 */
+#define BAND_FOREGROUND      100 /* 前台：保护环绝不触碰 */
+#define BAND_SYSTEM_ELEVATED 120 /* 系统抬升档（原字面量 120） */
+
+_Static_assert(BAND_MAX_PROTECT < BAND_FOREGROUND &&
+               BAND_PROTECT_DEFAULT == BAND_FOREGROUND - 10,
+               "band constants drift: protect/candidate/foreground mismatch");
 
 typedef struct memorystatus_priority_entry {
     pid_t    pid;
@@ -146,6 +152,23 @@ static applied_t *applied_find(pid_t pid) {
     for (int i = 0; i < g_napplied; i++)
         if (g_applied[i].pid == pid) return &g_applied[i];
     return NULL;
+}
+
+/* T3-IMP 判定入口（与 src/jetpilotd.c 同段逐字节提取） */
+static int jp_is_foreground(int32_t band) {
+    return band >= BAND_FOREGROUND;
+}
+static int jp_is_candidate(int32_t band) {
+    return band >= BAND_IDLE && band <= BAND_MAX_PROTECT;
+}
+static int jp_kill_allowed(int32_t natural_band) {
+    return natural_band <= BAND_BACKGROUND;
+}
+static int32_t jp_natural_band(pid_t pid, int32_t cur_now) {
+    applied_t *a = applied_find(pid);
+    if (a && a->sys_band_known) return a->sys_band;
+    if (a && a->orig_known) return a->orig;
+    return cur_now;
 }
 
 /* applied_set_ex:
@@ -303,7 +326,7 @@ static void applied_fill_identity(applied_t *a, const char *path, const char *fr
  *   前台档位（>=100）一律不碰，交慢轮。
  * 返回 1 表示发生了一次重断言（E2 空转判定用）。 */
 static int fast_reassert_one(applied_t *a, int32_t cur) {
-    if (cur >= BAND_FOREGROUND) {
+    if (jp_is_foreground(cur)) {
         if (cur != a->band) { a->sys_band = cur; a->sys_band_known = 1; }
         return 0;
     }
