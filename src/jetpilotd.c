@@ -176,6 +176,10 @@ extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buf
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
 #define MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES  2
+/* E4: 按 pid 定向查档位（未公开命令，XNU osfmk/kern/kern_memorystatus.h）。
+ * 私有 API 不得硬依赖：快轮必须带三级兜底（fast_scan_probe / fast_round），
+ * 探测或运行失败自动降级，最坏回退每轮全表扫的现状。 */
+#define MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES  3
 
 /* iOS 16+ 档位参考值 */
 #define BAND_IDLE        0
@@ -612,9 +616,20 @@ typedef struct {
     int     orig_known;
     int32_t sys_band;
     int     sys_band_known;
+    /* ---- E1 新增：快轮身份缓存（慢轮填充/刷新，快轮只读不改） ----
+     * 静态约 64 × 4.4KB ≈ 280KB BSS，守护进程可接受（设计 §2.2 二选一取静态） */
+    int     has_identity;   /* 1 = 以下身份字段有效（慢轮建条目时填） */
+    char    path[PROC_PIDPATHINFO_MAXSIZE]; /* 可执行路径（快轮重断言/日志用，免 proc_pidpath） */
+    int32_t target;         /* protect/demote 的目标档（快轮重断言目标） */
+    int     kind;           /* 0=protect(RAISE)，1=demote(DEMOTE) */
+    char    label[64];      /* proc_label 结果（日志/status 用） */
+    char    bid[128];       /* 主 App Bundle ID（status 用） */
+    char    frag[256];      /* 匹配的规则片段（act_log_success 去重/日志用） */
 } applied_t;
 static applied_t g_applied[MAX_APPLIED];
 static int g_napplied = 0;
+/* E2: 新建 applied 条目计数（空转判定用：慢轮无新条目才算空转） */
+static unsigned long g_applied_creates = 0;
 
 static applied_t *applied_find(pid_t pid) {
     for (int i = 0; i < g_napplied; i++)
@@ -636,6 +651,8 @@ static void applied_set_ex(pid_t pid, int32_t band, int32_t cur_before) {
         a->orig_known = 1;
         a->sys_band = 0;
         a->sys_band_known = 0;
+        a->has_identity = 0;   /* E1: 身份缓存由慢轮调用点随后填充 */
+        g_applied_creates++;   /* E2: 空转判定（仅计数，不改既有语义） */
     }
     a->band = band;
     a->seen = 1;
@@ -651,6 +668,8 @@ static void applied_set(pid_t pid, int32_t band) {
         a->orig_known = 0;
         a->sys_band = 0;
         a->sys_band_known = 0;
+        a->has_identity = 0;   /* E1: 同上 */
+        g_applied_creates++;   /* E2: 同上 */
     }
     a->band = band;
     a->seen = 1;
@@ -992,8 +1011,9 @@ static const char *proc_label_log(const char *path) {
     return buf;
 }
 
-/* status.txt 按需写：内容不变时最多每 STATUS_HEARTBEAT_SECS 秒写一次（心跳），省写盘 */
-#define STATUS_HEARTBEAT_SECS 60
+/* status 按需写（E3）：内容变化才写盘；bands.req 在手时 force 强制刷新。
+ * 原 60s 心跳已删——App 判活靠 daemon.pid 的 kill(pid,0)，不依赖 status.txt mtime 新鲜度；
+ * 守护进程首轮 body 必与 g_last_body(NULL) 不同 → 必写一次，满足「开机后写过至少一次」判据 */
 
 /* =========================================================================
  * M1 原子写统一：状态文件统一提交助手
@@ -1040,14 +1060,14 @@ static int jp_atomic_commit(FILE *f, const char *tmp_path, const char *final_pat
 
 static char  *g_last_body = NULL;   /* 上次成功写盘的内容（不含 updated= 行） */
 static size_t g_last_body_len = 0;
-static time_t g_last_write = 0;     /* 上次成功写盘的 CLOCK_MONOTONIC 秒 */
 static int    g_restart_cfg_bad_count = 0; /* restart.txt 无效行数 (v0.7.8 C1-N6) */
 static void pulse_write_status(FILE *m);
 static void bgkill_write_status(FILE *m);
 
+/* E3: force=1 时即使内容没变也写盘（慢轮 bands.req 到达时传入） */
 static void write_status(int protected_now, int demoted_pids,
                          protected_entry_t *plist, int nplist,
-                         protected_entry_t *dlist, int ndlist) {
+                         protected_entry_t *dlist, int ndlist, int force) {
     /* 1. 先在内存里拼出除 updated= 以外的全部内容 */
     char *body = NULL; size_t blen = 0;
     FILE *m = open_memstream(&body, &blen);
@@ -1091,11 +1111,10 @@ static void write_status(int protected_now, int demoted_pids,
     fclose(m);                         /* fclose 后 body/blen 才有效 */
     if (merr || !body) { free(body); return; }
 
-    /* 2. 内容没变且心跳未到 → 不写盘 */
-    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    /* 2. 内容没变且不强制 → 不写盘 (E3) */
     int same = g_last_body && blen == g_last_body_len &&
                memcmp(body, g_last_body, blen) == 0;
-    if (same && now.tv_sec - g_last_write < STATUS_HEARTBEAT_SECS) { free(body); return; }
+    if (same && !force) { free(body); return; }
 
     /* 3. 写盘：O_NOFOLLOW 打开 tmp，走 jp_atomic_commit 统一原子替换（M1：
      * fsync 数据 → rename → fsync 目录），App 永远读不到写一半的 status.txt */
@@ -1117,7 +1136,6 @@ static void write_status(int protected_now, int demoted_pids,
     /* 4. 成功才记账；失败下轮重试 */
     free(g_last_body);
     g_last_body = body; g_last_body_len = blen;
-    g_last_write = now.tv_sec;
 }
 
 static volatile sig_atomic_t g_locked = 0;
@@ -1688,6 +1706,199 @@ static int jp_file_stat_changed(const char *path, jp_file_stamp_t *stamp, int *o
     }
 
     return 0;
+}
+
+/* =========================================================================
+ * E1 快慢双节奏 / E2 自适应退避 / E4 定向查询兜底 (docs/optimization-design.md)
+ * ========================================================================= */
+/* E2: 退避常量集中定义（亮屏 5→60s；慢轮周期 30→240s；锁屏 10/60s 独立、不参与退避） */
+#define BACKOFF_BASE_SECS 5
+#define BACKOFF_MAX_SECS  60
+#define SLOW_BASE_SECS    30
+#define SLOW_MAX_SECS     240
+
+/* E4: 快轮模式（三级兜底链）
+ *   CMD3     命令 3 按 pid 定向查档位（正常路径，私有 API，不得硬依赖）
+ *   LISTSCAN get_list() 全表取回后只遍历已知 pid（省 proc_pidpath，不省全表 syscall）
+ *   SLEEP    快轮纯休眠，重断言交给慢轮（正确性不丢、只牺牲响应度）
+ *   LEGACY   最坏回退现状：每轮全表扫（慢轮连续 3 次取不到全表时进入） */
+#define FAST_MODE_CMD3     0
+#define FAST_MODE_LISTSCAN 1
+#define FAST_MODE_SLEEP    2
+#define FAST_MODE_LEGACY   3
+
+static int          g_fast_mode       = FAST_MODE_CMD3;
+static int          g_fast_mode_env_forced = 0; /* JP_FAST_SCAN=legacy 用户显式回退，排除在自动恢复外 */
+static time_t       g_slow_due_mono   = 0;              /* 下次慢轮到期（CLOCK_MONOTONIC 秒），0=首轮 */
+static int          g_slow_period     = SLOW_BASE_SECS; /* 当前慢轮周期（30→240，E2 退避） */
+static int          g_idle_rounds     = 0;              /* 连续空转轮数（翻倍指数） */
+static int          g_interval        = BACKOFF_BASE_SECS; /* 亮屏休眠间隔（5→60，E2 退避） */
+static int          g_last_protected_now = -1;          /* 上个慢轮 protected_now 基准（空转判定） */
+static int          g_slow_list_fail_streak = 0;        /* 慢轮 get_list 连续失败计数（LEGACY 触发） */
+static jp_file_stamp_t s_config_stamp = {0};            /* config.txt 变更戳（E1 慢轮判定） */
+
+static time_t mono_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+
+/* E4: 启动探测 GET_PRIORITY_PROPERTIES(3) 可用性，决定快轮初始模式。
+ * 运行时注入开关（真机验证/降级演练用）：
+ *   JP_E4_PROBE_FAIL=1  模拟命令 3 不可用 → 快轮降级 LISTSCAN（验证 0→1）
+ *   JP_FAST_SCAN=legacy 直接回退现状（验证最坏回退，每轮全表扫） */
+static void fast_scan_probe(void) {
+    const char *legacy = getenv("JP_FAST_SCAN");
+    if (legacy && strcmp(legacy, "legacy") == 0) {
+        g_fast_mode = FAST_MODE_LEGACY;
+        g_fast_mode_env_forced = 1;   /* P2: 用户显式回退，不参与自动恢复 */
+        JPLOG(JP_WARN, "%-6s env JP_FAST_SCAN=legacy -> full-scan every round", "E4");
+        return;
+    }
+    if (getenv("JP_E4_PROBE_FAIL")) {
+        g_fast_mode = FAST_MODE_LISTSCAN;
+        JPLOG(JP_WARN, "%-6s env JP_E4_PROBE_FAIL -> fast=list-scan fallback", "E4");
+        return;
+    }
+    memorystatus_priority_properties_t props;
+    memset(&props, 0, sizeof(props));
+    int rc = memorystatus_control(MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES,
+                                  getpid(), 0, &props, sizeof(props));
+    if (rc == 0) {
+        g_fast_mode = FAST_MODE_CMD3;
+        JPLOG(JP_INFO, "%-6s probe ok cmd3 self_prio=%d -> fast=cmd3",
+               "E4", (int)props.priority);
+    } else {
+        g_fast_mode = FAST_MODE_LISTSCAN;
+        JPLOG(JP_WARN, "%-6s probe fail errno=%d -> fast=list-scan fallback", "E4", errno);
+    }
+}
+
+/* E1: 慢轮填充/刷新 applied 条目身份缓存（快轮只读，不调本函数）。
+ * 慢轮每次匹配都刷新：pid 复用导致 path 变化时由此自愈（设计 §2.4.3）。 */
+static void applied_fill_identity(applied_t *a, const char *path, const char *frag,
+                                  int32_t target, int kind, const char *bid) {
+    if (!a) return;   /* 表满时 applied_find 为 NULL，安全 */
+    a->has_identity = 1;
+    strncpy(a->path, path ? path : "", sizeof(a->path) - 1);
+    a->path[sizeof(a->path) - 1] = '\0';
+    a->target = target;
+    a->kind = kind;
+    proc_label(a->path, a->label, sizeof(a->label));
+    strncpy(a->bid, bid ? bid : "", sizeof(a->bid) - 1);
+    a->bid[sizeof(a->bid) - 1] = '\0';
+    strncpy(a->frag, frag ? frag : "", sizeof(a->frag) - 1);
+    a->frag[sizeof(a->frag) - 1] = '\0';
+}
+
+/* E1: 快轮单条重断言。漂移响应矩阵与慢轮严格一致（不得比慢轮更激进）：
+ *   protect: 仅 cur < target 时重新抬档（RAISE）；系统抬到 target 之上 = 慢轮 SKIP 语义，不动
+ *   demote:  仅非前台且 cur > target 时压回（DEMOTE）；系统压到 target 之下不反向抬高
+ *   前台档位（>=100）一律不碰，交慢轮。
+ * 返回 1 表示发生了一次重断言（E2 空转判定用）。 */
+static int fast_reassert_one(applied_t *a, int32_t cur) {
+    if (cur >= BAND_FOREGROUND) {
+        if (cur != a->band) { a->sys_band = cur; a->sys_band_known = 1; }
+        return 0;
+    }
+    int do_reassert = (a->kind == 0) ? (cur < a->target) : (cur > a->target);
+    if (!do_reassert) {
+        /* 不重断言：仅记录系统档位漂移观察（与慢轮 prev->sys_band 语义一致） */
+        if (cur != a->band) { a->sys_band = cur; a->sys_band_known = 1; }
+        return 0;
+    }
+    if (set_priority(a->pid, a->target) == 0) {
+        g_reassert_count++;
+        a->sys_band = cur; a->sys_band_known = 1;   /* P3-1: 动作前记漂移观察，与慢轮语义对齐 */
+        applied_set_ex(a->pid, a->target, cur);  /* 已有条目只更新 band，身份缓存保留 */
+        act_log_success((a->kind == 0) ? ACT_KIND_RAISE : ACT_KIND_DEMOTE,
+                        a->pid, a->path, a->frag, cur, a->target);
+        return 1;
+    }
+    return 0;
+}
+
+/* E4/E1 快轮 · 模式 0：命令 3 逐已知 pid 定向查档位（O(已知数)，不取全表）。
+ * 返回本轮重断言次数；-1 表示中途异常降级（本轮未 prune，防误剪存活条目）。 */
+static int fast_round_cmd3(void) {
+    int actions = 0;
+    for (int i = 0; i < g_napplied; i++) {
+        applied_t *a = &g_applied[i];
+        memorystatus_priority_properties_t p;
+        memset(&p, 0, sizeof(p));
+        if (memorystatus_control(MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES,
+                                 a->pid, 0, &p, sizeof(p)) != 0) {
+            if (errno == ESRCH) continue;   /* 进程退出：不置 seen，applied_prune 剪除 */
+            /* E4 运行中异常失败（非 ESRCH）：整体降级到列表扫描模式。
+             * P2（代码审核）：return 前清掉本轮已置的 seen 残留——本轮部分条目已
+             * 成功置 seen=1，带着陈旧 seen 进下一轮 LISTSCAN 时，轮间退出的 pid
+             * 会被 prune 多保留一轮（listscan 对不在全表的条目不清 seen）。
+             * 清零后下一轮 LISTSCAN 从全表重新推导存活状态，死条目当轮剪除。
+             * 本轮不 prune：防误剪存活进程（重断言动作不回滚，仅丢弃存活观察）。 */
+            for (int k = 0; k < g_napplied; k++) g_applied[k].seen = 0;
+            JPLOG(JP_WARN, "%-6s cmd3_fail pid=%d errno=%d -> fast=list-scan fallback",
+                   "E4", (int)a->pid, errno);
+            g_fast_mode = FAST_MODE_LISTSCAN;
+            return -1;
+        }
+        a->seen = 1;
+        if (!a->has_identity) continue;     /* 无身份缓存：只确认存活，重断言交慢轮 */
+        actions += fast_reassert_one(a, p.priority);
+    }
+    applied_prune();
+    return actions;
+}
+
+/* E4/E1 快轮 · 模式 1：get_list() 全表取回后只遍历已知 pid（省 proc_pidpath）。
+ * get_list 失败 → 降级模式 2（快轮纯休眠）。返回重断言次数。 */
+static int fast_round_listscan(void) {
+    int count = 0;
+    memorystatus_priority_entry_t *list = get_list(&count);
+    if (!list) {
+        JPLOG(JP_WARN, "%-6s list_fail -> fast=sleep-only (reassert by slow round)", "E4");
+        g_fast_mode = FAST_MODE_SLEEP;
+        return 0;
+    }
+    int actions = 0;
+    for (int i = 0; i < g_napplied; i++) {
+        applied_t *a = &g_applied[i];
+        int32_t cur = -1;
+        for (int j = 0; j < count; j++) {   /* 只找已知 pid，其余条目跳过 */
+            if (list[j].pid == a->pid) { cur = list[j].priority; break; }
+        }
+        if (cur < 0) continue;              /* 不在全表：已退出，不置 seen → prune 剪除 */
+        a->seen = 1;
+        if (!a->has_identity) continue;
+        actions += fast_reassert_one(a, cur);
+    }
+    free(list);
+    applied_prune();
+    return actions;
+}
+
+/* E1 快轮分发：按 g_fast_mode 选择实现；SLEEP 模式纯休眠（无动作、不 prune，
+ * 退出条目交慢轮剪除）。 */
+static int fast_round(void) {
+    switch (g_fast_mode) {
+    case FAST_MODE_CMD3:     return fast_round_cmd3();
+    case FAST_MODE_LISTSCAN: return fast_round_listscan();
+    case FAST_MODE_SLEEP:
+    case FAST_MODE_LEGACY:
+    default:                 return 0;
+    }
+}
+
+/* E4/P2 兜底恢复：慢轮 get_list 成功时回升快轮模式。
+ * SLEEP / 失败触发的 LEGACY 都可能是瞬时失败（get_list 是两次 syscall，内存压力下
+ * 恰是快轮最该工作的时候），必须可恢复，不得一次失败永久休眠。
+ * 恢复目标 LISTSCAN（不依赖私有 API；重回 CMD3 由下次重启的 fast_scan_probe 探测）。
+ * JP_FAST_SCAN=legacy 为用户显式回退（g_fast_mode_env_forced），排除在自动恢复外。 */
+static void fast_mode_recover_on_slow_success(void) {
+    if (g_fast_mode_env_forced) return;
+    if (g_fast_mode == FAST_MODE_SLEEP || g_fast_mode == FAST_MODE_LEGACY) {
+        g_fast_mode = FAST_MODE_LISTSCAN;
+        JPLOG(JP_INFO, "%-6s get_list_recovered -> fast=list-scan", "E4");
+    }
 }
 
 /*
@@ -5745,8 +5956,13 @@ int main(int argc, char *argv[]) {
            "START", JP_VERSION, JP_COMMIT, (int)getpid(), g_nold_targets, g_locked);
     mempressure_init();  /* 前台 App 内存压力触发初始化 (v0.7.0) */
 
+    /* E4: 启动探测定向查询命令，决定快轮初始模式（三级兜底见 fast_scan_probe） */
+    fast_scan_probe();
+
+    int lock_changed_prev = 0;  /* E1: 休眠期间锁屏状态是否变化（触发下一轮慢轮） */
+
     while (!should_stop()) {
-        if (load_config() != 0) { sleep(5); continue; }
+        if (load_config() != 0) { sleep(BACKOFF_BASE_SECS); continue; }  /* E2: 基础间隔 */
 
         char bands_token[128] = {0};
         int handle_bands_req = 0;
@@ -5793,13 +6009,33 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        int count = 0;
-        memorystatus_priority_entry_t *list = get_list(&count);
-        int protected_now = 0, demote_actions = 0;
+        /* ---- E1: 慢轮判定（任一满足即本轮走慢轮）----
+         * 首轮 / 周期到期 / 锁屏状态变化 / config 变化 / bands.req；
+         * E4 最坏兜底 FAST_MODE_LEGACY 时每轮都是慢轮（回退现状） */
+        time_t now_mono_start = mono_now();
+        int config_changed = jp_file_stat_changed(CONFIG_PATH, &s_config_stamp, NULL);
+        int slow_round_now =
+            (g_fast_mode == FAST_MODE_LEGACY) ||
+            (g_slow_due_mono == 0) ||
+            (now_mono_start >= g_slow_due_mono) ||
+            lock_changed_prev || config_changed || handle_bands_req;
+
+        int slow_actions = 0;              /* E2: 本轮 RAISE/LOWER/DEMOTE/RETURN 成功次数 */
+        unsigned long creates_before = g_applied_creates;
+
+        int protected_now = 0;   /* P3-2: demote_actions 存量死变量已删（只增不读，批次1 存量） */
         protected_entry_t plist[MAX_PROTECTED_LIST];
         int nplist = 0;
         protected_entry_t dlist[MAX_PROTECTED_LIST];
         int ndlist = 0;
+        int fast_round_actions = 0;
+
+        if (!slow_round_now) {
+            /* E1 快轮：不调 proc_pidpath / mempressure_round / write_status */
+            fast_round_actions = fast_round();
+        } else {
+        int count = 0;
+        memorystatus_priority_entry_t *list = get_list(&count);
 
         if (list) {
             for (int i = 0; i < count; i++) {
@@ -5841,6 +6077,11 @@ int main(int argc, char *argv[]) {
                             }
                             prev->sys_band = 0;
                             prev->sys_band_known = 0;
+                            /* E1/P3-1: CLAIM 条目不填身份缓存（has_identity=0）——旧 target
+                             * 可能来自 demote 规则，按 protect 填 kind=0 会让快轮在 cur<30
+                             * 时抬档，比慢轮（对 demote 条目永不抬档）更激进。快轮只确认
+                             * 存活；身份缓存由慢轮首个真实动作（RAISE/LOWER/DEMOTE）填充，
+                             * 之前由慢轮周期兜底 */
                         }
                         JPLOG(JP_INFO, "%-6s pid=%d band=%d", "CLAIM", (int)pid, (int)cur);
                     }
@@ -5869,8 +6110,11 @@ int main(int argc, char *argv[]) {
                         /* 低于目标：抬高 */
                         int rc = set_priority(pid, target);
                         if (rc == 0) {
+                            slow_actions++;   /* E2: 空转判定 */
                             g_reassert_count++;
                             applied_set_ex(pid, target, cur);
+                            /* E1: 慢轮填充/刷新身份缓存（新建或已有条目） */
+                            applied_fill_identity(applied_find(pid), path, frag, target, 0, app_bid);
                             act_log_success(ACT_KIND_RAISE, pid, path, frag, cur, target);
                             cur = target;
                         } else {
@@ -5884,8 +6128,11 @@ int main(int argc, char *argv[]) {
                             /* 高于目标且是我们（或旧实例）设的：跟着降 */
                             int rc = set_priority(pid, target);
                             if (rc == 0) {
+                                slow_actions++;   /* E2: 空转判定 */
                                 g_reassert_count++;
                                 applied_set_ex(pid, target, cur);
+                                /* E1: 慢轮填充/刷新身份缓存（protect 规则命中，kind=0） */
+                                applied_fill_identity(applied_find(pid), path, frag, target, 0, app_bid);
                                 JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ok",
                                        "LOWER", (int)pid, proc_label_log(path), frag, (int)cur, (int)target);
                                 cur = target;
@@ -5925,11 +6172,13 @@ int main(int argc, char *argv[]) {
                     }
                     /* 只在非前台且当前档位高于目标档位时降 */
                     if (cur < BAND_FOREGROUND && cur > demote_target) {
-                        demote_actions++;
                         int rc = set_priority(pid, demote_target);
                         if (rc == 0) {
+                            slow_actions++;   /* E2: 空转判定 */
                             if (de) de->cur = demote_target;
                             applied_set_ex(pid, demote_target, cur);
+                            /* E1: 慢轮填充/刷新身份缓存（demote 规则命中，kind=1） */
+                            applied_fill_identity(applied_find(pid), path, demote_frag, demote_target, 1, app_bid);
                             act_log_success(ACT_KIND_DEMOTE, pid, path, demote_frag, cur, demote_target);
                             cur = demote_target;
                         } else {
@@ -5944,6 +6193,7 @@ int main(int argc, char *argv[]) {
                         /* 原逻辑：protect 抬过的档位还回普通后台 (30) */
                         int rc = set_priority(pid, BAND_BACKGROUND);
                         if (rc == 0) {
+                            slow_actions++;   /* E2: 空转判定（RETURN 也是动作） */
                             applied_remove(pid);   /* 还回后不再是我们的档位，内含 act_dedup_clear */
                             prev = NULL;           /* 指针已失效 */
                             cur = BAND_BACKGROUND;
@@ -5992,9 +6242,17 @@ int main(int argc, char *argv[]) {
             free(list);
             applied_prune();
             g_nold_targets = 0;  /* 首轮结束，清空旧记录 */
+            g_slow_list_fail_streak = 0;   /* E4: 全表恢复，清连续失败计数 */
+            fast_mode_recover_on_slow_success();   /* E4/P2: SLEEP/失败 LEGACY 回升 LISTSCAN（env 强制除外） */
         } else {
             mempressure_round(NULL, 0);
+            /* E4 最坏兜底：慢轮也连续取不到全表（×3）→ 回退现状（每轮全表扫） */
+            if (++g_slow_list_fail_streak >= 3 && g_fast_mode != FAST_MODE_LEGACY) {
+                g_fast_mode = FAST_MODE_LEGACY;
+                JPLOG(JP_WARN, "%-6s get_list_fail x3 -> legacy full-scan every round", "E4");
+            }
         }
+        }  /* end if (slow_round_now) */
 
         if (bf) {
             /* M1: 统一原子提交——ferror 检查、fsync、fclose、rename、目录 fsync
@@ -6009,8 +6267,42 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        write_status(protected_now, demoted_pids, plist, nplist, dlist, ndlist);
-        mempressure_write_state();
+        /* E3: status 只在慢轮写（快轮不重建 plist/dlist，避免用空列表写出错误 body）；
+         * force=handle_bands_req：用户在看档位页时即使内容没变也刷新 updated= */
+        if (slow_round_now) {
+            write_status(protected_now, demoted_pids, plist, nplist, dlist, ndlist, handle_bands_req);
+            mempressure_write_state();
+        }
+
+        /* ---- E2: 自适应退避（快/慢轮都统计；锁屏 10/60s 独立，不参与退避） ---- */
+        {
+            int idle;
+            if (slow_round_now) {
+                /* 慢轮空转：无动作 + config 未变 + 无 bands.req +
+                 * 无新受保护进程（protected_now 与上轮同、无新建 applied 条目） */
+                idle = (slow_actions == 0 && !config_changed && !handle_bands_req &&
+                        protected_now == g_last_protected_now &&
+                        g_applied_creates == creates_before);
+                g_last_protected_now = protected_now;
+            } else {
+                /* 快轮半组判定：config/bands/锁屏变化已在慢轮判定中拦截；
+                 * fast_round 返回 -1（异常降级未 prune）视为非空转 */
+                idle = (fast_round_actions == 0);
+            }
+            if (idle) {
+                if (g_idle_rounds < 8) g_idle_rounds++;   /* 封顶防移位溢出 */
+                int iv = BACKOFF_BASE_SECS << g_idle_rounds;
+                int sp = SLOW_BASE_SECS << g_idle_rounds;
+                g_interval    = (iv > BACKOFF_MAX_SECS) ? BACKOFF_MAX_SECS : iv;
+                g_slow_period = (sp > SLOW_MAX_SECS) ? SLOW_MAX_SECS : sp;
+            } else {
+                g_idle_rounds = 0;
+                g_interval    = BACKOFF_BASE_SECS;
+                g_slow_period = SLOW_BASE_SECS;
+            }
+            /* 慢轮到期时间只在慢轮收尾推进：空转时慢轮仍按 g_slow_period 兜底 */
+            if (slow_round_now) g_slow_due_mono = mono_now() + g_slow_period;
+        }
 
         if (should_stop() || g_got_sigterm) break;
 
@@ -6018,11 +6310,11 @@ int main(int argc, char *argv[]) {
             /* 刚锁屏的前两轮用 10 秒间隔，盖住系统降档的窗口；之后 60 秒 */
             int secs = (g_locked_passes < 2) ? 10 : 60;
             g_locked_passes++;
-            wait_lock_change(secs);       /* 解锁会立刻唤醒 */
+            lock_changed_prev = wait_lock_change(secs);       /* 解锁会立刻唤醒 */
         } else {
             g_locked_passes = 0;
-            /* 亮屏 5~10 秒；一锁屏立刻醒来补一轮抬档 */
-            wait_lock_change(5 + rand() % 6);
+            /* E2: 亮屏用退避后的间隔（5~60s）；一锁屏立刻醒来补一轮抬档 */
+            lock_changed_prev = wait_lock_change(g_interval);
         }
         /* 注意：锁屏时最长 60 秒才发现 running.flag 被删（停止变慢），
          * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
