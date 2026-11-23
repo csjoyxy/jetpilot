@@ -815,7 +815,7 @@ static const NSInteger kPulseMaxNMin = 60;
 @property (nonatomic, assign) NSInteger target;  // MB: 100 ~ 1500
 @property (nonatomic, assign) NSInteger n;       // min: 0 ~ 60
 @property (nonatomic, assign) NSInteger daymax;  // times: 1 ~ 100
-@property (nonatomic, assign) NSInteger delay;   // 秒: 3 ~ 20 (默认 10)
+@property (nonatomic, assign) NSInteger delay;   // 秒: 0 ~ 20 (默认 10)，0 = 一进后台就判定
 @property (nonatomic, copy) NSString *displayName;
 @property (nonatomic, assign) NSInteger lineIndex;
 @property (nonatomic, assign) BOOL isDuplicate;     // 重复规则标记

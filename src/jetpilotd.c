@@ -1543,8 +1543,11 @@ typedef struct {
     int32_t  orig_inactive;
     uint32_t orig_inactive_attr;
     int      suspect;
-    /* Ltarget: 1 = orig_* 是本进程在写限额前落盘的可信快照（身份校验通过必须原样恢复）；
-     * 0 = 旧格式/外部来源，沿用旧的 fp 合理性推断。缺字段按 0（fail closed）。 */
+    /* P2: 显式格式魔数；self_written 只在魔数匹配且值为 0/1 时才可信。
+     * self_written=1 表示本进程写限额前的快照；身份校验通过须原样恢复，
+     * 0 / 魔数缺失 / 非法值一律走旧合理性判定（fail closed）。 */
+    uint32_t fmt_magic;
+#define PULSE_STATE_FMT_MAGIC 0x4A505331U  /* "JPS1" */
     int      self_written;
 } pulse_saved_state_t;
 
@@ -3087,6 +3090,7 @@ static int pulse_save_state_file(const pulse_saved_state_t *st) {
     fprintf(f, "orig_inactive=%d\n", st->orig_inactive);
     fprintf(f, "orig_inactive_attr=%u\n", st->orig_inactive_attr);
     fprintf(f, "suspect=%d\n", st->suspect);
+    fprintf(f, "fmt_magic=%u\n", st->fmt_magic);
     fprintf(f, "self_written=%d\n", st->self_written);
     /* M1: 统一原子提交——原实现缺 fsync（数据与目录）；O_NOFOLLOW/fchmod 保留 */
     if (jp_atomic_commit(f, PULSE_STATE_TMP_PATH, PULSE_STATE_PATH) != 0) {
@@ -3124,6 +3128,7 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
     int has_act = 0, has_act_attr = 0;
     int has_inact = 0, has_inact_attr = 0;
     int has_suspect = 0;
+    int has_fmt_magic = 0;
     int has_self_written = 0;
 
     while (fgets(line, sizeof(line), f)) {
@@ -3160,6 +3165,9 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
         } else if (strncmp(line, "suspect=", 8) == 0) {
             st_out->suspect = atoi(line + 8);
             has_suspect = 1;
+        } else if (strncmp(line, "fmt_magic=", 10) == 0) {
+            st_out->fmt_magic = (uint32_t)strtoul(line + 10, NULL, 0);
+            has_fmt_magic = 1;
         } else if (strncmp(line, "self_written=", 13) == 0) {
             st_out->self_written = atoi(line + 13);
             has_self_written = 1;
@@ -3175,8 +3183,11 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
     if (!has_suspect) {
         st_out->suspect = 1;
     }
-    /* Ltarget: self_written 缺字段按 0（旧格式快照不可当可信镜像） */
-    if (!has_self_written) {
+    /* P2: 显式格式魔数 + 合法值校验；旧格式/魔数不符/非法值一律降级为不可信镜像 */
+    if (!has_fmt_magic || st_out->fmt_magic != PULSE_STATE_FMT_MAGIC) {
+        st_out->self_written = 0;
+    }
+    if (!has_self_written || (st_out->self_written != 0 && st_out->self_written != 1)) {
         st_out->self_written = 0;
     }
 
@@ -3234,6 +3245,7 @@ static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *i
     memset(st_out, 0, sizeof(*st_out));
     /* Ltarget: 此快照由本进程在写限额前落盘，身份校验通过即视为可信写前值，
      * 60s 窗口结束必须原样恢复（不再用当前 fp 推断"不可信"）。 */
+    st_out->fmt_magic = PULSE_STATE_FMT_MAGIC;
     st_out->self_written = 1;
     st_out->pid = ident->pid;
     if (bid && bid[0]) {
@@ -3346,8 +3358,8 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     int trusted_self = 0;
     if (pulse_load_trusted_state_file(pid, &ident, &state) != 0) {
         mirror_reason = "untrusted";
-    } else if (!state.self_written) {
-        /* 旧格式/非本进程快照：沿用原有可信判定 */
+    } else if (!state.self_written || state.orig_inactive < 0) {
+        /* 旧格式/魔数不符/非法值/非本进程快照：沿用原有可信判定 */
         if (state.orig_inactive <= 0) {
             mirror_reason = "none";
         } else if (state.suspect != 0) {
