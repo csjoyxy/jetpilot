@@ -1481,7 +1481,7 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
 #define PULSE_MAX_N_MIN       60
 #define PULSE_MIN_DAYMAX      1
 #define PULSE_MAX_DAYMAX      100
-#define PULSE_MIN_DELAY_S     3
+#define PULSE_MIN_DELAY_S     0
 #define PULSE_MAX_DELAY_S     20
 #define PULSE_DEFAULT_DELAY_S 10
 #define PULSE_DEADLINE_BG_SEC 25
@@ -1496,7 +1496,7 @@ typedef struct {
     int32_t target_mb;      /* 100..1500 */
     int32_t n_min;          /* 0..60 */
     int32_t daymax;         /* 1..100 */
-    int32_t delay_s;        /* 3..20 秒 (默认 10) */
+    int32_t delay_s;        /* 0..20 秒 (默认 10)；0 = 一进后台就判定 */
 } pulse_rule_t;
 
 #ifndef MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES
@@ -1539,6 +1539,9 @@ typedef struct {
     int32_t  orig_inactive;
     uint32_t orig_inactive_attr;
     int      suspect;
+    /* Ltarget: 1 = orig_* 是本进程在写限额前落盘的可信快照（身份校验通过必须原样恢复）；
+     * 0 = 旧格式/外部来源，沿用旧的 fp 合理性推断。缺字段按 0（fail closed）。 */
+    int      self_written;
 } pulse_saved_state_t;
 
 /* 配置文件状态变更检查通用结构体 (供 restart.txt 与 pulse.txt 共同复用) */
@@ -2962,12 +2965,16 @@ static void pulse_sort_queue(void) {
 /* =========================================================================
  * 后台内存释放：Pulse 写入、回读校验与统一 Restore 实现 (v0.7.8 C2-3)
  * ========================================================================= */
-static inline uint64_t calc_hard_guard_limit(uint64_t fp_mb) {
-    return (fp_mb * 11 + 9) / 10;   /* ceil(fp * 1.1) */
+/* Ltarget 语义（用户拍板）：L = 规则 target_mb；不要求把占用压到 target，
+ * 只要求后台且 fp>=target 时向系统发出信号、把 memlimit_inactive 设为 target。
+ * 去掉原 ceil(fp/0.85) / ceil(fp*1.1) 下限保护；非 FATAL 位、active 属性、
+ * 身份校验与回读校验保持原样（见 :3633-3667）。两函数保留以维持调用点清晰。 */
+static inline uint64_t calc_hard_guard_limit(uint64_t target_mb) {
+    return target_mb;
 }
 
-static inline uint64_t calc_pulse_limit(uint64_t fp_mb) {
-    return (fp_mb * 100 + 84) / 85; /* ceil(fp / 0.85) */
+static inline uint64_t calc_pulse_limit(uint64_t target_mb) {
+    return target_mb;
 }
 
 static inline uint64_t calc_restore_floor(uint64_t fp_mb) {
@@ -3068,6 +3075,7 @@ static int pulse_save_state_file(const pulse_saved_state_t *st) {
     fprintf(f, "orig_inactive=%d\n", st->orig_inactive);
     fprintf(f, "orig_inactive_attr=%u\n", st->orig_inactive_attr);
     fprintf(f, "suspect=%d\n", st->suspect);
+    fprintf(f, "self_written=%d\n", st->self_written);
     /* M1: 统一原子提交——原实现缺 fsync（数据与目录）；O_NOFOLLOW/fchmod 保留 */
     if (jp_atomic_commit(f, PULSE_STATE_TMP_PATH, PULSE_STATE_PATH) != 0) {
         return -1;
@@ -3104,6 +3112,7 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
     int has_act = 0, has_act_attr = 0;
     int has_inact = 0, has_inact_attr = 0;
     int has_suspect = 0;
+    int has_self_written = 0;
 
     while (fgets(line, sizeof(line), f)) {
         char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
@@ -3139,6 +3148,9 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
         } else if (strncmp(line, "suspect=", 8) == 0) {
             st_out->suspect = atoi(line + 8);
             has_suspect = 1;
+        } else if (strncmp(line, "self_written=", 13) == 0) {
+            st_out->self_written = atoi(line + 13);
+            has_self_written = 1;
         }
     }
     fclose(f);
@@ -3150,6 +3162,10 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
     /* R4-a: suspect 字段缺失时 fail closed，按可疑处理 (suspect=1) */
     if (!has_suspect) {
         st_out->suspect = 1;
+    }
+    /* Ltarget: self_written 缺字段按 0（旧格式快照不可当可信镜像） */
+    if (!has_self_written) {
+        st_out->self_written = 0;
     }
 
     if (ident != NULL) {
@@ -3204,6 +3220,9 @@ static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *i
     }
 
     memset(st_out, 0, sizeof(*st_out));
+    /* Ltarget: 此快照由本进程在写限额前落盘，身份校验通过即视为可信写前值，
+     * 60s 窗口结束必须原样恢复（不再用当前 fp 推断"不可信"）。 */
+    st_out->self_written = 1;
     st_out->pid = ident->pid;
     if (bid && bid[0]) {
         snprintf(st_out->bid, sizeof(st_out->bid), "%s", bid);
@@ -3234,6 +3253,30 @@ static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *i
     return 0;
 }
 
+/* Ltarget: 连续 RESTORE_REFUSED/RESTORE_FAILED 必须告警；曾出现"400MB 水位遗留"。
+ * 成功恢复（RESTORE_OK / RESTORE_MIRROR）时清零。这里选择告警而非硬停 daemon，
+ * 避免单次异常让整个 pulse 功能永久停摆（熔断与否交 jpauditor 复审）。 */
+#define PULSE_RESTORE_REFUSE_WARN_N 3
+static int g_pulse_restore_refuse_streak = 0;
+
+static void pulse_note_restore_refused(const char *bid, pid_t pid, const char *reason) {
+    g_pulse_restore_refuse_streak++;
+    if (g_pulse_restore_refuse_streak >= PULSE_RESTORE_REFUSE_WARN_N) {
+        JPLOG(JP_WARN, "%-6s RESTORE_CIRCUIT_OPEN app=%s pid=%d streak=%d last=%s",
+              "PLS", bid ? bid : "", (int)pid, g_pulse_restore_refuse_streak, reason ? reason : "");
+    } else {
+        JPLOG(JP_WARN, "%-6s RESTORE_REFUSED_STREAK app=%s pid=%d streak=%d last=%s",
+              "PLS", bid ? bid : "", (int)pid, g_pulse_restore_refuse_streak, reason ? reason : "");
+    }
+}
+
+static void pulse_clear_restore_refuse_streak(void) {
+    if (g_pulse_restore_refuse_streak != 0) {
+        g_pulse_restore_refuse_streak = 0;
+        JPLOG(JP_INFO, "%-6s RESTORE_REFUSED_STREAK cleared", "PLS");
+    }
+}
+
 /* 统一 Restore 实现函数 (C2-3) */
 static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_t verdict_sz) {
     if (verdict_out && verdict_sz > 0) verdict_out[0] = '\0';
@@ -3242,6 +3285,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (proc_pidpath(pid, path, sizeof(path)) <= 0 || !pulse_is_supported_app(pid, path, bid)) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=validate", bid, (int)pid);
+        pulse_note_restore_refused(bid, pid, "validate");
         return 1;
     }
 
@@ -3250,6 +3294,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (fp_err != 0) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=fp_unreadable", bid, (int)pid);
+        pulse_note_restore_refused(bid, pid, "fp_unreadable");
         return 1;
     }
 
@@ -3257,6 +3302,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (pulse_get_proc_identity(pid, &ident) != 0) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=ident", bid, (int)pid);
+        pulse_note_restore_refused(bid, pid, "ident");
         return 1;
     }
 
@@ -3265,30 +3311,41 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (cur_err != 0) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=get", bid, (int)pid);
+        pulse_note_restore_refused(bid, pid, "get");
         return 1;
     }
 
     pulse_saved_state_t state;
     const char *mirror_reason = NULL;
+    int trusted_self = 0;
     if (pulse_load_trusted_state_file(pid, &ident, &state) != 0) {
         mirror_reason = "untrusted";
-    } else if (state.orig_inactive <= 0) {
-        mirror_reason = "none";
-    } else if (state.suspect != 0) {
-        mirror_reason = "suspect";
+    } else if (!state.self_written) {
+        /* 旧格式/非本进程快照：沿用原有可信判定 */
+        if (state.orig_inactive <= 0) {
+            mirror_reason = "none";
+        } else if (state.suspect != 0) {
+            mirror_reason = "suspect";
+        } else {
+            uint64_t floor_1_2 = calc_restore_floor(fp_mb);
+            int implausible = 0;
+            if ((uint64_t)state.orig_inactive < floor_1_2) {
+                implausible = 1;
+            }
+            if (cur_props.memlimit_active > 0 &&
+                (int64_t)state.orig_inactive * 2 < cur_props.memlimit_active) {
+                implausible = 1;
+            }
+            if (implausible) {
+                mirror_reason = "implausible";
+            }
+        }
     } else {
-        uint64_t floor_1_2 = calc_restore_floor(fp_mb);
-        int implausible = 0;
-        if ((uint64_t)state.orig_inactive < floor_1_2) {
-            implausible = 1;
-        }
-        if (cur_props.memlimit_active > 0 &&
-            (int64_t)state.orig_inactive * 2 < cur_props.memlimit_active) {
-            implausible = 1;
-        }
-        if (implausible) {
-            mirror_reason = "implausible";
-        }
+        /* Ltarget: 本进程写前快照 + 身份校验通过 = 可信。L=target<fp 时
+         * "orig_inactive < ceil(fp*1.2)" 必然命中，旧判定会把写前值误判不可信，
+         * 回退 active 后常见 RESTORE_REFUSED → 永久遗留 target 水位。
+         * 这里强制原样恢复，保证窗口结束回到写前值。 */
+        trusted_self = 1;
     }
 
     int32_t target_inactive = 0;
@@ -3300,6 +3357,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
             (uint64_t)cur_props.memlimit_active <= floor_1_2) {
             if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
             JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=active_low", bid, (int)pid);
+            pulse_note_restore_refused(bid, pid, "active_low");
             return 1;
         }
         target_inactive = cur_props.memlimit_active;
@@ -3376,20 +3434,24 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
             const char *refused_reason = ident_failed ? "ident" : (get_failed ? "get" : "ident");
             if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
             JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=%s", bid, (int)pid, refused_reason);
+            pulse_note_restore_refused(bid, pid, refused_reason);
             return 1;
         }
         if (readback_mismatch) {
             if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED");
             JPLOG(JP_INFO, "RESTORE_FAILED app=%s pid=%d reason=readback", bid, (int)pid);
+            pulse_note_restore_refused(bid, pid, "readback");
             return 1;
         } else {
             if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED");
             JPLOG(JP_INFO, "RESTORE_FAILED app=%s pid=%d reason=retry", bid, (int)pid);
+            pulse_note_restore_refused(bid, pid, "retry");
             return 1;
         }
     }
 
     pulse_clear_state_file(pid);
+    pulse_clear_restore_refuse_streak();
 
     if (mirror_reason != NULL) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_MIRROR");
@@ -3398,7 +3460,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     }
 
     if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_OK");
-    JPLOG(JP_INFO, "RESTORE_OK app=%s pid=%d", bid, (int)pid);
+    JPLOG(JP_INFO, "RESTORE_OK app=%s pid=%d self=%d", bid, (int)pid, trusted_self);
     return 0;
 }
 
@@ -3622,8 +3684,21 @@ static void *pulse_worker_thread(void *arg) {
         goto thread_done;
     }
 
-    uint64_t L = calc_pulse_limit(fp0);
-    uint64_t hard_guard = calc_hard_guard_limit(fp0);
+    /* Ltarget: L = 本规则 target_mb（不再取 fp 的 1.1 / 1.18 倍下限保护）。
+     * 只向系统发出非致命水位信号，不承诺把占用压到 target。 */
+    pulse_rule_t pulse_rule_snap;
+    uint64_t pulse_target_mb = 0;
+    if (pulse_find_rule(bid, &pulse_rule_snap) && pulse_rule_snap.enabled) {
+        pulse_target_mb = (uint64_t)pulse_rule_snap.target_mb;
+    }
+    if (pulse_target_mb == 0) {
+        /* 规则在 worker 期间被删除/关闭：不写任何水位，清理快照后收尾 */
+        JPLOG(JP_INFO, "PULSE_RULE_GONE app=%s pid=%d", bid, (int)pid);
+        pulse_clear_state_file(pid);
+        goto thread_done;
+    }
+    uint64_t L = calc_pulse_limit(pulse_target_mb);
+    uint64_t hard_guard = calc_hard_guard_limit(pulse_target_mb);
     if (L < hard_guard) L = hard_guard;
 
     memorystatus_memlimit_properties_t cur_props;

@@ -8331,7 +8331,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
 
     self.currentTarget = (self.rule.target >= kPulseMinTargetMB && self.rule.target <= kPulseMaxTargetMB) ? self.rule.target : 550;
-    self.currentDelay = (self.rule.delay >= 3 && self.rule.delay <= 20) ? self.rule.delay : 10;
+    self.currentDelay = (self.rule.delay >= 0 && self.rule.delay <= 20) ? self.rule.delay : 10;
     self.currentN = (self.rule.n >= kPulseMinNMin && self.rule.n <= kPulseMaxNMin) ? self.rule.n : 10;
     self.currentDaymax = (self.rule.daymax >= 1 && self.rule.daymax <= 100) ? self.rule.daymax : 30;
     self.isEnabled = self.rule.enabled;
@@ -8376,9 +8376,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
             [self presentViewController:err animated:YES completion:nil];
             return;
         }
-        if (self.currentDelay < 3 || self.currentDelay > 20) {
+        if (self.currentDelay < 0 || self.currentDelay > 20) {
             UIAlertController *err = [UIAlertController alertControllerWithTitle:@"等待时间超出范围"
-                                                                         message:@"后台等待时间必须在 3 到 20 秒之间"
+                                                                         message:@"后台等待时间必须在 0 到 20 秒之间（0 = 一进后台就判定）"
                                                                   preferredStyle:UIAlertControllerStyleAlert];
             [err addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:err animated:YES completion:nil];
@@ -8623,13 +8623,14 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)promptEditDelay {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"设置后台等待时间"
-                                                                   message:@"切后台满这么多秒后释放一次；回前台前不会再动"
+                                                                   message:@"0 = 一进后台就判定；否则切后台满这么多秒后释放一次；回前台前不会再动"
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
-    NSArray<NSNumber *> *options = @[@5, @10, @15, @20];
+    NSArray<NSNumber *> *options = @[@0, @5, @10, @15, @20];
     for (NSNumber *opt in options) {
         NSInteger s = [opt integerValue];
-        NSString *title = [NSString stringWithFormat:@"%ld 秒%@", (long)s, (s == self.currentDelay ? @"（当前）" : (s == 10 ? @"（默认）" : @""))];
+        NSString *suffix = (s == self.currentDelay) ? @"（当前）" : (s == 10 ? @"（默认）" : (s == 0 ? @"（立即）" : @""));
+        NSString *title = [NSString stringWithFormat:@"%ld 秒%@", (long)s, suffix];
         [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
             weakSelf.currentDelay = s;
             [weakSelf.tableView reloadData];
