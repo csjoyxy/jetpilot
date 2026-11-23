@@ -2674,6 +2674,8 @@ typedef struct {
     int     pulse_late_this_bg; /* 1: 本次进入后台期间已超时放弃 (不计入 pulse 统计) (C2-T) */
     char    day_date[16];       /* YYYY-MM-DD 本地日期 */
     int     tripped_today;      /* 1: 当天已熔断 */
+    int     restore_fail_streak; /* P1-3: 当日连续恢复失败/拒绝次数 */
+    int     restore_tripped_today; /* P1-3: 当日因连续恢复失败停止写新水位 */
     int     unresponsive;       /* 1: 标记为对释放无响应 */
     int     total_pulses;       /* 累计 pulse 次数 */
     int     no_drop_pulses;     /* 降幅 <= 5MB 的 pulse 次数 */
@@ -2681,6 +2683,8 @@ typedef struct {
 
 #define PULSE_CTRL_APP_DAYMAX    10
 #define PULSE_CTRL_GLOBAL_DAYMAX 30
+/* P1-3: 同一 bid 当日连续恢复失败达此值即停止为其写新水位（不停 daemon） */
+#define PULSE_RESTORE_CIRCUIT_N  3
 static int g_pulse_ctrl_global_today_count = 0;
 
 static pthread_mutex_t s_pulse_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2729,6 +2733,8 @@ static void pulse_check_date_reset(const char *today_str) {
             g_pulse_app_states[i].day_count = 0;
             g_pulse_app_states[i].ctrl_day_count = 0;
             g_pulse_app_states[i].tripped_today = 0;
+            g_pulse_app_states[i].restore_fail_streak = 0;
+            g_pulse_app_states[i].restore_tripped_today = 0;
             snprintf(g_pulse_app_states[i].day_date, sizeof(g_pulse_app_states[i].day_date), "%s", today_str);
         }
     }
@@ -2788,6 +2794,8 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
     /* 条件 1: pulse.txt 里该 App 为 on，且为受支持的主进程 */
     if (!rule->enabled) return 0;
     if (!pulse_is_supported_app(pid, path, rule->bid)) return 0;
+    /* P1-3: 当日恢复熔断——停止为该 bid 写新水位（调用时持 s_pulse_mutex） */
+    if (st->restore_tripped_today) return 0;
 
     /* 当前档位检查：必须在候选档区间；其他值一律不处理 (M3 / C2-1) */
     if (!jp_is_candidate(cur)) return 0;
@@ -3257,28 +3265,42 @@ static int pulse_get_or_record_initial_state(pid_t pid, const proc_identity_t *i
     return 0;
 }
 
-/* Ltarget: 连续 RESTORE_REFUSED/RESTORE_FAILED 必须告警；曾出现"400MB 水位遗留"。
- * 成功恢复（RESTORE_OK / RESTORE_MIRROR）时清零。这里选择告警而非硬停 daemon，
- * 避免单次异常让整个 pulse 功能永久停摆（熔断与否交 jpauditor 复审）。 */
-#define PULSE_RESTORE_REFUSE_WARN_N 3
-static int g_pulse_restore_refuse_streak = 0;
+/* P1-3: 按 bid 维度的恢复失败计数与当日熔断。覆盖 pulse_do_restore 内所有
+ * REFUSED/FAILED 与 worker 写限额前的全部早退。熔断仅停止为该 App 写新水位，
+ * 不停 daemon；成功恢复清零 streak，但当日熔断状态保持到跨日 reset。 */
+static void pulse_note_restore_failed(const char *bid, pid_t pid, const char *reason) {
+    if (!bid || bid[0] == '\0') return;
+    char today_str[16] = {0};
+    pulse_get_local_date_str(today_str, sizeof(today_str));
 
-static void pulse_note_restore_refused(const char *bid, pid_t pid, const char *reason) {
-    g_pulse_restore_refuse_streak++;
-    if (g_pulse_restore_refuse_streak >= PULSE_RESTORE_REFUSE_WARN_N) {
-        JPLOG(JP_WARN, "%-6s RESTORE_CIRCUIT_OPEN app=%s pid=%d streak=%d last=%s",
-              "PLS", bid ? bid : "", (int)pid, g_pulse_restore_refuse_streak, reason ? reason : "");
-    } else {
-        JPLOG(JP_WARN, "%-6s RESTORE_REFUSED_STREAK app=%s pid=%d streak=%d last=%s",
-              "PLS", bid ? bid : "", (int)pid, g_pulse_restore_refuse_streak, reason ? reason : "");
+    pthread_mutex_lock(&s_pulse_mutex);
+    pulse_app_state_t *st = pulse_get_app_state(bid, today_str);
+    if (st && !st->restore_tripped_today) {
+        st->restore_fail_streak++;
+        if (st->restore_fail_streak >= PULSE_RESTORE_CIRCUIT_N) {
+            st->restore_tripped_today = 1;
+            JPLOG(JP_WARN, "%-6s RESTORE_CIRCUIT_OPEN app=%s pid=%d streak=%d last=%s -> no new watermark today",
+                  "PLS", bid, (int)pid, st->restore_fail_streak, reason ? reason : "");
+        } else {
+            JPLOG(JP_WARN, "%-6s RESTORE_WARN_STREAK app=%s pid=%d streak=%d last=%s",
+                  "PLS", bid, (int)pid, st->restore_fail_streak, reason ? reason : "");
+        }
     }
+    pthread_mutex_unlock(&s_pulse_mutex);
 }
 
-static void pulse_clear_restore_refuse_streak(void) {
-    if (g_pulse_restore_refuse_streak != 0) {
-        g_pulse_restore_refuse_streak = 0;
-        JPLOG(JP_INFO, "%-6s RESTORE_REFUSED_STREAK cleared", "PLS");
+static void pulse_note_restore_ok(const char *bid) {
+    if (!bid || bid[0] == '\0') return;
+    char today_str[16] = {0};
+    pulse_get_local_date_str(today_str, sizeof(today_str));
+
+    pthread_mutex_lock(&s_pulse_mutex);
+    pulse_app_state_t *st = pulse_get_app_state(bid, today_str);
+    if (st && st->restore_fail_streak != 0) {
+        st->restore_fail_streak = 0;
+        JPLOG(JP_INFO, "%-6s RESTORE_WARN_STREAK cleared app=%s", "PLS", bid);
     }
+    pthread_mutex_unlock(&s_pulse_mutex);
 }
 
 /* 统一 Restore 实现函数 (C2-3) */
@@ -3289,7 +3311,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (proc_pidpath(pid, path, sizeof(path)) <= 0 || !pulse_is_supported_app(pid, path, bid)) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=validate", bid, (int)pid);
-        pulse_note_restore_refused(bid, pid, "validate");
+        pulse_note_restore_failed(bid, pid, "validate");
         return 1;
     }
 
@@ -3298,7 +3320,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (fp_err != 0) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=fp_unreadable", bid, (int)pid);
-        pulse_note_restore_refused(bid, pid, "fp_unreadable");
+        pulse_note_restore_failed(bid, pid, "fp_unreadable");
         return 1;
     }
 
@@ -3306,7 +3328,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (pulse_get_proc_identity(pid, &ident) != 0) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=ident", bid, (int)pid);
-        pulse_note_restore_refused(bid, pid, "ident");
+        pulse_note_restore_failed(bid, pid, "ident");
         return 1;
     }
 
@@ -3315,7 +3337,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
     if (cur_err != 0) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=get", bid, (int)pid);
-        pulse_note_restore_refused(bid, pid, "get");
+        pulse_note_restore_failed(bid, pid, "get");
         return 1;
     }
 
@@ -3361,7 +3383,7 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
             (uint64_t)cur_props.memlimit_active <= floor_1_2) {
             if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
             JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=active_low", bid, (int)pid);
-            pulse_note_restore_refused(bid, pid, "active_low");
+            pulse_note_restore_failed(bid, pid, "active_low");
             return 1;
         }
         target_inactive = cur_props.memlimit_active;
@@ -3438,24 +3460,24 @@ static int pulse_do_restore(pid_t pid, const char *bid, char *verdict_out, size_
             const char *refused_reason = ident_failed ? "ident" : (get_failed ? "get" : "ident");
             if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_REFUSED");
             JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=%s", bid, (int)pid, refused_reason);
-            pulse_note_restore_refused(bid, pid, refused_reason);
+            pulse_note_restore_failed(bid, pid, refused_reason);
             return 1;
         }
         if (readback_mismatch) {
             if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED");
             JPLOG(JP_INFO, "RESTORE_FAILED app=%s pid=%d reason=readback", bid, (int)pid);
-            pulse_note_restore_refused(bid, pid, "readback");
+            pulse_note_restore_failed(bid, pid, "readback");
             return 1;
         } else {
             if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_FAILED");
             JPLOG(JP_INFO, "RESTORE_FAILED app=%s pid=%d reason=retry", bid, (int)pid);
-            pulse_note_restore_refused(bid, pid, "retry");
+            pulse_note_restore_failed(bid, pid, "retry");
             return 1;
         }
     }
 
     pulse_clear_state_file(pid);
-    pulse_clear_restore_refuse_streak();
+    pulse_note_restore_ok(bid);
 
     if (mirror_reason != NULL) {
         if (verdict_out) snprintf(verdict_out, verdict_sz, "RESTORE_MIRROR");
@@ -3661,6 +3683,18 @@ static void *pulse_worker_thread(void *arg) {
     }
     pthread_mutex_unlock(&s_pulse_mutex);
 
+    /* P1-3: 恢复熔断二次防线——worker 侧现读，当日已熔断则本次不写任何水位 */
+    pthread_mutex_lock(&s_pulse_mutex);
+    char today_w_str[16] = {0};
+    pulse_get_local_date_str(today_w_str, sizeof(today_w_str));
+    pulse_app_state_t *rst_chk = pulse_get_app_state(bid, today_w_str);
+    int restore_tripped = (rst_chk && rst_chk->restore_tripped_today);
+    pthread_mutex_unlock(&s_pulse_mutex);
+    if (restore_tripped) {
+        JPLOG(JP_INFO, "PULSE_CIRCUIT_SKIP app=%s pid=%d reason=restore_streak", bid, (int)pid);
+        goto thread_done;
+    }
+
     /* 线程开始执行时重新检查条件 (M2) */
     uint64_t reval_fp = 0;
     if (!pulse_revalidate_conditions(pid, bid, &reval_fp)) {
@@ -3670,6 +3704,7 @@ static void *pulse_worker_thread(void *arg) {
     proc_identity_t ident;
     if (pulse_get_proc_identity(pid, &ident) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=ident", bid, (int)pid);
+        pulse_note_restore_failed(bid, pid, "ident");
         goto thread_done;
     }
 
@@ -3678,12 +3713,14 @@ static void *pulse_worker_thread(void *arg) {
     if (state_rc != 0) {
         const char *ref_reason = (state_rc == -1) ? "get" : "state";
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=%s", bid, (int)pid, ref_reason);
+        pulse_note_restore_failed(bid, pid, ref_reason);
         goto thread_done;
     }
 
     uint64_t fp0 = 0;
     if (pulse_get_footprint_mb(pid, &fp0) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=fp_unreadable", bid, (int)pid);
+        pulse_note_restore_failed(bid, pid, "fp_unreadable");
         pulse_clear_state_file(pid);
         goto thread_done;
     }
@@ -3708,6 +3745,7 @@ static void *pulse_worker_thread(void *arg) {
     memorystatus_memlimit_properties_t cur_props;
     if (pulse_get_memlimit_props(pid, &cur_props) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=get", bid, (int)pid);
+        pulse_note_restore_failed(bid, pid, "get");
         pulse_clear_state_file(pid);
         goto thread_done;
     }
@@ -3719,12 +3757,14 @@ static void *pulse_worker_thread(void *arg) {
     proc_identity_t check_ident;
     if (pulse_get_proc_identity(pid, &check_ident) != 0 || !pulse_compare_proc_identity(&ident, &check_ident)) {
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=ident", bid, (int)pid);
+        pulse_note_restore_failed(bid, pid, "ident");
         pulse_clear_state_file(pid);
         goto thread_done;
     }
 
     if (pulse_set_memlimit_props(pid, &new_props) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=set", bid, (int)pid);
+        pulse_note_restore_failed(bid, pid, "set");
         pulse_clear_state_file(pid);
         goto thread_done;
     }
