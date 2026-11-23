@@ -1489,6 +1489,8 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
 #define PULSE_FAST_GATE_POLL_SEC 5
 /* Ltarget: 水位窗口内允许的绝对涨幅下限（再按 fp0/4 取大），替代失效的比例守卫 */
 #define PULSE_LTARGET_GROWTH_CAP_MB 128
+/* P1-1: 有启用 pulse 规则时慢轮周期上限，保证首次进后台 <=20s 被观测 */
+#define PULSE_FIRST_OBSERVE_MAX_SLOW 20
 #define PULSE_GLOBAL_DAYMAX   100
 #define PULSE_DEFAULT_WECHAT_TARGET 550
 
@@ -4672,6 +4674,14 @@ static int pulse_fast_gate_open(time_t now_mono) {
     return open;
 }
 
+/* P1-1: 是否存在启用的 pulse 规则；仅主线程调用（与 pulse 规则数组访问约定一致） */
+static int pulse_any_enabled_rule(void) {
+    for (int i = 0; i < g_npulse_rules; i++) {
+        if (g_pulse_rules[i].enabled) return 1;
+    }
+    return 0;
+}
+
 /* =========================================================================
  * 超内存自动重启：状态持久化与状态机实现 (v0.7.7 C2)
  * ========================================================================= */
@@ -6397,6 +6407,9 @@ int main(int argc, char *argv[]) {
         if (!slow_round_now) {
             /* E1 快轮：不调 proc_pidpath / mempressure_round / write_status */
             fast_round_actions = fast_round();
+            /* P1-2: 门控判定前重载 pulse.txt（内部 stat 去重，未变则零开销），
+             * 避免 App 改配置后 daemon 常驻最长 240s 仍按旧规则写水位。 */
+            pulse_load_config();
             /* D-003 (F1): 门控打开才临时恢复全表，仅跑 pulse 状态推进/候选评估。
              * 拿不到全表时按 S12 用 NULL 调用（pulse_round 安全跳过且不清状态）；
              * 连续 3 次失败回退 LEGACY（每轮慢轮），与 E4 慢轮兜底一致。 */
@@ -6688,6 +6701,14 @@ int main(int argc, char *argv[]) {
                 g_idle_rounds = 0;
                 g_interval    = BACKOFF_BASE_SECS;
                 g_slow_period = SLOW_BASE_SECS;
+            }
+            /* P1-1: 有启用的 pulse 规则时慢轮周期钳到 <=20s——bg_start_mono 只在
+             * pulse_round 内首次观测时设置，不钳周期则首次进后台仍要等 30~240s，
+             * 短后台段完全漏掉。20s < 25s 死线；首次观测后由门控快轮（<=5s）接续。
+             * 省电权衡：pulse 开启期间全表慢轮最多 20s 一次，部分回吐 E2 退避收益；
+             * 无 pulse 规则时维持原 30~240s 不变。 */
+            if (pulse_any_enabled_rule() && g_slow_period > PULSE_FIRST_OBSERVE_MAX_SLOW) {
+                g_slow_period = PULSE_FIRST_OBSERVE_MAX_SLOW;
             }
             /* 慢轮到期时间只在慢轮收尾推进：空转时慢轮仍按 g_slow_period 兜底 */
             if (slow_round_now) g_slow_due_mono = mono_now() + g_slow_period;
