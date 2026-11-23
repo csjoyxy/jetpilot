@@ -1485,6 +1485,8 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
 #define PULSE_MAX_DELAY_S     20
 #define PULSE_DEFAULT_DELAY_S 10
 #define PULSE_DEADLINE_BG_SEC 25
+/* D-003: 门控打开时快轮的唤醒上限，须显著小于 25s 死线，保证窗口内至少多次判定 */
+#define PULSE_FAST_GATE_POLL_SEC 5
 #define PULSE_GLOBAL_DAYMAX   100
 #define PULSE_DEFAULT_WECHAT_TARGET 550
 
@@ -1908,6 +1910,7 @@ static int          g_idle_rounds     = 0;              /* 连续空转轮数（
 static int          g_interval        = BACKOFF_BASE_SECS; /* 亮屏休眠间隔（5→60，E2 退避） */
 static int          g_last_protected_now = -1;          /* 上个慢轮 protected_now 基准（空转判定） */
 static int          g_slow_list_fail_streak = 0;        /* 慢轮 get_list 连续失败计数（LEGACY 触发） */
+static int          g_fast_pulse_list_fail_streak = 0;   /* D-003: 门控快轮为 pulse 取全表连续失败计数 */
 static jp_file_stamp_t s_config_stamp = {0};            /* config.txt 变更戳（E1 慢轮判定） */
 
 static time_t mono_now(void) {
@@ -4544,6 +4547,41 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     }
 }
 
+/* D-003: 门控式快轮 pulse 评估（F1）。
+ * 快轮本身不取全表；仅当"有启用的 pulse 规则，且存在 in_bg、未 pulsed/ctrl/late、
+ * 且距 bg_start < PULSE_DEADLINE_BG_SEC 的候选"时才返回 1，主循环据此临时恢复
+ * 全表并调用 pulse_round。其余快轮继续走省电跳过路径。
+ * 只读现有 pulse_app_state 条目（不新建），单次加锁/解锁，锁内无 return。 */
+static int pulse_fast_gate_open(time_t now_mono) {
+    if (g_npulse_rules <= 0 || g_pulse_cfg_file_absent) return 0;
+
+    int open = 0;
+    pthread_mutex_lock(&s_pulse_mutex);
+    for (int i = 0; i < g_npulse_app_states; i++) {
+        pulse_app_state_t *st = &g_pulse_app_states[i];
+        if (!st->in_bg || st->tracked_pid <= 0 || st->bg_start_mono <= 0) continue;
+        if (st->pulsed_this_bg || st->ctrl_this_bg || st->pulse_late_this_bg) continue;
+
+        int enabled = 0;
+        for (int r = 0; r < g_npulse_rules; r++) {
+            if (g_pulse_rules[r].enabled && strcmp(g_pulse_rules[r].bid, st->bid) == 0) {
+                enabled = 1;
+                break;
+            }
+        }
+        if (!enabled) continue;
+
+        time_t elapsed = now_mono - st->bg_start_mono;
+        /* elapsed<0 视为时钟异常回拨，保守不打开门控 */
+        if (elapsed >= 0 && elapsed < (time_t)PULSE_DEADLINE_BG_SEC) {
+            open = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_pulse_mutex);
+    return open;
+}
+
 /* =========================================================================
  * 超内存自动重启：状态持久化与状态机实现 (v0.7.7 C2)
  * ========================================================================= */
@@ -6264,10 +6302,31 @@ int main(int argc, char *argv[]) {
         protected_entry_t dlist[MAX_PROTECTED_LIST];
         int ndlist = 0;
         int fast_round_actions = 0;
+        int pulse_gate_active = 0;   /* D-003: 本轮门控是否打开（用于约束下一次唤醒间隔） */
 
         if (!slow_round_now) {
             /* E1 快轮：不调 proc_pidpath / mempressure_round / write_status */
             fast_round_actions = fast_round();
+            /* D-003 (F1): 门控打开才临时恢复全表，仅跑 pulse 状态推进/候选评估。
+             * 拿不到全表时按 S12 用 NULL 调用（pulse_round 安全跳过且不清状态）；
+             * 连续 3 次失败回退 LEGACY（每轮慢轮），与 E4 慢轮兜底一致。 */
+            pulse_gate_active = pulse_fast_gate_open(now_mono_start);
+            if (pulse_gate_active) {
+                int pulse_count = 0;
+                memorystatus_priority_entry_t *pulse_list = get_list(&pulse_count);
+                if (pulse_list) {
+                    pulse_round(pulse_list, pulse_count);
+                    free(pulse_list);
+                    g_fast_pulse_list_fail_streak = 0;
+                } else {
+                    pulse_round(NULL, 0);
+                    if (++g_fast_pulse_list_fail_streak >= 3 && !g_fast_mode_env_forced &&
+                        g_fast_mode != FAST_MODE_LEGACY) {
+                        g_fast_mode = FAST_MODE_LEGACY;
+                        JPLOG(JP_WARN, "%-6s fast_pulse_list_fail x3 -> legacy full-scan", "E4");
+                    }
+                }
+            }
         } else {
         int count = 0;
         memorystatus_priority_entry_t *list = get_list(&count);
@@ -6549,12 +6608,17 @@ int main(int argc, char *argv[]) {
         if (g_locked) {
             /* 刚锁屏的前两轮用 10 秒间隔，盖住系统降档的窗口；之后 60 秒 */
             int secs = (g_locked_passes < 2) ? 10 : 60;
+            /* D-003: 门控打开时把锁屏轮询压到 <=5s，保证 25s 死线内多次判定 */
+            if (pulse_gate_active && secs > PULSE_FAST_GATE_POLL_SEC) secs = PULSE_FAST_GATE_POLL_SEC;
             g_locked_passes++;
             lock_changed_prev = wait_lock_change(secs);       /* 解锁会立刻唤醒 */
         } else {
             g_locked_passes = 0;
-            /* E2: 亮屏用退避后的间隔（5~60s）；一锁屏立刻醒来补一轮抬档 */
-            lock_changed_prev = wait_lock_change(g_interval);
+            /* E2: 亮屏用退避后的间隔（5~60s）；一锁屏立刻醒来补一轮抬档
+             * D-003: 门控打开时忽略退避上探，压到 <=5s */
+            int secs = g_interval;
+            if (pulse_gate_active && secs > PULSE_FAST_GATE_POLL_SEC) secs = PULSE_FAST_GATE_POLL_SEC;
+            lock_changed_prev = wait_lock_change(secs);
         }
         /* 注意：锁屏时最长 60 秒才发现 running.flag 被删（停止变慢），
          * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
