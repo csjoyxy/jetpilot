@@ -8469,7 +8469,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         label.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
         label.numberOfLines = 0;
         label.textColor = UIColor.secondaryLabelColor;
-        label.text = @"切到后台时提示 App 释放内存，不会结束 App。";
+        label.text = @"进入后台后按设置向系统发出非致命内存水位信号，不会由我们主动结束 App；系统内存紧张时仍可能按 jetsam 规则终止。";
         [footer addSubview:label];
         [NSLayoutConstraint activateConstraints:@[
             [label.topAnchor constraintEqualToAnchor:footer.topAnchor constant:6],
@@ -8486,7 +8486,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         label.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
         label.numberOfLines = 0;
         label.textColor = UIColor.secondaryLabelColor;
-        label.text = [NSString stringWithFormat:@"后台等待时间：切到后台大约 %ld 秒后释放一次（可能提前几秒）；回前台以前不会再动。\n目标内存：当进入后台且物理内存达到此值时尝试释放。", (long)self.currentDelay];
+        label.text = [NSString stringWithFormat:@"后台等待时间：%ld 秒（0 = 一进后台就判定）。\n目标内存：进入后台且物理内存达到此值时，向系统设置一个非致命后台内存水位；系统可在内存紧张时优先回收，不保证占用下降，也不会由我们主动结束 App（系统紧张时仍可能按 jetsam 规则终止）", (long)self.currentDelay];
         [footer addSubview:label];
         [NSLayoutConstraint activateConstraints:@[
             [label.topAnchor constraintEqualToAnchor:footer.topAnchor constant:6],
@@ -8971,7 +8971,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     pulseNote.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     pulseNote.textColor = UIColor.secondaryLabelColor;
     pulseNote.numberOfLines = 0;
-    pulseNote.text = @"切到后台时提示 App 释放内存，不会结束 App。不支持应用扩展（PlugIns）、系统应用及 Safari 网页进程。";
+    pulseNote.text = @"进入后台后按设置向系统发出非致命内存水位信号，不会由我们主动结束 App；系统内存紧张时仍可能按 jetsam 规则终止。不支持应用扩展（PlugIns）、系统应用及 Safari 网页进程。";
     [self.contentStackView addArrangedSubview:pulseNote];
 
     self.pulseRulesStackView = [UIStackView new];
