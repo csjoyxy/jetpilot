@@ -1487,6 +1487,8 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
 #define PULSE_DEADLINE_BG_SEC 25
 /* D-003: 门控打开时快轮的唤醒上限，须显著小于 25s 死线，保证窗口内至少多次判定 */
 #define PULSE_FAST_GATE_POLL_SEC 5
+/* Ltarget: 水位窗口内允许的绝对涨幅下限（再按 fp0/4 取大），替代失效的比例守卫 */
+#define PULSE_LTARGET_GROWTH_CAP_MB 128
 #define PULSE_GLOBAL_DAYMAX   100
 #define PULSE_DEFAULT_WECHAT_TARGET 550
 
@@ -3932,20 +3934,33 @@ static void *pulse_worker_thread(void *arg) {
             }
         }
 
-        /* 5. 窗口内一旦 fp >= 0.95*L，马上 restore，记 ABORT near_limit */
-        if (cur_fp * 100 >= 95 * L) {
-            JPLOG(JP_INFO, "ABORT near_limit fp=%llu limit=%llu",
-                  (unsigned long long)cur_fp, (unsigned long long)L);
+        /* P0 返工：旧比例守卫按 L≈1.18×fp0 设计；Ltarget 下 L=target 且入队保证
+         * fp>target=L，cur_fp*100>=95*L 首秒恒成立 → ARMED 后立刻 ABORT、水位 1s 撤销。
+         * 现停用比例守卫，改为相对 fp0 的绝对涨幅保护，并保留 60s 定时恢复。 */
+        uint64_t growth = (fp0 / 4 > (uint64_t)PULSE_LTARGET_GROWTH_CAP_MB)
+                          ? fp0 / 4 : (uint64_t)PULSE_LTARGET_GROWTH_CAP_MB;
+        uint64_t runaway_cap = fp0 + growth;
+        if (cur_fp > runaway_cap) {
+            /* 断言：fp>target 时不得出现 t_reach<=1 的 ABORT；若真在首秒触发，
+             * 只能是暴涨异常，打 WARN 供真机核对（正常路径须 60s 或 fp<=target 才结束）。 */
+            if (sec <= 1 && fp0 > pulse_target_mb) {
+                JPLOG(JP_WARN, "PULSE_ASSERT early_abort app=%s pid=%d fp=%llu fp0=%llu cap=%llu",
+                      bid, (int)pid, (unsigned long long)cur_fp,
+                      (unsigned long long)fp0, (unsigned long long)runaway_cap);
+            }
+            JPLOG(JP_INFO, "ABORT runaway fp=%llu cap=%llu",
+                  (unsigned long long)cur_fp, (unsigned long long)runaway_cap);
             end_reason = "ABORT";
             t_reach = sec;
             should_restore = 1;
             break;
         }
 
-        /* 4. 窗口到时间，或者 fp 降到 0.8*L 以下，就按原值 restore */
-        if (cur_fp * 100 < 80 * L) {
-            JPLOG(JP_INFO, "TARGET_REACHED fp=%llu < 0.8*L (%llu)",
-                  (unsigned long long)cur_fp, (unsigned long long)((80 * L) / 100));
+        /* P0 返工：TARGET_REACHED 重定义为 fp 已降到 target 以下（App 自行收敛），
+         * 不再使用 Ltarget 下不可达的 fp<0.8*L。 */
+        if (cur_fp <= pulse_target_mb) {
+            JPLOG(JP_INFO, "TARGET_REACHED fp=%llu <= target=%llu",
+                  (unsigned long long)cur_fp, (unsigned long long)pulse_target_mb);
             end_reason = "TARGET_REACHED";
             t_reach = sec;
             should_restore = 1;
