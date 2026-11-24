@@ -89,6 +89,8 @@ static NSString *const kRestartState         = @"/var/mobile/Library/JetPilot/re
 
 static NSString *const kPulseConfig          = @"/var/mobile/Library/JetPilot/pulse.txt";
 static NSString *const kPulseState           = @"/var/mobile/Library/JetPilot/pulse.state";
+/* DIAG2: 用户可见「测试模式」配置文件（单行 level=off|basic|detailed|full） */
+static NSString *const kDiagConfig           = @"/var/mobile/Library/JetPilot/diag.txt";
 static NSString *const kBgKillConfig         = @"/var/mobile/Library/JetPilot/bgkill.txt";
 static NSString *const kBandsReqPath    = @"/var/mobile/Library/JetPilot/bands.req";
 static NSString *const kBandsReqTmpPath = @"/var/mobile/Library/JetPilot/bands.req.tmp";
@@ -5099,7 +5101,7 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             [entries addObject:@{@"name": @"daemon.log", @"data": logData}];
         }
 
-        // 2. 附带文件：mempressure_state.txt、config.txt、status.txt、restart.txt、restart_state.txt、pulse.txt、pulse.state、bgkill.txt
+        // 2. 附带文件：mempressure_state.txt、config.txt、status.txt、restart.txt、restart_state.txt、pulse.txt、pulse.state、bgkill.txt、diag.txt（测试模式）
         NSArray<NSArray<NSString *> *> *attachFiles = @[
             @[kMemPressureState,     @"mempressure_state.txt"],
             @[kConfig,               @"config.txt"],
@@ -5108,7 +5110,8 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
             @[kRestartState,         @"restart_state.txt"],
             @[kPulseConfig,          @"pulse.txt"],
             @[kPulseState,           @"pulse.state"],
-            @[kBgKillConfig,         @"bgkill.txt"]
+            @[kBgKillConfig,         @"bgkill.txt"],
+            @[kDiagConfig,           @"diag.txt"]   /* DIAG2 */
         ];
 
         for (NSArray<NSString *> *pair in attachFiles) {
@@ -8777,6 +8780,9 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 @property (nonatomic, strong) UIStackView *pulseRulesStackView;
 @property (nonatomic, strong) UIView *addPulseRuleCard;
 
+/* DIAG2: 「测试模式」选择器（off/basic/detailed/full） */
+@property (nonatomic, strong) UIButton *diagLevelButton;
+
 @property (nonatomic, strong) UIView *saveNoticeToast;
 @property (nonatomic, strong) NSTimer *saveNoticeTimer;
 @property (nonatomic, strong) NSTimer *pollingTimer;
@@ -8961,6 +8967,57 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     // Add Rule Card
     self.addRuleCard = [self createAddRuleCard];
     [self.contentStackView addArrangedSubview:self.addRuleCard];
+
+    // DIAG2: 测试模式 header card（与日志页 levelButton 同构），置于「后台释放」之前
+    UIView *diagHeaderCard = [UIView new];
+    diagHeaderCard.translatesAutoresizingMaskIntoConstraints = NO;
+    diagHeaderCard.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    diagHeaderCard.layer.cornerRadius = 12;
+    diagHeaderCard.layer.cornerCurve = kCACornerCurveContinuous;
+    diagHeaderCard.clipsToBounds = YES;
+
+    UIStackView *diagHeaderStack = [UIStackView new];
+    diagHeaderStack.translatesAutoresizingMaskIntoConstraints = NO;
+    diagHeaderStack.axis = UILayoutConstraintAxisVertical;
+    diagHeaderStack.spacing = 6;
+
+    UIStackView *diagLevelRow = [UIStackView new];
+    diagLevelRow.translatesAutoresizingMaskIntoConstraints = NO;
+    diagLevelRow.axis = UILayoutConstraintAxisHorizontal;
+    diagLevelRow.alignment = UIStackViewAlignmentCenter;
+    diagLevelRow.distribution = UIStackViewDistributionEqualSpacing;
+
+    UILabel *diagTitle = [UILabel new];
+    diagTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    diagTitle.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    diagTitle.textColor = UIColor.labelColor;
+    diagTitle.text = @"测试模式";
+
+    self.diagLevelButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.diagLevelButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.diagLevelButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    self.diagLevelButton.showsMenuAsPrimaryAction = YES;
+    [self updateDiagLevelMenu];
+
+    UILabel *diagTip = [UILabel new];
+    diagTip.translatesAutoresizingMaskIntoConstraints = NO;
+    diagTip.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    diagTip.textColor = UIColor.secondaryLabelColor;
+    diagTip.numberOfLines = 0;
+    diagTip.text = @"正常使用即采集触发/未触发数据供事后分析；off 不额外记录，full 最详细。切换后约 5 秒生效。";
+
+    [diagLevelRow addArrangedSubview:diagTitle];
+    [diagLevelRow addArrangedSubview:self.diagLevelButton];
+    [diagHeaderStack addArrangedSubview:diagLevelRow];
+    [diagHeaderStack addArrangedSubview:diagTip];
+    [diagHeaderCard addSubview:diagHeaderStack];
+    [NSLayoutConstraint activateConstraints:@[
+        [diagHeaderStack.topAnchor constraintEqualToAnchor:diagHeaderCard.topAnchor constant:10],
+        [diagHeaderStack.leadingAnchor constraintEqualToAnchor:diagHeaderCard.leadingAnchor constant:16],
+        [diagHeaderStack.trailingAnchor constraintEqualToAnchor:diagHeaderCard.trailingAnchor constant:-16],
+        [diagHeaderStack.bottomAnchor constraintEqualToAnchor:diagHeaderCard.bottomAnchor constant:-10]
+    ]];
+    [self.contentStackView addArrangedSubview:diagHeaderCard];
 
     // Pulse Section (后台释放 - v0.7.8 C2-7 / Q14)
     self.pulseSectionHeaderLabel = [self createSectionHeader:@"后台释放"];
@@ -9176,6 +9233,65 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     self.config = [JPRestartConfig loadFromPath:kRestartConfig];
     self.pulseConfig = [JPPulseConfig loadFromPath:kPulseConfig];
     self.installedApps = [JPInstalledApp scanInstalledApps];
+}
+
+/* DIAG2: 读取 diag.txt 当前等级。严格单行 level=off|basic|detailed|full；
+ * 非法/缺失一律显示 off，且不自动改写文件（保留用户排错现场）。 */
+- (NSString *)diagCurrentLevel {
+    NSError *err = nil;
+    NSString *content = [NSString stringWithContentsOfFile:kDiagConfig encoding:NSUTF8StringEncoding error:&err];
+    if (!content) return @"off";
+    NSString *trimmed = [content stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    for (NSString *v in @[@"off", @"basic", @"detailed", @"full"]) {
+        if ([trimmed isEqualToString:[NSString stringWithFormat:@"level=%@", v]]) return v;
+    }
+    return @"off";
+}
+
+- (void)updateDiagLevelMenu {
+    NSString *current = [self diagCurrentLevel];
+    NSDictionary *titles = @{ @"off":@"OFF", @"basic":@"Basic", @"detailed":@"Detailed", @"full":@"Full" };
+    NSString *display = titles[current] ?: @"OFF";
+    [self.diagLevelButton setTitle:[NSString stringWithFormat:@"%@  ▾", display] forState:UIControlStateNormal];
+
+    NSMutableArray<UIAction *> *actions = [NSMutableArray array];
+    __weak typeof(self) weakSelf = self;
+    for (NSString *key in @[@"off", @"basic", @"detailed", @"full"]) {
+        UIAction *act = [UIAction actionWithTitle:titles[key] image:nil identifier:nil handler:^(__kindof UIAction * _Nonnull action) {
+            [weakSelf selectDiagLevel:key];
+        }];
+        if ([key isEqualToString:current]) act.state = UIMenuElementStateOn;
+        [actions addObject:act];
+    }
+    self.diagLevelButton.menu = [UIMenu menuWithTitle:@"" children:actions];
+}
+
+- (void)selectDiagLevel:(NSString *)newLevel {
+    if (![@[@"off", @"basic", @"detailed", @"full"] containsObject:newLevel]) return;
+    NSError *err = nil;
+    NSString *content = [NSString stringWithFormat:@"level=%@\n", newLevel];
+    BOOL ok = [content writeToFile:kDiagConfig atomically:YES encoding:NSUTF8StringEncoding error:&err];
+
+    /* 写后 lstat 复核：普通文件 / uid 0 / 组其他不可写（与 daemon jp_secure_precheck 同约束）。
+     * atomic rename 每次换 inode，daemon stat 去重可感知；失败回滚选中项并弹窗。 */
+    if (ok) {
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:kDiagConfig error:&err];
+        NSNumber *uid = [attrs objectForKey:NSFileOwnerAccountID];
+        BOOL regular = [[attrs fileType] isEqualToString:NSFileTypeRegular];
+        ok = regular && (uid.unsignedIntValue == 0) && (([attrs fileAttributes] & 0022) == 0);
+        if (!ok) {
+            err = [NSError errorWithDomain:@"JPDiag" code:1
+                                  userInfo:@{NSLocalizedDescriptionKey:@"diag.txt 不是合法的特权普通文件"}];
+        }
+    }
+    [self updateDiagLevelMenu];
+    if (!ok) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"保存失败"
+                                                                       message:[NSString stringWithFormat:@"测试模式保存失败：%@", err.localizedDescription ?: @"写入错误"]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+    }
 }
 
 - (BOOL)saveConfig {
