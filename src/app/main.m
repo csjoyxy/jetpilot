@@ -810,6 +810,8 @@ static const NSInteger kPulseMinTargetMB = 100;
 static const NSInteger kPulseMaxTargetMB = 1500;
 static const NSInteger kPulseMinNMin = 0;
 static const NSInteger kPulseMaxNMin = 60;
+static const NSInteger kPulseMinDelayS = 0;
+static const NSInteger kPulseMaxDelayS = 20;
 
 @interface JPPulseRule : NSObject
 @property (nonatomic, copy) NSString *bid;
@@ -990,7 +992,7 @@ static const NSInteger kPulseMaxNMin = 60;
                 valDaymax = (NSInteger)v;
                 hasDaymax = YES;
             } else if ([key isEqualToString:@"delay_s"]) {
-                if (hasDelay || v < 3 || v > 20) { bad = YES; break; }
+                if (hasDelay || v < kPulseMinDelayS || v > kPulseMaxDelayS) { bad = YES; break; }
                 valDelay = (NSInteger)v;
                 hasDelay = YES;
             } else if ([key isEqualToString:@"delay"]) {
@@ -1214,13 +1216,14 @@ static const NSInteger kBgKillMaxRules = 32;
 @property (nonatomic, copy) NSString *rawText;
 @property (nonatomic, strong) JPBgKillRule *rule;
 @property (nonatomic, assign) BOOL isGlobalLine;
+@property (nonatomic, assign) BOOL isBandGateLine;
 @property (nonatomic, assign) BOOL isUnknownOrComment;
 - (BOOL)isCommentOrEmpty;
 @end
 
 @implementation JPBgKillLine
 - (BOOL)isCommentOrEmpty {
-    if (self.isGlobalLine) return NO;
+    if (self.isGlobalLine || self.isBandGateLine) return NO;
     if (!self.isUnknownOrComment) return NO;
     NSString *trimmed = [self.rawText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
     return (trimmed.length == 0 || [trimmed hasPrefix:@"#"]);
@@ -1282,6 +1285,7 @@ static const NSInteger kBgKillMaxRules = 32;
     NSArray<NSString *> *rawLines = [toSplit componentsSeparatedByString:@"\n"];
 
     BOOL seenGlobal = NO;
+    BOOL seenBandGate = NO;
 
     for (NSString *rawLine in rawLines) {
         NSString *trimmed = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
@@ -1315,6 +1319,27 @@ static const NSInteger kBgKillMaxRules = 32;
                 continue;
             } else {
                 /* global 写了两次，或值不是 on 和 off，都按坏行处理，总开关保持 on */
+                JPBgKillLine *l = [JPBgKillLine new];
+                l.isUnknownOrComment = YES;
+                l.rawText = rawLine;
+                [cfg.lines addObject:l];
+                continue;
+            }
+        }
+
+        /* T3-IMP 3.2: 守护进程支持单行控制字 bandgate=0|1，App 端同步识别并原样保留
+         *（与守护进程 bandgate_count++ 对齐：一旦出现过 bandgate= 行即占位，后续重复均按坏行处理） */
+        if (tokens.count > 0 && [tokens[0] hasPrefix:@"bandgate="]) {
+            BOOL firstBandGate = !seenBandGate;
+            seenBandGate = YES;
+            if (firstBandGate && tokens.count == 1 &&
+                ([tokens[0] isEqualToString:@"bandgate=0"] || [tokens[0] isEqualToString:@"bandgate=1"])) {
+                JPBgKillLine *l = [JPBgKillLine new];
+                l.isBandGateLine = YES;
+                l.rawText = rawLine;
+                [cfg.lines addObject:l];
+                continue;
+            } else {
                 JPBgKillLine *l = [JPBgKillLine new];
                 l.isUnknownOrComment = YES;
                 l.rawText = rawLine;
@@ -1435,7 +1460,7 @@ static const NSInteger kBgKillMaxRules = 32;
             NSString *gLine = [NSString stringWithFormat:@"global %@", self.isGlobalEnabled ? @"on" : @"off"];
             [outputLines addObject:gLine];
             l.rawText = gLine;
-        } else if (l.isUnknownOrComment || !l.rule) {
+        } else if (l.isBandGateLine || l.isUnknownOrComment || !l.rule) {
             [outputLines addObject:l.rawText ?: @""];
         } else {
             JPBgKillRule *r = l.rule;
@@ -1484,11 +1509,33 @@ static const NSInteger kBgKillMaxRules = 32;
     if (!rule || !bid || bid.length == 0) return;
     rule.bid = bid;
 
+    /* 优先按指针精确匹配（避免重复 bid 规则编辑第 2 条时误覆写第 1 条） */
+    for (NSUInteger i = 0; i < self.lines.count; i++) {
+        JPBgKillLine *l = self.lines[i];
+        if (!l.isUnknownOrComment && l.rule == rule) {
+            rule.lineIndex = (NSInteger)i;
+            if ([self.rules indexOfObjectIdenticalTo:rule] == NSNotFound) {
+                [self.rules addObject:rule];
+            }
+            [self updateDuplicateRules];
+            return;
+        }
+    }
+
     for (NSUInteger i = 0; i < self.lines.count; i++) {
         JPBgKillLine *l = self.lines[i];
         if (!l.isUnknownOrComment && l.rule && [l.rule.bid isEqualToString:bid]) {
+            JPBgKillRule *oldRule = l.rule;
             l.rule = rule;
             rule.lineIndex = (NSInteger)i;
+            if (oldRule != rule) {
+                NSUInteger rIdx = [self.rules indexOfObjectIdenticalTo:oldRule];
+                if (rIdx != NSNotFound) {
+                    self.rules[rIdx] = rule;
+                } else {
+                    [self.rules addObject:rule];
+                }
+            }
             [self updateDuplicateRules];
             return;
         }
@@ -1497,7 +1544,16 @@ static const NSInteger kBgKillMaxRules = 32;
     if (rule.lineIndex >= 0 && (NSUInteger)rule.lineIndex < self.lines.count) {
         JPBgKillLine *l = self.lines[(NSUInteger)rule.lineIndex];
         if (!l.isUnknownOrComment && l.rule) {
+            JPBgKillRule *oldRule = l.rule;
             l.rule = rule;
+            if (oldRule != rule) {
+                NSUInteger rIdx = [self.rules indexOfObjectIdenticalTo:oldRule];
+                if (rIdx != NSNotFound) {
+                    self.rules[rIdx] = rule;
+                } else {
+                    [self.rules addObject:rule];
+                }
+            }
             [self updateDuplicateRules];
             return;
         }
@@ -3837,7 +3893,7 @@ static BOOL RuleMatchesProcess(JPRule *rule, NSString *procName, NSArray<JPInsta
         [tip.trailingAnchor constraintEqualToAnchor:self.emptyView.trailingAnchor constant:-24],
     ]];
 
-    if (!self.userAppsOnly || self.isRestartPicker) {
+    if (!self.userAppsOnly || self.isRestartPicker || self.isPulsePicker || self.isBgKillPicker) {
         [NSLayoutConstraint activateConstraints:@[
             [manualBtn.topAnchor constraintEqualToAnchor:tip.bottomAnchor constant:16],
             [manualBtn.centerXAnchor constraintEqualToAnchor:self.emptyView.centerXAnchor],
@@ -4989,13 +5045,40 @@ static NSData *JPCreateZipArchive(NSArray<NSDictionary *> *entries) {
     NSData *data = [handle readDataToEndOfFile];
     [handle closeFile];
 
+    /* 截断读取时先在原始字节层丢弃首行残行（0x0A 永不出现在多字节 UTF-8 续字节中），
+     * 避免 seek 落在多字节字符中间导致整块 UTF-8 解码失败回退 Latin-1 乱码。 */
+    BOOL trimmedFirstLine = NO;
+    if (seeked && data.length > 0) {
+        const uint8_t *bytes = (const uint8_t *)data.bytes;
+        NSUInteger len = data.length;
+        NSUInteger nlIdx = NSNotFound;
+        for (NSUInteger i = 0; i < len; i++) {
+            if (bytes[i] == '\n') {
+                nlIdx = i;
+                break;
+            }
+        }
+        if (nlIdx != NSNotFound && nlIdx + 1 < len) {
+            data = [data subdataWithRange:NSMakeRange(nlIdx + 1, len - (nlIdx + 1))];
+            trimmedFirstLine = YES;
+        } else {
+            NSUInteger skip = 0;
+            while (skip < len && skip < 3 && (bytes[skip] & 0xC0) == 0x80) {
+                skip++;
+            }
+            if (skip > 0 && skip < len) {
+                data = [data subdataWithRange:NSMakeRange(skip, len - skip)];
+            }
+        }
+    }
+
     NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!text) {
         text = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding] ?: @"";
     }
 
-    if (seeked) {
-        /* 丢掉第一行残行再显示 */
+    if (seeked && !trimmedFirstLine) {
+        /* 兜底：若前面未能按换行裁剪（例如整块无后续行），保留既有首行裁切 */
         NSRange firstNewline = [text rangeOfString:@"\n"];
         if (firstNewline.location != NSNotFound && firstNewline.location + 1 < text.length) {
             text = [text substringFromIndex:firstNewline.location + 1];
@@ -5803,7 +5886,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
     NSFileManager *fm = NSFileManager.defaultManager;
     [fm createDirectoryAtPath:kDir withIntermediateDirectories:YES
-                   attributes:@{NSFilePosixPermissions: @0777} error:nil];
+                   attributes:@{NSFilePosixPermissions: @0755} error:nil];
     if (![fm fileExistsAtPath:kConfig]) {
         [DefaultConfig() writeToFile:kConfig atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
@@ -7977,6 +8060,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
                installedApps:(NSArray<JPInstalledApp *> *)apps
                     appState:(JPPulseAppState *)appState;
 - (void)updateStatus;
+- (void)updateStatusWithStatusInfo:(JPStatusInfo *)statusInfo restartConfig:(JPRestartConfig *)restartCfg;
 @end
 
 @implementation JPPulseRuleCardView
@@ -8159,18 +8243,23 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 }
 
 - (void)updateStatus {
-    JPRestartConfig *restartCfg = [JPRestartConfig loadFromPath:kRestartConfig];
-    JPRestartRule *rst = [restartCfg ruleForBundleId:self.rule.bid];
+    [self updateStatusWithStatusInfo:nil restartConfig:nil];
+}
+
+- (void)updateStatusWithStatusInfo:(JPStatusInfo *)statusInfo restartConfig:(JPRestartConfig *)restartCfg {
+    JPRestartConfig *effectiveRestartCfg = restartCfg ?: [JPRestartConfig loadFromPath:kRestartConfig];
+    JPRestartRule *rst = [effectiveRestartCfg ruleForBundleId:self.rule.bid];
     BOOL rstActive = (self.rule.enabled && rst && rst.isEnabled && rst.thr > 0);
     BOOL targetBlocked = rstActive && (self.rule.target >= rst.thr);
     BOOL targetNear = rstActive && (!targetBlocked) && (rst.thr - self.rule.target < 200);
 
-    JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
-    JPPulseAppState *ast = (st && self.rule.bid.length > 0) ? st.pulseAppStates[self.rule.bid] : nil;
-    if (!ast) {
-        ast = self.appState;
-    } else {
+    JPStatusInfo *st = statusInfo ?: [JPStatusInfo loadCurrentStatus];
+    JPPulseAppState *ast = nil;
+    if (st) {
+        ast = (self.rule.bid.length > 0) ? st.pulseAppStates[self.rule.bid] : nil;
         self.appState = ast;
+    } else {
+        ast = self.appState;
     }
 
     if (!self.rule.enabled) {
@@ -8782,6 +8871,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 /* DIAG2: 「测试模式」选择器（off/basic/detailed/full） */
 @property (nonatomic, strong) UIButton *diagLevelButton;
+@property (nonatomic, copy) NSString *lastDiagLevel;
 
 @property (nonatomic, strong) UIView *saveNoticeToast;
 @property (nonatomic, strong) NSTimer *saveNoticeTimer;
@@ -9250,6 +9340,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
 - (void)updateDiagLevelMenu {
     NSString *current = [self diagCurrentLevel];
+    self.lastDiagLevel = current;
     NSDictionary *titles = @{ @"off":@"OFF", @"basic":@"Basic", @"detailed":@"Detailed", @"full":@"Full" };
     NSString *display = titles[current] ?: @"OFF";
     [self.diagLevelButton setTitle:[NSString stringWithFormat:@"%@  ▾", display] forState:UIControlStateNormal];
@@ -9451,6 +9542,20 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     self.restartSupport = running && st.restartSupport;
     self.pulseSupport = running && st.pulseSupport;
+
+    /* 同步测试模式按钮（仅当文件等级变化时重建菜单，避免 3s 轮询闪烁/关闭已展开菜单） */
+    NSString *curDiag = [self diagCurrentLevel];
+    if (![curDiag isEqualToString:self.lastDiagLevel]) {
+        [self updateDiagLevelMenu];
+    }
+
+    /* 复用本次加载的 st 与 self.config 刷新全部释放规则卡片（消除 N+1 读盘，同步熔断/冷却与当日次数） */
+    for (UIView *v in self.pulseRulesStackView.arrangedSubviews) {
+        if ([v isKindOfClass:[JPPulseRuleCardView class]]) {
+            JPPulseRuleCardView *card = (JPPulseRuleCardView *)v;
+            [card updateStatusWithStatusInfo:st restartConfig:self.config];
+        }
+    }
 
     NSString *appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.7.8";
     NSString *appCommit = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"JPGitCommit"] ?: @"";
@@ -11081,7 +11186,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
     NSUInteger visibleCardsCount = 0;
     for (JPBgKillLine *line in self.config.lines) {
-        if (!line.isCommentOrEmpty && !line.isGlobalLine) {
+        if (!line.isCommentOrEmpty && !line.isGlobalLine && !line.isBandGateLine) {
             visibleCardsCount++;
         }
     }
@@ -11139,7 +11244,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
 
     JPDaemonState dState = [JPDaemonManager daemonStateWithLastSpawnTime:self.lastSpawnTime];
     BOOL running = (dState == JPDaemonStateRunning);
-    self.deadBanner.hidden = running;
+    self.deadBanner.hidden = (dState != JPDaemonStateDead);
 
     JPStatusInfo *st = [JPStatusInfo loadCurrentStatus];
     NSString *appVersion = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"0.8.0";
