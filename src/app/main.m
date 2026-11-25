@@ -8182,7 +8182,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         self.statusLabel.textColor = UIColor.systemRedColor;
         self.alpha = 1.0;
     } else if (ast.trippedToday) {
-        self.statusLabel.text = @"⚠️ 今日已熔断（切后台后异常退出）";
+        self.statusLabel.text = @"⚠️ 熔断保护中：后台异常退出后约 2 小时不释放；再次触发将持续到今日结束";
         self.statusLabel.textColor = UIColor.systemRedColor;
         self.alpha = 1.0;
     } else if (targetBlocked) {

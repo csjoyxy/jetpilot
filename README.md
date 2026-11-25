@@ -139,6 +139,7 @@ v0.7.7 真机验收通过后发版（main `cf0bde8`，tag `v0.7.7`）。
 
 ## 10. 版本历史
 
+- **v0.8.5**（2026-11-25，第一批预览包/非发版）：熔断粒度由「当天布尔」改为「首次 GONE 冷却 2 小时 + 冷却过期后同 bid 再次 GONE 升级到当日结束」，新增 `circuit_cooldown` / `circuit_escalated` 原因码；恢复失败熔断 `restore_tripped_today` 与两道门不变。日志 PLS_SKIP 增「首因 + 终态因」双槽与 `PLS_FINAL` 行（`too_late` / `fp_below_target` / `gone` / 冷却码不再被闩锁吞掉，去重与预算不变）；`PLS_SKIP elapsed=-1` 统一渲染 `NA`（`PULSE_LATE` 真实耗时不动）；`respondsToSelector:` 的 `objc_msgSend` 函数指针返回类型 `intptr_t`→`bool`。App 文案同步为冷却口径。本版为沙箱构建的预览包，App 侧编译待 CI、真机验收待用户侧。
 - **v0.8.4**（2026-11-25）：新增用户可见「测试模式」四档日志（`off` / `basic` / `detailed` / `full`，由 `diag.txt` 配置，配置与 stat 去重感知）；PULSE 升级 v=2 汇总与 PLS_SKIP 全 reason 码闩锁去重，新增 PLS_CFG/STATE/CIRCUIT/OVERRIDE/STAGE/SAMPLE 与 DIAG_STATS 统计；修复本次测试模式保存失败（去掉 `diag.txt` 的 root 属主要求，App 端保留 regular + `(mode & 0022)==0` 复核、daemon 端改用专用只读预检）及 main.m 编译错误。真机 8 小时高频日志验证通过：0 early_abort / 0 PULSE_LATE / 0 unresponsive，日志体积约 50KB/24h 推算。
 - **v0.8.1**（2026-11-22）：P0-1 root 写路径统一安全加固——所有 root 落盘文件经 `jp_secure_precheck` / `jp_secure_fd_check` 双重校验（防符号链接 `O_NOFOLLOW` + root 属主与组/其他不可写），保留 M1 原子提交；CI 门禁 UNVERIFIED 改硬失败（移除 `--allow-unverified`，`set -euo pipefail` + grep 吞错修复）；远端批次 0–2：H1 并发原子性 / H2 规则数组撕裂读（读写锁）/ M1 全写点原子写 + fsync，省电优化（快慢双节奏扫描 / 定向查询 / 自适应退避 / status 按需写），九场景回归测试 harness 入库 `tests/`。
 - **v0.8.0**（2026-11-20）：删除 E 规则；新增后台定时清理（按后台时长自动结束）；后台释放支持限额被改写后重设一次。

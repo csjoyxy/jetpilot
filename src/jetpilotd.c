@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
@@ -231,7 +232,7 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define BANDS_TAKEN_PATH CONFIG_DIR "/bands.req.taken"
 #define BANDS_PATH       CONFIG_DIR "/bands.txt"
 #define BANDS_TMP_PATH   CONFIG_DIR "/bands.txt.tmp"
-#define JP_VERSION   "0.8.4"
+#define JP_VERSION   "0.8.5"
 #ifndef JP_COMMIT
 #define JP_COMMIT    "dev"
 #endif
@@ -347,6 +348,9 @@ enum { DIAG_OFF = 0, DIAG_BASIC = 1, DIAG_DETAILED = 2, DIAG_FULL = 3 };
 #define DSK_OVER_RESTART_THR  "over_restart_thr"
 #define DSK_TOO_LATE          "too_late"
 #define DSK_CIRCUIT_TRIPPED   "circuit_tripped"
+#define DSK_CIRCUIT_COOLDOWN  "circuit_cooldown"
+#define DSK_CIRCUIT_ESCALATED "circuit_escalated"
+#define DSK_GONE              "gone"
 #define DSK_COOLDOWN          "cooldown"
 #define DSK_DAYMAX            "daymax"
 #define DSK_GLOBAL_CAP        "global_cap"
@@ -2920,6 +2924,14 @@ static int pulse_load_config(void) {
 /* =========================================================================
  * 后台内存释放：档位判定、状态跟踪与触发条件校验 (v0.7.8 C2-1)
  * ========================================================================= */
+/* BL-010: 熔断由「当日布尔」改为「冷却 + 重复升级」状态机。
+ * 全部为内存态，与 DIAG 观测字段同级，不写入 pulse_saved_state_t 磁盘结构。 */
+typedef enum {
+    CIRCUIT_NONE = 0,
+    CIRCUIT_COOLDOWN = 1,
+    CIRCUIT_ESCALATED = 2
+} pulse_circuit_level_t;
+
 typedef struct {
     char    bid[128];
     pid_t   tracked_pid;
@@ -2935,7 +2947,11 @@ typedef struct {
     int     ctrl_day_count;     /* 当天已采对照组次数 (每天上限 10) (M5 / Q2) */
     int     pulse_late_this_bg; /* 1: 本次进入后台期间已超时放弃 (不计入 pulse 统计) (C2-T) */
     char    day_date[16];       /* YYYY-MM-DD 本地日期 */
-    int     tripped_today;      /* 1: 当天已熔断 */
+    /* BL-010: 熔断冷却状态机（内存态）；tripped_today 由三字段替代。 */
+    time_t                tripped_until;        /* wall-clock epoch；0=无熔断。唯一权威"到点"字段 */
+    time_t                tripped_until_mono;   /* CLOCK_MONOTONIC 秒；仅 COOLDOWN 期设，防墙上钟前跳缩短安全窗；0=无 */
+    pulse_circuit_level_t circuit_level;        /* 供原因码/升级判定使用 */
+    int                   cooldowns_today;      /* 当日已开冷却次数；冷却过期后仍保留，作为"升级资格"标记 */
     int     restore_fail_streak; /* P1-3: 当日连续恢复失败/拒绝次数 */
     int     restore_tripped_today; /* P1-3: 当日因连续恢复失败停止写新水位 */
     int     unresponsive;       /* 1: 标记为对释放无响应 */
@@ -2953,6 +2969,10 @@ typedef struct {
 #define PULSE_CTRL_GLOBAL_DAYMAX 30
 /* P1-3: 同一 bid 当日连续恢复失败达此值即停止为其写新水位（不停 daemon） */
 #define PULSE_RESTORE_CIRCUIT_N  3
+/* BL-010: 首次 GONE 的冷却时长（秒）。QA 预览包可临时改短压缩等待，合入前必须恢复 7200。 */
+#define PULSE_CIRCUIT_COOLDOWN_SEC 7200
+/* BL-010 行为回退开关：置 1 则首次 GONE 直接走 CIRCUIT_ESCALATED（全天），等价 v0.8.4。 */
+#define PULSE_CIRCUIT_LEGACY_ALLDAY 0
 static int g_pulse_ctrl_global_today_count = 0;
 
 static pthread_mutex_t s_pulse_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2976,8 +2996,18 @@ static void pulse_write_status(FILE *m) {
     }
     for (int i = 0; i < g_npulse_app_states; i++) {
         pulse_app_state_t *st = &g_pulse_app_states[i];
-        fprintf(m, "pulse_app=%s|%d|%d|%d\n",
-                st->bid, st->day_count, st->tripped_today, st->unresponsive);
+        time_t now_wall = time(NULL);
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        time_t now_mono = ts.tv_sec;
+        /* 第 3 字段保持派生 0/1 active 布尔（旧 App parts[2]==1 兼容）。
+         * active = circuit 有状态且 wall/mono 双截止尚未同时过期。 */
+        int circuit_active = (st->circuit_level != CIRCUIT_NONE) &&
+            ((st->tripped_until > 0 && st->tripped_until > now_wall) ||
+             (st->tripped_until_mono > 0 && st->tripped_until_mono > now_mono));
+        fprintf(m, "pulse_app=%s|%d|%d|%d|%ld\n",
+                st->bid, st->day_count, circuit_active ? 1 : 0, st->unresponsive,
+                (long)(st->tripped_until > 0 ? st->tripped_until : 0));
     }
     pthread_mutex_unlock(&s_pulse_mutex);
 }
@@ -2987,6 +3017,65 @@ static void pulse_get_local_date_str(char *buf, size_t sz) {
     struct tm tm_val;
     localtime_r(&t, &tm_val);
     strftime(buf, sz, "%Y-%m-%d", &tm_val);
+}
+
+/* BL-010 跨日处理（调用点均持 s_pulse_mutex，函数内不写日志避免锁嵌套）：
+ * ESCALATED → NONE（当日剩余熔断到期）；COOLDOWN 跨午夜保留到原双截止；
+ * 一律 cooldowns_today=0（新日首次 GONE 仍是 2h 冷却，不会立即全天封）。 */
+static void pulse_circuit_on_new_day(pulse_app_state_t *st) {
+    if (st->circuit_level == CIRCUIT_ESCALATED) {
+        st->circuit_level = CIRCUIT_NONE;
+        st->tripped_until = 0;
+        st->tripped_until_mono = 0;
+    }
+    st->cooldowns_today = 0;
+}
+
+/* BL-010 惰性判定（纯只读、不加锁、不改状态；调用点沿用各自既有锁约定）：
+ * active = circuit 有状态且 wall/mono 双截止尚未"同时"过期（任一未过即 active）。
+ * 返回 active 时应发的 skip 原因码；非 active 返回 NULL（两道门据此放行）。 */
+static const char *pulse_circuit_skip_reason(const pulse_app_state_t *st,
+                                             time_t now_wall, time_t now_mono) {
+    if (!st || st->circuit_level == CIRCUIT_NONE) return NULL;
+    int wall_active = (st->tripped_until > 0 && st->tripped_until > now_wall);
+    int mono_active = (st->tripped_until_mono > 0 && st->tripped_until_mono > now_mono);
+    if (!wall_active && !mono_active) return NULL;
+    return (st->circuit_level == CIRCUIT_ESCALATED) ? DSK_CIRCUIT_ESCALATED
+                                                    : DSK_CIRCUIT_COOLDOWN;
+}
+
+/* BL-010 状态迁移：一次 GONE 命中后的置位（调用点持 s_pulse_mutex）。
+ * 返回本次处于的 circuit 原因码，供 PLS_CIRCUIT/日志判读使用。 */
+static const char *pulse_circuit_on_gone(pulse_app_state_t *st,
+                                         time_t now_wall, time_t now_mono) {
+    const char *cir = pulse_circuit_skip_reason(st, now_wall, now_mono);
+    /* ARCH §1.3：已 ESCALATED 不变；COOLDOWN 仍在冷却期不变、不重复计数；
+     * COOLDOWN 且双截止已过、cooldowns_today>=1 升级到当日结束（S2 上界）；
+     * 其余（NONE / 跨日资格已清零）开 PULSE_CIRCUIT_COOLDOWN_SEC 的冷却。 */
+    int escalate = (st->circuit_level == CIRCUIT_COOLDOWN && cir == NULL && st->cooldowns_today >= 1);
+#if PULSE_CIRCUIT_LEGACY_ALLDAY
+    escalate = 1;  /* 行为回退：首次 GONE 也直接全天熔断，等价 v0.8.4 */
+#endif
+    if (st->circuit_level != CIRCUIT_ESCALATED) {
+        if (escalate) {
+            struct tm tm_end;
+            localtime_r(&now_wall, &tm_end);
+            tm_end.tm_hour = 23; tm_end.tm_min = 59; tm_end.tm_sec = 59;
+            tm_end.tm_isdst = -1;
+            time_t eod = mktime(&tm_end);
+            if (eod <= now_wall) eod = now_wall + 1;  /* 安全兜底，绝不超过现在 */
+            st->circuit_level = CIRCUIT_ESCALATED;
+            st->tripped_until = eod;
+            st->tripped_until_mono = 0;  /* ESCALATED 只按墙上钟到当日结束 */
+        } else if (!(st->circuit_level == CIRCUIT_COOLDOWN && cir != NULL)) {
+            st->circuit_level = CIRCUIT_COOLDOWN;
+            st->tripped_until = now_wall + PULSE_CIRCUIT_COOLDOWN_SEC;
+            st->tripped_until_mono = now_mono + PULSE_CIRCUIT_COOLDOWN_SEC;
+            st->cooldowns_today++;  /* 首次=1；跨日资格归零后新日首次=1 */
+        }
+    }
+    return (st->circuit_level == CIRCUIT_ESCALATED) ? DSK_CIRCUIT_ESCALATED
+                                                    : DSK_CIRCUIT_COOLDOWN;
 }
 
 static void pulse_check_date_reset(const char *today_str) {
@@ -3000,7 +3089,7 @@ static void pulse_check_date_reset(const char *today_str) {
         for (int i = 0; i < g_npulse_app_states; i++) {
             g_pulse_app_states[i].day_count = 0;
             g_pulse_app_states[i].ctrl_day_count = 0;
-            g_pulse_app_states[i].tripped_today = 0;
+            pulse_circuit_on_new_day(&g_pulse_app_states[i]);
             g_pulse_app_states[i].restore_fail_streak = 0;
             g_pulse_app_states[i].restore_tripped_today = 0;
             snprintf(g_pulse_app_states[i].day_date, sizeof(g_pulse_app_states[i].day_date), "%s", today_str);
@@ -3017,7 +3106,7 @@ static pulse_app_state_t *pulse_get_app_state(const char *bid, const char *today
             if (strcmp(g_pulse_app_states[i].day_date, today_str) != 0) {
                 g_pulse_app_states[i].day_count = 0;
                 g_pulse_app_states[i].ctrl_day_count = 0;
-                g_pulse_app_states[i].tripped_today = 0;
+                pulse_circuit_on_new_day(&g_pulse_app_states[i]);
                 snprintf(g_pulse_app_states[i].day_date, sizeof(g_pulse_app_states[i].day_date), "%s", today_str);
             }
             return &g_pulse_app_states[i];
@@ -3047,18 +3136,38 @@ static int pulse_get_footprint_mb(pid_t pid, uint64_t *fp_mb_out) {
     return rc;
 }
 
-/* DIAG2: PLS_SKIP 单槽闩锁 —— 每 (bid,bg_session) 仅首个未触发原因获胜，
- * 后续原因只累加 diag_dropped；通用去重键仍为 bid|bg_session|reason。 */
+/* DIAG2: PLS_SKIP 闩锁 —— 每 (bid,bg_session) 保留「首因 + 终态因」双槽。
+ * 首因仍按 bid 闩锁、后续同段原因照旧只累加 diag_dropped；但终态原因
+ * (too_late/fp_below_target/gone/circuit_cooldown/circuit_escalated) 在首因
+ * 之外时，额外发一条 PLS_FINAL 供日志判读，且走既有三闸/去重，不改预算。 */
 #define DIAG_SKIP_LATCH_N 16
-typedef struct { char bid[128]; int bg_seq; int used; } diag_skip_latch_t;
+typedef struct {
+    char bid[128];
+    int  bg_seq;
+    int  used;
+    char first[24];       /* 首因（新会话时置） */
+    char final[24];       /* 终态因（覆盖槽） */
+    int  final_seen;      /* 本段是否已写入终态因 */
+} diag_skip_latch_t;
 static diag_skip_latch_t g_diag_skip_latch[DIAG_SKIP_LATCH_N];
 static unsigned g_diag_skip_latch_head = 0;
+
+/* 终态原因集：命中者可作为「终态」写入第二槽并触发 PLS_FINAL。 */
+static int diag_is_final_reason(const char *r) {
+    return strcmp(r, DSK_TOO_LATE) == 0 ||
+           strcmp(r, DSK_FP_BELOW_TARGET) == 0 ||
+           strcmp(r, DSK_GONE) == 0 ||
+           strcmp(r, DSK_CIRCUIT_COOLDOWN) == 0 ||
+           strcmp(r, DSK_CIRCUIT_ESCALATED) == 0;
+}
 
 static void diag_skip_note(const char *bid, int bg_seq, const char *reason,
                            int round, time_t elapsed, int band) {
     if (g_diag_level < DIAG_DETAILED || !bid || !reason) return;
     /* invalid_arg 是内部防御码：只计数，不输出（正常路径不可达） */
     if (strcmp(reason, DSK_INVALID_ARG) == 0) { g_diag_dropped++; return; }
+
+    int is_final = diag_is_final_reason(reason);
 
     diag_skip_latch_t *slot = NULL;
     for (int i = 0; i < DIAG_SKIP_LATCH_N; i++) {
@@ -3080,19 +3189,53 @@ static void diag_skip_note(const char *bid, int bg_seq, const char *reason,
         slot->bg_seq = -1;
         fresh = 1;
     }
-    if (!fresh && bg_seq >= 0 && slot->bg_seq == bg_seq) {
-        g_diag_dropped++;  /* 同段后续原因被闩锁吸收 */
-        return;
+    /* 新会话/新槽：重置双槽，避免串段；首因无条件置为本条 reason。 */
+    int new_session = (fresh || bg_seq < 0 || slot->bg_seq != bg_seq);
+    if (new_session) {
+        rst_str_copy(slot->first, sizeof(slot->first), reason);
+        slot->final[0] = '\0';
+        slot->final_seen = 0;
     }
     slot->bg_seq = bg_seq;
 
+    /* 同段终态且首因不同 → 写第二槽并发 PLS_FINAL（不被闩锁吞）；
+     * 同段重复终态由 f: 前缀去重键吸收。 */
+    int emit_final = 0;
+    if (is_final && !new_session && strcmp(slot->first, reason) != 0) {
+        if (!slot->final_seen || strcmp(slot->final, reason) != 0) {
+            rst_str_copy(slot->final, sizeof(slot->final), reason);
+            slot->final_seen = 1;
+            emit_final = 1;
+        }
+    }
+
     char key[DIAG_DEDUP_KEY_SZ];
+    char s_elapsed[16];
+    diag_sec_str(s_elapsed, sizeof(s_elapsed), elapsed);
+
+    if (emit_final) {
+        snprintf(key, sizeof(key), "%s|%d|f:%s", bid, bg_seq, reason);
+        if (!diag_dedup_check(key)) {
+            const char *first_str = slot->first[0] ? slot->first : "NA";
+            DIAGLOG(DIAG_DETAILED,
+                    "DIAG event=PLS_FINAL bid=%s bg_session=%d first=%s reason=%s round=%d elapsed=%s band=%d dedup_key=%s diag_dropped=%d",
+                    bid, bg_seq, first_str, reason, round, s_elapsed, (int)band, key, g_diag_dropped);
+        }
+        return;
+    }
+
+    if (!new_session) {
+        g_diag_dropped++;  /* 同段后续非终态原因被闩锁吸收 */
+        return;
+    }
+
+    /* 首因（含首因本身即终态）：原 PLS_SKIP 行，格式不变。 */
     snprintf(key, sizeof(key), "%s|%d|%s", bid, bg_seq, reason);
     if (diag_dedup_check(key)) return;
 
     DIAGLOG(DIAG_DETAILED,
-            "DIAG event=PLS_SKIP bid=%s reason=%s bg_session=%d round=%d elapsed=%ld band=%d dedup_key=%s diag_dropped=%d",
-            bid, reason, bg_seq, round, (long)elapsed, (int)band, key, g_diag_dropped);
+            "DIAG event=PLS_SKIP bid=%s reason=%s bg_session=%d round=%d elapsed=%s band=%d dedup_key=%s diag_dropped=%d",
+            bid, reason, bg_seq, round, s_elapsed, (int)band, key, g_diag_dropped);
 }
 
 /* 25s 硬截止四处（pulse_check_candidate / revalidate / worker / 对照组）
@@ -3197,10 +3340,13 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
         return 0;
     }
 
-    /* 条件 7: 该 App 今天没有被熔断 */
-    if (st->tripped_today) {
-        diag_skip_note(dbid, dseq, DSK_CIRCUIT_TRIPPED, drnd, delp, (int)cur);
-        return 0;
+    /* 条件 7: 该 App 当前不在熔断/冷却期（BL-010：布尔改为惰性时间谓词） */
+    {
+        const char *cir = pulse_circuit_skip_reason(st, time(NULL), now_mono);
+        if (cir) {
+            diag_skip_note(dbid, dseq, cir, drnd, delp, (int)cur);
+            return 0;
+        }
     }
 
     /* 检查是否命中频控 (条件 4 和 5)：命中频控者可作为对照组采样来源 (M5 / Q2) */
@@ -3265,10 +3411,13 @@ static int pulse_revalidate_conditions(pid_t pid, const char *bid, uint64_t *out
     dseq = st ? st->diag_bg_seq : -1;
     drnd = st ? st->diag_round : 0;
     delp = (st && st->bg_start_mono > 0) ? (now_mono - st->bg_start_mono) : -1;
-    int invalid = (!st || st->tripped_today || st->day_count >= rule_snap.daymax ||
+    const char *cir_reason = pulse_circuit_skip_reason(st, time(NULL), now_mono);
+    int invalid = (!st || cir_reason || st->day_count >= rule_snap.daymax ||
                    g_pulse_global_today_count >= PULSE_GLOBAL_DAYMAX);
     if (invalid) {
-        const char *inv_reason = (!st || st->tripped_today) ? DSK_CIRCUIT_TRIPPED
+        /* cir_reason 优先（cooldown/escalated）；DSK_CIRCUIT_TRIPPED 仅作未知原因/无状态兜底 */
+        const char *inv_reason = cir_reason ? cir_reason
+                               : (!st) ? DSK_CIRCUIT_TRIPPED
                                : (st->day_count >= rule_snap.daymax) ? DSK_DAYMAX
                                : DSK_GLOBAL_CAP;
         diag_skip_note(dbid, dseq, inv_reason, drnd, delp, -1);
@@ -4690,13 +4839,24 @@ static void *pulse_worker_thread(void *arg) {
             st->total_pulses++;
         }
 
-        /* 熔断判定 (C2-6): 窗口内或 restore 后 10 秒内 GONE；PID_REUSED 不计入熔断 (S7) */
+        /* 熔断判定 (C2-6 / BL-010): 窗口内或 restore 后 10 秒内 GONE；PID_REUSED 不计入熔断 (S7) */
         if ((strcmp(end_reason, "GONE") == 0 || gone_post_restore) && strcmp(end_reason, "PID_REUSED") != 0) {
-            st->tripped_today = 1;
-            JPLOG(JP_WARN, "%-6s circuit_break app=%s pid=%d reason=gone", "PLS", bid, (int)pid);
+            /* BL-010 状态机落地：唯一权威迁移逻辑在 pulse_circuit_on_gone（便于测试/审计）。 */
+            time_t now_wall = time(NULL);
+            struct timespec ts_cir;
+            clock_gettime(CLOCK_MONOTONIC, &ts_cir);
+            const char *cir_reason = pulse_circuit_on_gone(st, now_wall, ts_cir.tv_sec);
+            const char *dedup_tail = (st->circuit_level == CIRCUIT_ESCALATED)
+                                     ? "circuit_escalated" : "circuit_cooldown";
+            const char *log_tag = (st->circuit_level == CIRCUIT_ESCALATED) ? "escalated" : "cooldown";
+            JPLOG(JP_WARN, "%-6s circuit_%s app=%s pid=%d reason=gone", "PLS", log_tag, bid, (int)pid);
             DIAGLOG(DIAG_BASIC,
-                    "DIAG event=PLS_CIRCUIT bid=%s reason=break streak=%d dedup_key=%s|-|circuit_break diag_dropped=%d",
-                    bid, st->restore_fail_streak, bid, g_diag_dropped);
+                    "DIAG event=PLS_CIRCUIT bid=%s reason=%s streak=%d dedup_key=%s|-|%s diag_dropped=%d",
+                    bid, cir_reason, st->restore_fail_streak, bid, dedup_tail, g_diag_dropped);
+
+            /* BL-003: GONE 作为终态原因写入双槽终态槽（首因可为 delay_not_met 等）；
+             * 走既有 diag_skip_note 三闸/去重，预算不变。 */
+            diag_skip_note(bid, st->diag_bg_seq, DSK_GONE, diag_round, -1, diag_band_in);
         }
 
         /* 无响应判定 (C2-6): 若已完成 >= 2 次 pulse 且最近连续 2 次降幅均 <= 5MB，标记为无响应 (只标记，不停用) */
@@ -6784,7 +6944,7 @@ int rst_fbs_launch(const char *bid, const char **err_stage) {
         return -1;
     }
 
-    intptr_t responds = ((intptr_t (*)(jp_objc_id, jp_objc_SEL, jp_objc_SEL))fn_objc_msgSend)(
+    bool responds = ((bool (*)(jp_objc_id, jp_objc_SEL, jp_objc_SEL))fn_objc_msgSend)(
         service, selResponds, selWithResult);
     if (!responds) {
         if (err_stage) *err_stage = "noselector";
