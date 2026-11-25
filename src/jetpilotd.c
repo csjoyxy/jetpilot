@@ -324,15 +324,16 @@ static void jp_log_write(const char *fmt, ...) __attribute__((format(printf, 1, 
  *     jp_log_write（同一 s_log_mutex、同一 O_APPEND|O_NOFOLLOW、同一 daemon.log
  *     轮转）。绝不复用受 g_loglevel 过滤的 JPLOG 宏，否则 loglevel=off 时
  *     「测试模式」会静默失效；零新增日志文件、零新增 fd。
- *   - off 时 diag_should_emit 的第一个判断即为 false：零 vsnprintf、零写盘。
+ *   - off 时 DIAGLOG 的第一个判断即为 false：零 vsnprintf、零加锁、零写盘。
  *   - 预算：basic 100 / detailed 300 / full 600 事件每日，180KB 字节软上限；
  *     超限只累加 g_diag_dropped，不输出。
  * ========================================================================= */
 enum { DIAG_OFF = 0, DIAG_BASIC = 1, DIAG_DETAILED = 2, DIAG_FULL = 3 };
 #define DIAG_BYTE_CAP     (180UL * 1024UL)   /* 每日字节软上限 */
-#define DIAG_LINE_BUDGET  320                 /* 单行格式化暂存 */
+#define DIAG_LINE_BUDGET  512                 /* 单行格式化暂存（容纳最长 bid×2 + 字段） */
 #define DIAG_DEDUP_SLOTS  64
 #define DIAG_DEDUP_KEY_SZ 160
+#define DIAG_SKIP_LATCH_N 16
 
 /* 固定原因码枚举（不含任何用户数据；diag.txt 原文绝不入日志） */
 #define DSK_INVALID_ARG       "invalid_arg"
@@ -362,14 +363,35 @@ typedef struct {
     unsigned count;
 } diag_dedup_t;
 
-static int            g_diag_level     = DIAG_OFF;   /* 全局单值 0..3 */
-static int            g_diag_events    = 0;          /* 当日事件计数 */
-static unsigned long  g_diag_bytes     = 0;          /* 当日字节计数 */
-static int            g_diag_dropped   = 0;          /* 当日丢弃累计 */
-static int            g_diag_stats_hour = -1;        /* 上次小时汇总的小时 */
-static char           g_diag_day[16]   = {0};        /* 当日 YYYY-MM-DD */
-static diag_dedup_t   g_diag_dedup[DIAG_DEDUP_SLOTS];
-static unsigned       g_diag_dedup_head = 0;
+typedef struct {
+    char bid[128];
+    int  bg_seq;
+    int  used;
+    char first[32];       /* 首因（新会话时置） */
+    char final[32];       /* 终态因（覆盖槽） */
+    int  final_seen;      /* 本段是否已写入终态因 */
+} diag_skip_latch_t;
+
+/* DIAG2 并发保护：纯叶锁 s_diag_mutex（严格低于 s_pulse_mutex，且绝不嵌套 s_log_mutex） */
+static pthread_mutex_t s_diag_mutex     = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int     g_diag_level     = DIAG_OFF;   /* 全局单值 0..3 */
+static int             g_diag_events    = 0;          /* 当日事件计数 (s_diag_mutex) */
+static unsigned long   g_diag_bytes     = 0;          /* 当日字节计数 (s_diag_mutex) */
+static _Atomic int     g_diag_dropped   = 0;          /* 当日丢弃累计 */
+static int             g_diag_stats_hour = -1;        /* 上次小时汇总的小时 (s_diag_mutex) */
+static char            g_diag_day[16]   = {0};        /* 当日 YYYY-MM-DD (s_diag_mutex) */
+static diag_dedup_t    g_diag_dedup[DIAG_DEDUP_SLOTS];
+static unsigned        g_diag_dedup_head = 0;
+static diag_skip_latch_t g_diag_skip_latch[DIAG_SKIP_LATCH_N];
+static unsigned        g_diag_skip_latch_head = 0;
+
+static inline int diag_level_now(void) {
+    return atomic_load_explicit(&g_diag_level, memory_order_acquire);
+}
+
+static inline int diag_dropped_now(void) {
+    return atomic_load_explicit(&g_diag_dropped, memory_order_relaxed);
+}
 
 static const char *diag_level_to_str(int lv) {
     switch (lv) {
@@ -397,24 +419,28 @@ static void diag_sec_str(char *buf, size_t sz, time_t sec) {
     else snprintf(buf, sz, "NA");
 }
 
-/* 跨日重置：复用 pulse_check_date_reset 的触发点；重置预算与去重表，
- * 等级本身不清零（用户设置持续有效）。 */
+/* 跨日重置：复用 pulse_check_date_reset 的触发点；重置预算、去重表与闩锁，
+ * 等级本身不清零（用户设置持续有效）。调用方可持 s_pulse_mutex，锁序安全。 */
 static void diag_reset_day(void) {
+    pthread_mutex_lock(&s_diag_mutex);
     g_diag_events = 0;
     g_diag_bytes = 0;
-    g_diag_dropped = 0;
+    atomic_store_explicit(&g_diag_dropped, 0, memory_order_relaxed);
     g_diag_stats_hour = -1;
     memset(g_diag_dedup, 0, sizeof(g_diag_dedup));
     g_diag_dedup_head = 0;
+    memset(g_diag_skip_latch, 0, sizeof(g_diag_skip_latch));
+    g_diag_skip_latch_head = 0;
+    pthread_mutex_unlock(&s_diag_mutex);
 }
 
-/* 通用去重：命中返回 1（表内 count++ 且计入 dropped），新键返回 0 并写表。 */
-static int diag_dedup_check(const char *key) {
+/* 通用去重（调用方须持 s_diag_mutex）：命中返回 1（count++ 且 dropped++），新键返回 0 并写表。 */
+static int diag_dedup_check_locked(const char *key) {
     if (!key || !*key) return 0;
     for (int i = 0; i < DIAG_DEDUP_SLOTS; i++) {
         if (g_diag_dedup[i].key[0] && strcmp(g_diag_dedup[i].key, key) == 0) {
             g_diag_dedup[i].count++;
-            g_diag_dropped++;
+            atomic_fetch_add_explicit(&g_diag_dropped, 1, memory_order_relaxed);
             return 1;
         }
     }
@@ -425,33 +451,45 @@ static int diag_dedup_check(const char *key) {
     return 0;
 }
 
-/* 三道闸：off → 等级 → 事件数 → 字节数。通过时先把本次字节计入预算。 */
-static int diag_should_emit(int minlv, const char *fmt, ...) {
-    if (g_diag_level == DIAG_OFF) return 0;       /* off：第一次判断即 false */
-    if (g_diag_level < minlv) return 0;
-    if (g_diag_events >= diag_level_cap(g_diag_level)) {
-        g_diag_dropped++;
-        return 0;
-    }
+/* 三道闸：off → 等级 → 事件数 → 字节数。格式化一次，锁内原子扣预算，锁外落盘。 */
+static void diag_log_emit(int minlv, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void diag_log_emit(int minlv, const char *fmt, ...) {
+    int lv = diag_level_now();
+    if (lv == DIAG_OFF || lv < minlv) return;
+
     char scratch[DIAG_LINE_BUDGET];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(scratch, sizeof(scratch), fmt, ap);
     va_end(ap);
-    unsigned long bytes = (unsigned long)(n > 0 ? n : 0) + 24UL; /* 时间戳+换行 */
-    if (g_diag_bytes + bytes > DIAG_BYTE_CAP) {
-        g_diag_dropped++;
-        return 0;
+    if (n < 0) return;
+
+    unsigned long bytes = (unsigned long)n + 24UL; /* 时间戳+换行 */
+    int allowed = 0;
+    pthread_mutex_lock(&s_diag_mutex);
+    lv = diag_level_now();
+    if (lv != DIAG_OFF && lv >= minlv) {
+        if (g_diag_events >= diag_level_cap(lv)) {
+            atomic_fetch_add_explicit(&g_diag_dropped, 1, memory_order_relaxed);
+        } else if (g_diag_bytes + bytes > DIAG_BYTE_CAP) {
+            atomic_fetch_add_explicit(&g_diag_dropped, 1, memory_order_relaxed);
+        } else {
+            g_diag_events++;
+            g_diag_bytes += bytes;
+            allowed = 1;
+        }
     }
-    g_diag_events++;
-    g_diag_bytes += bytes;
-    return 1;
+    pthread_mutex_unlock(&s_diag_mutex);
+
+    if (allowed) {
+        jp_log_write("%s", scratch);
+    }
 }
 
-/* 唯一 DIAG 输出宏：底层仍走 jp_log_write，与 g_loglevel 无关。 */
+/* 唯一 DIAG 输出宏：off/低等级时短路，绝不求值可变参数；底层仍走 jp_log_write，与 g_loglevel 无关。 */
 #define DIAGLOG(minlv, ...) do { \
-    if (diag_should_emit((minlv), __VA_ARGS__)) { \
-        jp_log_write(__VA_ARGS__); \
+    if (diag_level_now() >= (minlv)) { \
+        diag_log_emit((minlv), __VA_ARGS__); \
     } \
 } while (0)
 
@@ -924,6 +962,22 @@ static void applied_note_sys_band(applied_t *a, int32_t cur) {
     a->sys_band = cur;
     a->sys_band_known = 1;
     a->sys_band_seen_mono = applied_mono_now();
+}
+
+/* 档位只读观察：仅在系统把档位漂移离己方设定值 (cur != band) 时记 sys_band，
+ * 避免把自己设的 protect/demote 档位污染进自然档位门控；仍停留在己方设定档
+ * (cur == band) 时仅在 TTL 内续期 band_seen_mono，既防稳态 >240s 后 LOWER/RETURN
+ * 失灵，又保留休眠/停顿超时后的归属保护。 */
+static void applied_observe_band(applied_t *a, int32_t cur) {
+    if (!a) return;
+    if (cur != a->band) {
+        applied_note_sys_band(a, cur);
+    } else {
+        time_t now_m = applied_mono_now();
+        if (jp_snapshot_fresh(a->band_seen_mono, now_m)) {
+            a->band_seen_mono = now_m;
+        }
+    }
 }
 
 /* 归属判定可信条件：有明确来源（E1 身份缓存或旧实例 CLAIM）
@@ -1629,6 +1683,7 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
 #define PULSE_MAX_DELAY_S     20
 #define PULSE_DEFAULT_DELAY_S 10
 #define PULSE_DEADLINE_BG_SEC 25
+#define PULSE_REASSERT_MAX_SEC 30 /* 卡 P-2: 窗口前 30 秒内允许重设限额一次 */
 /* D-003: 门控打开时快轮的唤醒上限，须显著小于 25s 死线，保证窗口内至少多次判定 */
 #define PULSE_FAST_GATE_POLL_SEC 5
 /* Ltarget: 水位窗口内允许的绝对涨幅下限（再按 fp0/4 取大），替代失效的比例守卫 */
@@ -2136,8 +2191,8 @@ static int fast_reassert_one(applied_t *a, int32_t cur) {
     }
     int do_reassert = (a->kind == 0) ? (cur < a->target) : (cur > a->target);
     if (!do_reassert) {
-        /* 不重断言：仅记录系统档位漂移观察（与慢轮 prev->sys_band 语义一致） */
-        if (cur != a->band) applied_note_sys_band(a, cur);
+        /* 不重断言：只读观察档位（漂移记 sys_band，稳态续期 band_seen_mono） */
+        applied_observe_band(a, cur);
         return 0;
     }
     if (set_priority(a->pid, a->target) == 0) {
@@ -2175,7 +2230,11 @@ static int fast_round_cmd3(void) {
             return -1;
         }
         a->seen = 1;
-        if (!a->has_identity) continue;     /* 无身份缓存：只确认存活，重断言交慢轮 */
+        if (!a->has_identity) {
+            /* 无身份缓存（含旧实例 CLAIM）：只读观察不重断言，避免空闲退避 >240s 令归属过期 */
+            applied_observe_band(a, p.priority);
+            continue;
+        }
         actions += fast_reassert_one(a, p.priority);
     }
     applied_prune();
@@ -2201,7 +2260,10 @@ static int fast_round_listscan(void) {
         }
         if (cur < 0) continue;              /* 不在全表：已退出，不置 seen → prune 剪除 */
         a->seen = 1;
-        if (!a->has_identity) continue;
+        if (!a->has_identity) {
+            applied_observe_band(a, cur);
+            continue;
+        }
         actions += fast_reassert_one(a, cur);
     }
     free(list);
@@ -2289,19 +2351,29 @@ static int jp_config_open(const char *path, jp_file_stamp_t *stamp, const char *
 /* DIAG2: 小时级统计汇总行。不经 DIAGLOG（不占用事件预算），仅按等级 gate；
  * 落盘仍走 jp_log_write，共享 daemon.log 轮转。 */
 static void diag_stats_emit(void) {
-    if (g_diag_level == DIAG_OFF) return;
+    int lv = diag_level_now();
+    if (lv == DIAG_OFF) return;
     time_t t = time(NULL);
     struct tm lt;
     localtime_r(&t, &lt);
     char day[16], hh[8];
     strftime(day, sizeof(day), "%Y-%m-%d", &lt);
     snprintf(hh, sizeof(hh), "%02d", lt.tm_hour);
+    pthread_mutex_lock(&s_diag_mutex);
+    lv = diag_level_now();
+    if (lv == DIAG_OFF) {
+        pthread_mutex_unlock(&s_diag_mutex);
+        return;
+    }
     if (g_diag_day[0] == '\0' || strcmp(g_diag_day, day) != 0) {
         snprintf(g_diag_day, sizeof(g_diag_day), "%s", day);
     }
+    int events = g_diag_events;
+    unsigned long bytes = g_diag_bytes;
+    int dropped = diag_dropped_now();
+    pthread_mutex_unlock(&s_diag_mutex);
     jp_log_write("DIAG event=DIAG_STATS level=%s events=%d bytes=%lu dropped=%d day=%s hh=%s",
-                 diag_level_to_str(g_diag_level), g_diag_events, g_diag_bytes,
-                 g_diag_dropped, day, hh);
+                 diag_level_to_str(lv), events, bytes, dropped, day, hh);
 }
 
 /* DIAG2: 感知 diag.txt 变更并解析等级。
@@ -2352,9 +2424,10 @@ static void diag_load_config(void) {
         /* 符号链接 / 非普通文件 / 组或其他可写 → 拒绝解析（不再要求 root 属主），
          * 保持上一合法等级；stamp 已推进，下一轮不会重复打日志。 */
         if (jp_diag_config_precheck(DIAG_CONFIG_PATH) != 0) {
+            int cur_lv = diag_level_now();
             DIAGLOG(DIAG_BASIC,
                     "DIAG event=PLS_CFG reason=diag_cfg_rejected from=%s to=%s file=ok diag_dropped=%d",
-                    diag_level_to_str(g_diag_level), diag_level_to_str(g_diag_level), g_diag_dropped);
+                    diag_level_to_str(cur_lv), diag_level_to_str(cur_lv), diag_dropped_now());
             return;
         }
         FILE *f = fopen(DIAG_CONFIG_PATH, "r");
@@ -2387,13 +2460,13 @@ static void diag_load_config(void) {
         }
     }
 
-    if (new_level != g_diag_level) {
-        int old = g_diag_level;
-        g_diag_level = new_level;
+    int old = diag_level_now();
+    if (new_level != old) {
+        atomic_store_explicit(&g_diag_level, new_level, memory_order_release);
         DIAGLOG(DIAG_BASIC,
                 "DIAG event=PLS_CFG reason=%s from=%s to=%s file=%s diag_dropped=%d",
                 reason, diag_level_to_str(old), diag_level_to_str(new_level),
-                file_state, g_diag_dropped);
+                file_state, diag_dropped_now());
         diag_stats_emit();  /* 等级切换即时汇总，验证即时生效 */
     }
 }
@@ -2903,7 +2976,7 @@ static int pulse_load_config(void) {
         /* DIAG2: 配置变更观测行；basic 起输出，仅在 changed==1 命中 */
         DIAGLOG(DIAG_BASIC,
                 "DIAG event=PLS_CFG reason=cfg_change file=%s rules=%d dedup_key=-|-|cfg diag_dropped=%d",
-                file_absent ? "absent" : "ok", nparsed, g_diag_dropped);
+                file_absent ? "absent" : "ok", nparsed, diag_dropped_now());
         for (int i = 0; i < nparsed; i++) {
             JPLOG(JP_DEBUG, "%-6s cfg_rule i=%d bid=%s on=%d target=%d n=%d daymax=%d delay_s=%d",
                   "PLS", i, parsed_rules[i].bid, parsed_rules[i].enabled,
@@ -3107,6 +3180,8 @@ static pulse_app_state_t *pulse_get_app_state(const char *bid, const char *today
                 g_pulse_app_states[i].day_count = 0;
                 g_pulse_app_states[i].ctrl_day_count = 0;
                 pulse_circuit_on_new_day(&g_pulse_app_states[i]);
+                g_pulse_app_states[i].restore_fail_streak = 0;
+                g_pulse_app_states[i].restore_tripped_today = 0;
                 snprintf(g_pulse_app_states[i].day_date, sizeof(g_pulse_app_states[i].day_date), "%s", today_str);
             }
             return &g_pulse_app_states[i];
@@ -3137,20 +3212,11 @@ static int pulse_get_footprint_mb(pid_t pid, uint64_t *fp_mb_out) {
 }
 
 /* DIAG2: PLS_SKIP 闩锁 —— 每 (bid,bg_session) 保留「首因 + 终态因」双槽。
+ * 表定义与 g_diag_dedup 一并受 s_diag_mutex 保护；
  * 首因仍按 bid 闩锁、后续同段原因照旧只累加 diag_dropped；但终态原因
  * (too_late/fp_below_target/gone/circuit_cooldown/circuit_escalated) 在首因
- * 之外时，额外发一条 PLS_FINAL 供日志判读，且走既有三闸/去重，不改预算。 */
-#define DIAG_SKIP_LATCH_N 16
-typedef struct {
-    char bid[128];
-    int  bg_seq;
-    int  used;
-    char first[24];       /* 首因（新会话时置） */
-    char final[24];       /* 终态因（覆盖槽） */
-    int  final_seen;      /* 本段是否已写入终态因 */
-} diag_skip_latch_t;
-static diag_skip_latch_t g_diag_skip_latch[DIAG_SKIP_LATCH_N];
-static unsigned g_diag_skip_latch_head = 0;
+ * 之外时，额外发一条 PLS_FINAL 供日志判读，且走既有三闸/去重，不改预算。
+ * bg_seq < 0 的无会话事件不覆写有效会话闩锁槽，直接走去重输出。 */
 
 /* 终态原因集：命中者可作为「终态」写入第二槽并触发 PLS_FINAL。 */
 static int diag_is_final_reason(const char *r) {
@@ -3163,79 +3229,101 @@ static int diag_is_final_reason(const char *r) {
 
 static void diag_skip_note(const char *bid, int bg_seq, const char *reason,
                            int round, time_t elapsed, int band) {
-    if (g_diag_level < DIAG_DETAILED || !bid || !reason) return;
+    if (diag_level_now() < DIAG_DETAILED || !bid || !reason) return;
     /* invalid_arg 是内部防御码：只计数，不输出（正常路径不可达） */
-    if (strcmp(reason, DSK_INVALID_ARG) == 0) { g_diag_dropped++; return; }
+    if (strcmp(reason, DSK_INVALID_ARG) == 0) {
+        atomic_fetch_add_explicit(&g_diag_dropped, 1, memory_order_relaxed);
+        return;
+    }
 
     int is_final = diag_is_final_reason(reason);
-
-    diag_skip_latch_t *slot = NULL;
-    for (int i = 0; i < DIAG_SKIP_LATCH_N; i++) {
-        if (g_diag_skip_latch[i].used && strcmp(g_diag_skip_latch[i].bid, bid) == 0) {
-            slot = &g_diag_skip_latch[i];
-            break;
-        }
-    }
-    int fresh = 0;
-    if (!slot) {
-        for (int i = 0; i < DIAG_SKIP_LATCH_N; i++) {
-            if (!g_diag_skip_latch[i].used) { slot = &g_diag_skip_latch[i]; break; }
-        }
-        if (!slot) {
-            slot = &g_diag_skip_latch[g_diag_skip_latch_head++ % DIAG_SKIP_LATCH_N];
-        }
-        rst_str_copy(slot->bid, sizeof(slot->bid), bid);
-        slot->used = 1;
-        slot->bg_seq = -1;
-        fresh = 1;
-    }
-    /* 新会话/新槽：重置双槽，避免串段；首因无条件置为本条 reason。 */
-    int new_session = (fresh || bg_seq < 0 || slot->bg_seq != bg_seq);
-    if (new_session) {
-        rst_str_copy(slot->first, sizeof(slot->first), reason);
-        slot->final[0] = '\0';
-        slot->final_seen = 0;
-    }
-    slot->bg_seq = bg_seq;
-
-    /* 同段终态且首因不同 → 写第二槽并发 PLS_FINAL（不被闩锁吞）；
-     * 同段重复终态由 f: 前缀去重键吸收。 */
-    int emit_final = 0;
-    if (is_final && !new_session && strcmp(slot->first, reason) != 0) {
-        if (!slot->final_seen || strcmp(slot->final, reason) != 0) {
-            rst_str_copy(slot->final, sizeof(slot->final), reason);
-            slot->final_seen = 1;
-            emit_final = 1;
-        }
-    }
-
     char key[DIAG_DEDUP_KEY_SZ];
+    char first_copy[32] = {0};
+    int emit_kind = 0; /* 0=none, 1=PLS_SKIP, 2=PLS_FINAL */
+    int dropped_snap = 0;
+
+    pthread_mutex_lock(&s_diag_mutex);
+    if (bg_seq < 0) {
+        /* 无会话号事件不进入/覆盖有效会话双槽闩锁，仅走去重防刷屏。 */
+        snprintf(key, sizeof(key), "%s|%d|%s", bid, bg_seq, reason);
+        if (!diag_dedup_check_locked(key)) {
+            emit_kind = 1;
+            dropped_snap = diag_dropped_now();
+        }
+        pthread_mutex_unlock(&s_diag_mutex);
+    } else {
+        diag_skip_latch_t *slot = NULL;
+        for (int i = 0; i < DIAG_SKIP_LATCH_N; i++) {
+            if (g_diag_skip_latch[i].used && strcmp(g_diag_skip_latch[i].bid, bid) == 0) {
+                slot = &g_diag_skip_latch[i];
+                break;
+            }
+        }
+        int fresh = 0;
+        if (!slot) {
+            for (int i = 0; i < DIAG_SKIP_LATCH_N; i++) {
+                if (!g_diag_skip_latch[i].used) { slot = &g_diag_skip_latch[i]; break; }
+            }
+            if (!slot) {
+                slot = &g_diag_skip_latch[g_diag_skip_latch_head++ % DIAG_SKIP_LATCH_N];
+            }
+            rst_str_copy(slot->bid, sizeof(slot->bid), bid);
+            slot->used = 1;
+            slot->bg_seq = -1;
+            fresh = 1;
+        }
+        /* 新会话/新槽：重置双槽，避免串段；首因无条件置为本条 reason。 */
+        int new_session = (fresh || slot->bg_seq != bg_seq);
+        if (new_session) {
+            rst_str_copy(slot->first, sizeof(slot->first), reason);
+            slot->final[0] = '\0';
+            slot->final_seen = 0;
+            slot->bg_seq = bg_seq;
+        }
+
+        /* 同段终态且首因不同 → 写第二槽并发 PLS_FINAL（不被闩锁吞）；
+         * 同段重复终态由 f: 前缀去重键吸收。 */
+        int emit_final = 0;
+        if (is_final && !new_session && strcmp(slot->first, reason) != 0) {
+            if (!slot->final_seen || strcmp(slot->final, reason) != 0) {
+                rst_str_copy(slot->final, sizeof(slot->final), reason);
+                slot->final_seen = 1;
+                emit_final = 1;
+            }
+        }
+
+        if (emit_final) {
+            snprintf(key, sizeof(key), "%s|%d|f:%s", bid, bg_seq, reason);
+            if (!diag_dedup_check_locked(key)) {
+                rst_str_copy(first_copy, sizeof(first_copy), slot->first[0] ? slot->first : "NA");
+                emit_kind = 2;
+                dropped_snap = diag_dropped_now();
+            }
+        } else if (!new_session) {
+            atomic_fetch_add_explicit(&g_diag_dropped, 1, memory_order_relaxed);
+        } else {
+            snprintf(key, sizeof(key), "%s|%d|%s", bid, bg_seq, reason);
+            if (!diag_dedup_check_locked(key)) {
+                emit_kind = 1;
+                dropped_snap = diag_dropped_now();
+            }
+        }
+        pthread_mutex_unlock(&s_diag_mutex);
+    }
+
+    if (emit_kind == 0) return;
+
     char s_elapsed[16];
     diag_sec_str(s_elapsed, sizeof(s_elapsed), elapsed);
-
-    if (emit_final) {
-        snprintf(key, sizeof(key), "%s|%d|f:%s", bid, bg_seq, reason);
-        if (!diag_dedup_check(key)) {
-            const char *first_str = slot->first[0] ? slot->first : "NA";
-            DIAGLOG(DIAG_DETAILED,
-                    "DIAG event=PLS_FINAL bid=%s bg_session=%d first=%s reason=%s round=%d elapsed=%s band=%d dedup_key=%s diag_dropped=%d",
-                    bid, bg_seq, first_str, reason, round, s_elapsed, (int)band, key, g_diag_dropped);
-        }
-        return;
+    if (emit_kind == 2) {
+        DIAGLOG(DIAG_DETAILED,
+                "DIAG event=PLS_FINAL bid=%s bg_session=%d first=%s reason=%s round=%d elapsed=%s band=%d dedup_key=%s diag_dropped=%d",
+                bid, bg_seq, first_copy, reason, round, s_elapsed, (int)band, key, dropped_snap);
+    } else {
+        DIAGLOG(DIAG_DETAILED,
+                "DIAG event=PLS_SKIP bid=%s reason=%s bg_session=%d round=%d elapsed=%s band=%d dedup_key=%s diag_dropped=%d",
+                bid, reason, bg_seq, round, s_elapsed, (int)band, key, dropped_snap);
     }
-
-    if (!new_session) {
-        g_diag_dropped++;  /* 同段后续非终态原因被闩锁吸收 */
-        return;
-    }
-
-    /* 首因（含首因本身即终态）：原 PLS_SKIP 行，格式不变。 */
-    snprintf(key, sizeof(key), "%s|%d|%s", bid, bg_seq, reason);
-    if (diag_dedup_check(key)) return;
-
-    DIAGLOG(DIAG_DETAILED,
-            "DIAG event=PLS_SKIP bid=%s reason=%s bg_session=%d round=%d elapsed=%s band=%d dedup_key=%s diag_dropped=%d",
-            bid, reason, bg_seq, round, s_elapsed, (int)band, key, g_diag_dropped);
 }
 
 /* 25s 硬截止四处（pulse_check_candidate / revalidate / worker / 对照组）
@@ -3658,8 +3746,16 @@ static int pulse_load_trusted_state_file(pid_t pid, const proc_identity_t *ident
     if (file_st.st_uid != geteuid()) return -1;
     if ((file_st.st_mode & 0777) != 0600) return -1;
 
-    int fd = open(PULSE_STATE_PATH, O_RDONLY | O_NOFOLLOW);
+    int fd = open(PULSE_STATE_PATH, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return -1;
+
+    struct stat fd_st;
+    if (fstat(fd, &fd_st) != 0 || !S_ISREG(fd_st.st_mode) ||
+        fd_st.st_uid != geteuid() || (fd_st.st_mode & 0777) != 0600 ||
+        fd_st.st_ino != file_st.st_ino || fd_st.st_dev != file_st.st_dev) {
+        close(fd);
+        return -1;
+    }
 
     FILE *f = fdopen(fd, "r");
     if (!f) {
@@ -3839,13 +3935,13 @@ static void pulse_note_restore_failed(const char *bid, pid_t pid, const char *re
                   "PLS", bid, (int)pid, st->restore_fail_streak, reason ? reason : "");
             DIAGLOG(DIAG_BASIC,
                     "DIAG event=PLS_CIRCUIT bid=%s reason=open streak=%d dedup_key=%s|-|circuit_open diag_dropped=%d",
-                    bid, st->restore_fail_streak, bid, g_diag_dropped);
+                    bid, st->restore_fail_streak, bid, diag_dropped_now());
         } else {
             JPLOG(JP_WARN, "%-6s RESTORE_WARN_STREAK app=%s pid=%d streak=%d last=%s",
                   "PLS", bid, (int)pid, st->restore_fail_streak, reason ? reason : "");
             DIAGLOG(DIAG_BASIC,
                     "DIAG event=PLS_CIRCUIT bid=%s reason=warn_streak streak=%d dedup_key=%s|-|circuit_warn diag_dropped=%d",
-                    bid, st->restore_fail_streak, bid, g_diag_dropped);
+                    bid, st->restore_fail_streak, bid, diag_dropped_now());
         }
     }
     pthread_mutex_unlock(&s_pulse_mutex);
@@ -3863,7 +3959,7 @@ static void pulse_note_restore_ok(const char *bid) {
         JPLOG(JP_INFO, "%-6s RESTORE_WARN_STREAK cleared app=%s", "PLS", bid);
         DIAGLOG(DIAG_BASIC,
                 "DIAG event=PLS_CIRCUIT bid=%s reason=cleared streak=0 dedup_key=%s|-|circuit_cleared diag_dropped=%d",
-                bid, bid, g_diag_dropped);
+                bid, bid, diag_dropped_now());
     }
     pthread_mutex_unlock(&s_pulse_mutex);
 }
@@ -4136,7 +4232,7 @@ static void pulse_startup_recovery(void) {
     struct stat dir_st;
     if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) || !S_ISDIR(dir_st.st_mode)) {
         JPLOG(JP_WARN, "%-6s state_invalid reason=dir_symlink path=%s", "PLS", PULSE_STATE_PATH);
-        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=dir_symlink dedup_key=-|-|dir_symlink diag_dropped=%d", g_diag_dropped);
+        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=dir_symlink dedup_key=-|-|dir_symlink diag_dropped=%d", diag_dropped_now());
         g_pulse_corrupt_state = 1;
         g_pulse_corrupt_bid[0] = '\0';
         pulse_log_today_pulsed_bids();
@@ -4153,7 +4249,7 @@ static void pulse_startup_recovery(void) {
         file_st.st_uid != geteuid() || (file_st.st_mode & 0777) != 0600) {
         unlink(PULSE_STATE_PATH);
         JPLOG(JP_WARN, "%-6s state_invalid reason=file_attr path=%s", "PLS", PULSE_STATE_PATH);
-        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=file_attr dedup_key=-|-|file_attr diag_dropped=%d", g_diag_dropped);
+        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=file_attr dedup_key=-|-|file_attr diag_dropped=%d", diag_dropped_now());
         g_pulse_corrupt_state = 1;
         g_pulse_corrupt_bid[0] = '\0';
         pulse_log_today_pulsed_bids();
@@ -4164,7 +4260,7 @@ static void pulse_startup_recovery(void) {
     if (pulse_load_trusted_state_file(0, NULL, &st) != 0 || st.pid <= 0) {
         unlink(PULSE_STATE_PATH);
         JPLOG(JP_WARN, "%-6s state_invalid reason=parse_fail path=%s", "PLS", PULSE_STATE_PATH);
-        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=parse_fail dedup_key=-|-|parse_fail diag_dropped=%d", g_diag_dropped);
+        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=parse_fail dedup_key=-|-|parse_fail diag_dropped=%d", diag_dropped_now());
         g_pulse_corrupt_state = 1;
         if (st.bid[0] != '\0') {
             snprintf(g_pulse_corrupt_bid, sizeof(g_pulse_corrupt_bid), "%s", st.bid);
@@ -4181,7 +4277,7 @@ static void pulse_startup_recovery(void) {
         /* 进程已经没了 */
         unlink(PULSE_STATE_PATH);
         JPLOG(JP_INFO, "%-6s state_cleanup pid=%d reason=process_gone", "PLS", st.pid);
-        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=process_gone dedup_key=-|-|process_gone diag_dropped=%d", g_diag_dropped);
+        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=process_gone dedup_key=-|-|process_gone diag_dropped=%d", diag_dropped_now());
         return;
     }
 
@@ -4189,7 +4285,7 @@ static void pulse_startup_recovery(void) {
         /* pid 对不上 (pid 已被其他进程复用) */
         unlink(PULSE_STATE_PATH);
         JPLOG(JP_INFO, "%-6s state_cleanup pid=%d reason=pid_reused", "PLS", st.pid);
-        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=pid_reused dedup_key=-|-|pid_reused diag_dropped=%d", g_diag_dropped);
+        DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=pid_reused dedup_key=-|-|pid_reused diag_dropped=%d", diag_dropped_now());
         return;
     }
 
@@ -4200,7 +4296,7 @@ static void pulse_startup_recovery(void) {
     JPLOG(JP_INFO, "%-6s crash_recovered pid=%d bid=%s verdict=%s",
           "PLS", st.pid, bid, verdict_str[0] ? verdict_str : "RESTORE_OK");
     DIAGLOG(DIAG_BASIC, "DIAG event=PLS_STATE reason=crash_recovered bid=%s dedup_key=%s|-|crash_recovered diag_dropped=%d",
-            bid, bid, g_diag_dropped);
+            bid, bid, diag_dropped_now());
     pulse_clear_state_file(st.pid);
 }
 
@@ -4231,7 +4327,7 @@ static void *pulse_worker_thread(void *arg) {
     int was_locked = target->locked;
 
     /* DIAG2: worker 局部观测快照（纯内存，绝不写 pulse.state 磁盘结构） */
-    int diag_round = 0, diag_band_in = -1;
+    int diag_bg_seq = -1, diag_round = 0, diag_band_in = -1;
     time_t diag_first_obs_s = -1, diag_gate_t_s = -1;
     int diag_arm_t_s = -1;
     time_t diag_bg_start_mono = 0;
@@ -4254,7 +4350,8 @@ static void *pulse_worker_thread(void *arg) {
         pthread_mutex_unlock(&s_pulse_mutex);
         goto thread_done;
     }
-    /* DIAG2: 锁内快照本段观测字段 */
+    /* DIAG2: 锁内快照本段观测字段（含 diag_bg_seq，避免收尾 GONE 归因串到新会话） */
+    diag_bg_seq = st_init->diag_bg_seq;
     diag_round = st_init->diag_round;
     diag_band_in = st_init->diag_band_in;
     diag_first_obs_s = st_init->diag_first_observe_s;
@@ -4266,7 +4363,7 @@ static void *pulse_worker_thread(void *arg) {
             st_init->pulse_late_this_bg = 1;
             JPLOG(JP_INFO, "PULSE_LATE app=%s pid=%d elapsed=%ld locked=%d", bid, (int)pid, (long)elapsed_start, g_locked);
         }
-        diag_skip_too_late(bid, st_init->diag_bg_seq, diag_round, elapsed_start, -1);
+        diag_skip_too_late(bid, diag_bg_seq, diag_round, elapsed_start, -1);
         pthread_mutex_unlock(&s_pulse_mutex);
         goto thread_done;
     }
@@ -4284,8 +4381,8 @@ static void *pulse_worker_thread(void *arg) {
         JPLOG(JP_INFO, "PULSE_CIRCUIT_SKIP app=%s pid=%d reason=restore_streak", bid, (int)pid);
         DIAGLOG(DIAG_BASIC,
                 "DIAG event=PLS_CIRCUIT bid=%s reason=skip streak=%d dedup_key=%s|-|circuit_skip diag_dropped=%d",
-                bid, diag_rst_streak, bid, g_diag_dropped);
-        diag_skip_note(bid, -1, DSK_RESTORE_TRIPPED, diag_round, -1, -1);
+                bid, diag_rst_streak, bid, diag_dropped_now());
+        diag_skip_note(bid, diag_bg_seq, DSK_RESTORE_TRIPPED, diag_round, -1, diag_band_in);
         goto thread_done;
     }
 
@@ -4522,14 +4619,14 @@ static void *pulse_worker_thread(void *arg) {
                 }
 
                 /* 卡 P-2: 重新设限，最多 1 次
-                 * 条件：ovr_t <= BAND_BACKGROUND，现读档位 < BAND_PROTECT_DEFAULT，
+                 * 条件：ovr_t <= PULSE_REASSERT_MAX_SEC (30s)，现读档位 < BAND_PROTECT_DEFAULT，
                  * fp_ovr > target，从窗口开始到现在的 cpu_ms > 0，且没重新设过 */
                 /* H2: 读锁内取规则快照，锁外用快照判定 */
                 pulse_rule_t rule_snap;
                 int have_rule = pulse_find_rule(bid, &rule_snap);
                 uint64_t target_mb = have_rule ? (uint64_t)rule_snap.target_mb : 0;
 
-                if (ovr_t <= BAND_BACKGROUND && band >= BAND_IDLE &&
+                if (ovr_t <= PULSE_REASSERT_MAX_SEC && band >= BAND_IDLE &&
                     band < BAND_PROTECT_DEFAULT && fp_ovr > target_mb) {
                     reassert_count = 1;
                     proc_identity_t check_reassert_ident;
@@ -4779,7 +4876,8 @@ static void *pulse_worker_thread(void *arg) {
     if (g_locked) was_locked = 1;
 
     /* DIAG2: off 保留 v=1 行逐字不变；basic 及以上改写 v=2（v=1 不再重复输出） */
-    if (g_diag_level >= DIAG_BASIC) {
+    int cur_diag_lv = diag_level_now();
+    if (cur_diag_lv >= DIAG_BASIC) {
         char s_first[16], s_gate[16], s_arm[16], s_band[16];
         diag_sec_str(s_first, sizeof(s_first), diag_first_obs_s);
         diag_sec_str(s_gate, sizeof(s_gate), diag_gate_t_s);
@@ -4789,7 +4887,7 @@ static void *pulse_worker_thread(void *arg) {
                 "DIAG event=PULSE v=2 bid=%s round=%d band_in=%s bg_lag=%s first_observe=%s gate_t=%s arm_t=%s L=%llu t_reach=%s cpu_ms=%s end=%s restore=%s diag_dropped=%d",
                 bid, diag_round, s_band, bg_lag_str, s_first, s_gate, s_arm,
                 (unsigned long long)L, t_reach_str, cpu_ms_str, end_reason,
-                restore_verdict_str, g_diag_dropped);
+                restore_verdict_str, diag_dropped_now());
     } else {
         JPLOG(JP_INFO, "PULSE app=%s pid=%d fp0=%llu L=%llu t_reach=%s fp15=%s fp30=%s fp60=%s cpu_ms=%s end=%s restore=%s bg_lag=%s locked=%d ovr_t=%s fp_ovr=%s reassert=%s ovr_rf=%d",
               bid, (int)pid, (unsigned long long)fp0, (unsigned long long)L,
@@ -4805,9 +4903,9 @@ static void *pulse_worker_thread(void *arg) {
                 "DIAG event=PLS_OVERRIDE bid=%s t=%d inactive=%d/0x%x fp=%llu band=%d reassert=%d dedup_key=%s|-|override diag_dropped=%d",
                 bid, diag_ovr_t, diag_ovr_val, (unsigned)diag_ovr_attr,
                 (unsigned long long)diag_ovr_fp, diag_ovr_band, diag_reassert_ok,
-                bid, g_diag_dropped);
+                bid, diag_dropped_now());
     }
-    if (g_diag_level >= DIAG_FULL) {
+    if (cur_diag_lv >= DIAG_FULL) {
         char s_fp1[24], s_fp15[24], s_fp30[24], s_fp60[24];
         char s_first2[16], s_gate2[16], s_arm2[16];
         if (has_fp1)  snprintf(s_fp1,  sizeof(s_fp1),  "%llu", (unsigned long long)fp1);  else snprintf(s_fp1,  sizeof(s_fp1),  "NA");
@@ -4820,10 +4918,10 @@ static void *pulse_worker_thread(void *arg) {
         DIAGLOG(DIAG_FULL,
                 "DIAG event=PLS_STAGE bid=%s round=%d first=%s gate=%s arm=%s set=%s window=%s restore=%s end=%s dedup_key=%s|-|stage diag_dropped=%d",
                 bid, diag_round, s_first2, s_gate2, s_arm2, s_arm2, t_reach_str, t_reach_str,
-                end_reason, bid, g_diag_dropped);
+                end_reason, bid, diag_dropped_now());
         DIAGLOG(DIAG_FULL,
                 "DIAG event=PLS_SAMPLE bid=%s t1=%s t15=%s t30=%s t60=%s cpu_ms=%s dedup_key=%s|-|sample diag_dropped=%d",
-                bid, s_fp1, s_fp15, s_fp30, s_fp60, cpu_ms_str, bid, g_diag_dropped);
+                bid, s_fp1, s_fp15, s_fp30, s_fp60, cpu_ms_str, bid, diag_dropped_now());
     }
 
     /* 计次与状态更新 (M6: 持锁保护) */
@@ -4852,11 +4950,11 @@ static void *pulse_worker_thread(void *arg) {
             JPLOG(JP_WARN, "%-6s circuit_%s app=%s pid=%d reason=gone", "PLS", log_tag, bid, (int)pid);
             DIAGLOG(DIAG_BASIC,
                     "DIAG event=PLS_CIRCUIT bid=%s reason=%s streak=%d dedup_key=%s|-|%s diag_dropped=%d",
-                    bid, cir_reason, st->restore_fail_streak, bid, dedup_tail, g_diag_dropped);
+                    bid, cir_reason, st->restore_fail_streak, bid, dedup_tail, diag_dropped_now());
 
-            /* BL-003: GONE 作为终态原因写入双槽终态槽（首因可为 delay_not_met 等）；
-             * 走既有 diag_skip_note 三闸/去重，预算不变。 */
-            diag_skip_note(bid, st->diag_bg_seq, DSK_GONE, diag_round, -1, diag_band_in);
+            /* BL-003: GONE 作为终态原因写入双槽终态槽（使用 worker 启动时快照的 diag_bg_seq，
+             * 防止 60s 窗口内前后台切换后归因串到新会话）；走既有 diag_skip_note 三闸/去重。 */
+            diag_skip_note(bid, diag_bg_seq, DSK_GONE, diag_round, -1, diag_band_in);
         }
 
         /* 无响应判定 (C2-6): 若已完成 >= 2 次 pulse 且最近连续 2 次降幅均 <= 5MB，标记为无响应 (只标记，不停用) */
@@ -5296,6 +5394,16 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         }
         target.fp_mb = reval_fp;
 
+        if (g_got_sigterm || g_pulse_stop_requested) {
+            return;
+        }
+
+        pulse_queue_entry_t *thread_arg = (pulse_queue_entry_t *)malloc(sizeof(pulse_queue_entry_t));
+        if (!thread_arg) {
+            break;
+        }
+        *thread_arg = target;
+
         pthread_mutex_lock(&s_pulse_mutex);
         pulse_app_state_t *st = pulse_get_app_state(target.bid, today_str);
         if (st) {
@@ -5303,32 +5411,26 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
         }
         pthread_mutex_unlock(&s_pulse_mutex);
 
-        if (g_got_sigterm || g_pulse_stop_requested) {
-            return;
-        }
-
         atomic_store_explicit(&g_pulse_in_progress, 1, memory_order_relaxed);
         atomic_store_explicit(&g_pulse_current_pid, target.pid, memory_order_relaxed);
         rst_str_copy(g_pulse_current_bid, sizeof(g_pulse_current_bid), target.bid);
 
-        pulse_queue_entry_t *thread_arg = (pulse_queue_entry_t *)malloc(sizeof(pulse_queue_entry_t));
-        if (thread_arg) {
-            *thread_arg = target;
-            /* H1: 先置 running(release) 再 create，作为新 worker 状态的权威置位 */
-            atomic_store_explicit(&g_pulse_thread_running, 1, memory_order_release);
-            if (pthread_create(&g_pulse_thread, NULL, pulse_worker_thread, thread_arg) == 0) {
-                g_pulse_thread_has_handle = 1;
-            } else {
-                atomic_store_explicit(&g_pulse_thread_running, 0, memory_order_relaxed);
-                free(thread_arg);
-                atomic_store_explicit(&g_pulse_in_progress, 0, memory_order_relaxed);
-                atomic_store_explicit(&g_pulse_current_pid, 0, memory_order_relaxed);
-                g_pulse_current_bid[0] = '\0';
-            }
+        /* H1: 先置 running(release) 再 create，作为新 worker 状态的权威置位 */
+        atomic_store_explicit(&g_pulse_thread_running, 1, memory_order_release);
+        if (pthread_create(&g_pulse_thread, NULL, pulse_worker_thread, thread_arg) == 0) {
+            g_pulse_thread_has_handle = 1;
         } else {
+            atomic_store_explicit(&g_pulse_thread_running, 0, memory_order_relaxed);
+            free(thread_arg);
             atomic_store_explicit(&g_pulse_in_progress, 0, memory_order_relaxed);
             atomic_store_explicit(&g_pulse_current_pid, 0, memory_order_relaxed);
             g_pulse_current_bid[0] = '\0';
+            pthread_mutex_lock(&s_pulse_mutex);
+            pulse_app_state_t *st_rb = pulse_get_app_state(target.bid, today_str);
+            if (st_rb) {
+                st_rb->pulsed_this_bg = 0;
+            }
+            pthread_mutex_unlock(&s_pulse_mutex);
         }
         break;
     }
@@ -6395,7 +6497,9 @@ static int bgkill_load_config(void) {
 
     if (file_absent || !f) {
         g_bgkill_cfg_file_absent = 1;
+        pthread_rwlock_wrlock(&s_rule_lock);
         g_nbgkill_rules = 0;
+        pthread_rwlock_unlock(&s_rule_lock);
         g_bgkill_cfg_bad_count = 0;
         g_bgkill_bandgate = 1;   /* 配置消失时回到安全的默认门禁 */
         return -1;
@@ -7169,7 +7273,12 @@ int main(int argc, char *argv[]) {
                 int pulse_count = 0;
                 memorystatus_priority_entry_t *pulse_list = get_list(&pulse_count);
                 if (pulse_list) {
+                    /* P0 修复：D-003 门控快轮不经过 restart_round()，必须重置
+                     * s_napp_procs = -1，否则 rst_ensure_app_procs 会复用上轮陈旧缓存，
+                     * 丢弃本次 pulse_list（可能对已回前台的 App 误触发 pulse）。 */
+                    s_napp_procs = -1;
                     pulse_round(pulse_list, pulse_count);
+                    s_napp_procs = -1;
                     free(pulse_list);
                     g_fast_pulse_list_fail_streak = 0;
                 } else {
@@ -7188,8 +7297,14 @@ int main(int argc, char *argv[]) {
             time_t diag_t = time(NULL);
             struct tm diag_tm;
             localtime_r(&diag_t, &diag_tm);
+            int emit_stats = 0;
+            pthread_mutex_lock(&s_diag_mutex);
             if (g_diag_stats_hour != diag_tm.tm_hour) {
                 g_diag_stats_hour = diag_tm.tm_hour;
+                emit_stats = 1;
+            }
+            pthread_mutex_unlock(&s_diag_mutex);
+            if (emit_stats) {
                 diag_stats_emit();
             }
         }
@@ -7215,9 +7330,7 @@ int main(int argc, char *argv[]) {
                 applied_t *prev = applied_find(pid);
                 if (prev) {
                     prev->seen = 1;
-                    /* T3-IMP 3.3: 慢轮入口无条件刷新 sys_band 观察时间，
-                     * 把陈旧窗口压到 <= 1 个慢轮周期（原仅漂移时写）。 */
-                    applied_note_sys_band(prev, cur);
+                    applied_observe_band(prev, cur);
                 }
                 /* 首轮认领：上个实例记录过、且当前档位仍等于它设的值 */
                 if (!prev && g_nold_targets > 0 && !jp_is_foreground(cur)) {
@@ -7360,9 +7473,10 @@ int main(int argc, char *argv[]) {
                             slow_actions++;   /* E2: 空转判定（RETURN 也是动作） */
                             applied_remove(pid);   /* 还回后不再是我们的档位，内含 act_dedup_clear */
                             prev = NULL;           /* 指针已失效 */
+                            int32_t old_cur = cur;
                             cur = BAND_BACKGROUND;
                             JPLOG(JP_INFO, "%-6s pid=%d %s %d->%d ok",
-                                   "RETURN", (int)pid, proc_label_log(path), (int)cur, BAND_BACKGROUND);
+                                   "RETURN", (int)pid, proc_label_log(path), (int)old_cur, BAND_BACKGROUND);
                         } else {
                             /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
                             JPLOG(JP_ERR, "%-6s pid=%d %s %d->%d FAIL errno=%d %s",
