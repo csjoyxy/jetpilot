@@ -1,0 +1,86 @@
+name: build-jetweb
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "webhub/**"
+      - "review/**"
+    tags:
+      - "jetweb-v*"
+    paths:
+      - "webhub/**"
+      - ".github/workflows/build-jetweb.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Inject git commit into Info.plist
+        run: |
+          COMMIT="$(git rev-parse --short=7 HEAD)"
+          echo "JW_COMMIT=$COMMIT" >> $GITHUB_ENV
+          plutil -replace JWGitCommit -string "$COMMIT" webhub/app/Info.plist || plutil -insert JWGitCommit -string "$COMMIT" webhub/app/Info.plist
+
+      - name: Build jetwebctl root helper
+        working-directory: webhub
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall \
+            -miphoneos-version-min=15.0 \
+            jetwebctl.c -o jetwebctl
+          ldid -Sentitlements-helper.plist jetwebctl
+
+      - name: Build JetWeb app
+        working-directory: webhub
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall -fobjc-arc \
+            -miphoneos-version-min=15.0 \
+            -DJW_COMMIT=\"${{ env.JW_COMMIT }}\" \
+            -framework UIKit -framework Foundation -framework WebKit -framework CoreGraphics -framework QuartzCore \
+            app/main.m -o JetWeb
+          ldid -Sentitlements-app.plist JetWeb
+
+      - name: Package JetWeb.tipa
+        working-directory: webhub
+        run: |
+          rm -rf Payload JetWeb.tipa JetWeb.tipa.verification
+          mkdir -p Payload/JetWeb.app
+          cp app/Info.plist Payload/JetWeb.app/
+          cp app/Icon-*.png Payload/JetWeb.app/
+          cp JetWeb jetwebctl Payload/JetWeb.app/
+          chmod 755 Payload/JetWeb.app/JetWeb Payload/JetWeb.app/jetwebctl
+          zip -qr JetWeb.tipa Payload
+
+      - name: Verify JetWeb.tipa signature and entitlements
+        run: python3 webhub/verify-jetweb.py --tipa webhub/JetWeb.tipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JetWeb
+          path: |
+            webhub/JetWeb.tipa
+            webhub/JetWeb.tipa.verification
+
+      - name: Check package verification status before release
+        if: startsWith(github.ref, 'refs/tags/jetweb-v')
+        run: |
+          STATUS_FILE="webhub/JetWeb.tipa.verification"
+          if [ ! -f "$STATUS_FILE" ] || ! grep -q "^STATUS: VERIFIED$" "$STATUS_FILE"; then
+            echo "::error::JetWeb package verification status is not VERIFIED!"
+            exit 1
+          fi
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/jetweb-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: webhub/JetWeb.tipa
