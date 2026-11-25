@@ -9272,16 +9272,16 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
     NSString *content = [NSString stringWithFormat:@"level=%@\n", newLevel];
     BOOL ok = [content writeToFile:kDiagConfig atomically:YES encoding:NSUTF8StringEncoding error:&err];
 
-    /* 写后 lstat 复核：普通文件 / uid 0 / 组其他不可写（与 daemon jp_secure_precheck 同约束）。
+    /* FIX1: 写后属性复核——普通文件（非符号链接）/ 组其他不可写。diag.txt 由 App
+     * (mobile) 原子写创建，不再要求 root 属主；daemon 侧用等价专用校验读取。
      * atomic rename 每次换 inode，daemon stat 去重可感知；失败回滚选中项并弹窗。 */
     if (ok) {
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:kDiagConfig error:&err];
-        NSNumber *uid = [attrs objectForKey:NSFileOwnerAccountID];
         BOOL regular = [[attrs fileType] isEqualToString:NSFileTypeRegular];
-        ok = regular && (uid.unsignedIntValue == 0) && (([attrs filePosixPermissions] & 0022) == 0);
+        ok = regular && (([attrs filePosixPermissions] & 0022) == 0);
         if (!ok) {
             err = [NSError errorWithDomain:@"JPDiag" code:1
-                                  userInfo:@{NSLocalizedDescriptionKey:@"diag.txt 不是合法的特权普通文件"}];
+                                  userInfo:@{NSLocalizedDescriptionKey:@"diag.txt 不是合法的普通文件（组/其他不可写）"}];
         }
     }
     [self updateDiagLevelMenu];

@@ -2302,9 +2302,34 @@ static void diag_stats_emit(void) {
 
 /* DIAG2: 感知 diag.txt 变更并解析等级。
  * - 复用 jp_file_stat_changed 的 ino+size+mtime 去重，未变时零开销、零日志；
- * - jp_config_open 内部 fopen 不带 O_NOFOLLOW，故 fopen 前必须先 jp_secure_precheck；
+ * - fopen 不带 O_NOFOLLOW，故 fopen 前必须先 jp_diag_config_precheck；
  * - 严格单行 level=off|basic|detailed|full；文件缺失/超长/多键/未知值 → off；
  * - daemon 只读不写，绝不回写默认值；仅在解析结果变化时输出 PLS_CFG。 */
+
+/* FIX1: diag.txt 由 App(mobile) 原子写创建，不能套用守护进程状态文件的 root
+ * 属主规则。专用只读校验与 jp_secure_precheck 等价但去掉 uid==0：CONFIG_DIR
+ * 仍须真实目录且非符号链接；目标若存在须非符号链接、S_ISREG、组/其他不可写
+ * (& 0022)；ENOENT 允许（off）；其余 lstat 错误一律拒绝。不回写、不 fchmod，
+ * 且不改动 jp_secure_precheck 本身及任何其他调用点。 */
+static int jp_diag_config_precheck(const char *path) {
+    struct stat dir_st;
+    if (lstat(CONFIG_DIR, &dir_st) != 0 || S_ISLNK(dir_st.st_mode) ||
+        !S_ISDIR(dir_st.st_mode)) {
+        return -1;
+    }
+
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        if (S_ISLNK(st.st_mode) || !S_ISREG(st.st_mode) ||
+            (st.st_mode & 0022) != 0) {
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        return -1;
+    }
+    return 0;
+}
+
 static void diag_load_config(void) {
     int first = !s_diag_cfg_stamp.initialized;
     int absent = 0;
@@ -2320,9 +2345,9 @@ static void diag_load_config(void) {
         new_level = DIAG_OFF;
         reason = "absent";
     } else {
-        /* 符号链接 / 非普通文件 / 非 root 属主 / 组或其他可写 → 拒绝解析，
+        /* 符号链接 / 非普通文件 / 组或其他可写 → 拒绝解析（不再要求 root 属主），
          * 保持上一合法等级；stamp 已推进，下一轮不会重复打日志。 */
-        if (jp_secure_precheck(DIAG_CONFIG_PATH) != 0) {
+        if (jp_diag_config_precheck(DIAG_CONFIG_PATH) != 0) {
             DIAGLOG(DIAG_BASIC,
                     "DIAG event=PLS_CFG reason=diag_cfg_rejected from=%s to=%s file=ok diag_dropped=%d",
                     diag_level_to_str(g_diag_level), diag_level_to_str(g_diag_level), g_diag_dropped);
