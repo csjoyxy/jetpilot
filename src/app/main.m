@@ -9278,7 +9278,7 @@ static BOOL JPWaitForDaemonExit(pid_t pid) {
         NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:kDiagConfig error:&err];
         NSNumber *uid = [attrs objectForKey:NSFileOwnerAccountID];
         BOOL regular = [[attrs fileType] isEqualToString:NSFileTypeRegular];
-        ok = regular && (uid.unsignedIntValue == 0) && (([attrs fileAttributes] & 0022) == 0);
+        ok = regular && (uid.unsignedIntValue == 0) && (([attrs filePosixPermissions] & 0022) == 0);
         if (!ok) {
             err = [NSError errorWithDomain:@"JPDiag" code:1
                                   userInfo:@{NSLocalizedDescriptionKey:@"diag.txt 不是合法的特权普通文件"}];
