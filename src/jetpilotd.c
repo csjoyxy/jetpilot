@@ -177,10 +177,11 @@ extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buf
 /* ---- XNU kern_memorystatus.h 相关定义（头文件不公开，这里自己声明） ---- */
 #define MEMORYSTATUS_CMD_GET_PRIORITY_LIST        1
 #define MEMORYSTATUS_CMD_SET_PRIORITY_PROPERTIES  2
-/* E4: 按 pid 定向查档位（未公开命令，XNU osfmk/kern/kern_memorystatus.h）。
- * 私有 API 不得硬依赖：快轮必须带三级兜底（fast_scan_probe / fast_round），
- * 探测或运行失败自动降级，最坏回退每轮全表扫的现状。 */
-#define MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES  3
+/* E4 修正：XNU bsd/sys/kern_memorystatus.h 中 command=3 实为 GET_JETSAM_SNAPSHOT（无快照时
+ * 忽略 pid 返回 0 且不写缓冲区，会导致读出假 0 档）；XNU 原生按 pid 定向查有效档位是
+ * MEMORYSTATUS_CMD_GET_PRIORITY_LIST(1) 传入 pid>0 与 sizeof(memorystatus_priority_entry_t)
+ * （内核走 memorystatus_get_priority_pid，返回 sizeof(entry) 并填 p_memstat_effectivepriority）。
+ * 快轮仍保留三级兜底链（PID1 -> LISTSCAN -> SLEEP -> LEGACY）。 */
 
 /* iOS 16+ 档位参考值 —— T3-IMP: 档位数值的唯一权威来源（模块内零字面量） */
 #define BAND_IDLE            0
@@ -911,14 +912,24 @@ static int jp_snapshot_fresh(time_t seen_mono, time_t now_mono) {
            (now_mono - seen_mono) <= JP_SNAPSHOT_TTL_SECS;
 }
 
-/* 定向现读当前自然档位；失败返回 -1（调用方回退到手头 cur）。 */
+/* 定向现读当前有效档位（XNU memorystatus_cmd_get_priority_list 单 pid 分支，O(1)）；
+ * 严格校验返回字节数 == sizeof(entry) 且 entry.pid == pid，杜绝未写入缓冲区假阳性；
+ * 失败返回 -1 并保留内核原始 errno（进程退出为 ESRCH，协议不符置 EPROTO）。 */
 static int jp_read_current_band(pid_t pid, int32_t *band_out) {
-    if (pid <= 0 || !band_out) return -1;
-    memorystatus_priority_properties_t props;
-    memset(&props, 0, sizeof(props));
-    if (memorystatus_control(MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES,
-                             pid, 0, &props, sizeof(props)) != 0) return -1;
-    *band_out = props.priority;
+    if (pid <= 0 || !band_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    memorystatus_priority_entry_t entry;
+    memset(&entry, 0, sizeof(entry));
+    int ret = memorystatus_control(MEMORYSTATUS_CMD_GET_PRIORITY_LIST,
+                                   pid, 0, &entry, sizeof(entry));
+    if (ret < 0) return -1;
+    if ((size_t)ret != sizeof(entry) || entry.pid != pid) {
+        errno = EPROTO;
+        return -1;
+    }
+    *band_out = entry.priority;
     return 0;
 }
 
@@ -2105,16 +2116,17 @@ static int jp_file_stat_changed(const char *path, jp_file_stamp_t *stamp, int *o
 #define SLOW_MAX_SECS     JP_SNAPSHOT_TTL_SECS
 
 /* E4: 快轮模式（三级兜底链）
- *   CMD3     命令 3 按 pid 定向查档位（正常路径，私有 API，不得硬依赖）
+ *   PID1     GET_PRIORITY_LIST(1, pid>0) 单 pid 定向查有效档位（XNU memorystatus_get_priority_pid）
  *   LISTSCAN get_list() 全表取回后只遍历已知 pid（省 proc_pidpath，不省全表 syscall）
  *   SLEEP    快轮纯休眠，重断言交给慢轮（正确性不丢、只牺牲响应度）
  *   LEGACY   最坏回退现状：每轮全表扫（慢轮连续 3 次取不到全表时进入） */
-#define FAST_MODE_CMD3     0
+#define FAST_MODE_PID1     0
+#define FAST_MODE_CMD3     FAST_MODE_PID1
 #define FAST_MODE_LISTSCAN 1
 #define FAST_MODE_SLEEP    2
 #define FAST_MODE_LEGACY   3
 
-static int          g_fast_mode       = FAST_MODE_CMD3;
+static int          g_fast_mode       = FAST_MODE_PID1;
 static int          g_fast_mode_env_forced = 0; /* JP_FAST_SCAN=legacy 用户显式回退，排除在自动恢复外 */
 static time_t       g_slow_due_mono   = 0;              /* 下次慢轮到期（CLOCK_MONOTONIC 秒），0=首轮 */
 static int          g_slow_period     = SLOW_BASE_SECS; /* 当前慢轮周期（30→240，E2 退避） */
@@ -2131,9 +2143,9 @@ static time_t mono_now(void) {
     return ts.tv_sec;
 }
 
-/* E4: 启动探测 GET_PRIORITY_PROPERTIES(3) 可用性，决定快轮初始模式。
+/* E4: 启动探测单 pid 定向档位查询可用性（GET_PRIORITY_LIST, pid>0），决定快轮初始模式。
  * 运行时注入开关（真机验证/降级演练用）：
- *   JP_E4_PROBE_FAIL=1  模拟命令 3 不可用 → 快轮降级 LISTSCAN（验证 0→1）
+ *   JP_E4_PROBE_FAIL=1  模拟单 pid 查询不可用 → 快轮降级 LISTSCAN（验证 0→1）
  *   JP_FAST_SCAN=legacy 直接回退现状（验证最坏回退，每轮全表扫） */
 static void fast_scan_probe(void) {
     const char *legacy = getenv("JP_FAST_SCAN");
@@ -2148,14 +2160,11 @@ static void fast_scan_probe(void) {
         JPLOG(JP_WARN, "%-6s env JP_E4_PROBE_FAIL -> fast=list-scan fallback", "E4");
         return;
     }
-    memorystatus_priority_properties_t props;
-    memset(&props, 0, sizeof(props));
-    int rc = memorystatus_control(MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES,
-                                  getpid(), 0, &props, sizeof(props));
-    if (rc == 0) {
-        g_fast_mode = FAST_MODE_CMD3;
-        JPLOG(JP_INFO, "%-6s probe ok cmd3 self_prio=%d -> fast=cmd3",
-               "E4", (int)props.priority);
+    int32_t self_prio = -1;
+    if (jp_read_current_band(getpid(), &self_prio) == 0) {
+        g_fast_mode = FAST_MODE_PID1;
+        JPLOG(JP_INFO, "%-6s probe ok pid1 self_prio=%d -> fast=pid1",
+               "E4", (int)self_prio);
     } else {
         g_fast_mode = FAST_MODE_LISTSCAN;
         JPLOG(JP_WARN, "%-6s probe fail errno=%d -> fast=list-scan fallback", "E4", errno);
@@ -2206,16 +2215,14 @@ static int fast_reassert_one(applied_t *a, int32_t cur) {
     return 0;
 }
 
-/* E4/E1 快轮 · 模式 0：命令 3 逐已知 pid 定向查档位（O(已知数)，不取全表）。
+/* E4/E1 快轮 · 模式 0：GET_PRIORITY_LIST(1, pid>0) 逐已知 pid 定向查有效档位（O(已知数)，不取全表）。
  * 返回本轮重断言次数；-1 表示中途异常降级（本轮未 prune，防误剪存活条目）。 */
-static int fast_round_cmd3(void) {
+static int fast_round_pid1(void) {
     int actions = 0;
     for (int i = 0; i < g_napplied; i++) {
         applied_t *a = &g_applied[i];
-        memorystatus_priority_properties_t p;
-        memset(&p, 0, sizeof(p));
-        if (memorystatus_control(MEMORYSTATUS_CMD_GET_PRIORITY_PROPERTIES,
-                                 a->pid, 0, &p, sizeof(p)) != 0) {
+        int32_t cur = -1;
+        if (jp_read_current_band(a->pid, &cur) != 0) {
             if (errno == ESRCH) continue;   /* 进程退出：不置 seen，applied_prune 剪除 */
             /* E4 运行中异常失败（非 ESRCH）：整体降级到列表扫描模式。
              * P2（代码审核）：return 前清掉本轮已置的 seen 残留——本轮部分条目已
@@ -2224,7 +2231,7 @@ static int fast_round_cmd3(void) {
              * 清零后下一轮 LISTSCAN 从全表重新推导存活状态，死条目当轮剪除。
              * 本轮不 prune：防误剪存活进程（重断言动作不回滚，仅丢弃存活观察）。 */
             for (int k = 0; k < g_napplied; k++) g_applied[k].seen = 0;
-            JPLOG(JP_WARN, "%-6s cmd3_fail pid=%d errno=%d -> fast=list-scan fallback",
+            JPLOG(JP_WARN, "%-6s pid1_fail pid=%d errno=%d -> fast=list-scan fallback",
                    "E4", (int)a->pid, errno);
             g_fast_mode = FAST_MODE_LISTSCAN;
             return -1;
@@ -2232,10 +2239,10 @@ static int fast_round_cmd3(void) {
         a->seen = 1;
         if (!a->has_identity) {
             /* 无身份缓存（含旧实例 CLAIM）：只读观察不重断言，避免空闲退避 >240s 令归属过期 */
-            applied_observe_band(a, p.priority);
+            applied_observe_band(a, cur);
             continue;
         }
-        actions += fast_reassert_one(a, p.priority);
+        actions += fast_reassert_one(a, cur);
     }
     applied_prune();
     return actions;
@@ -2275,7 +2282,7 @@ static int fast_round_listscan(void) {
  * 退出条目交慢轮剪除）。 */
 static int fast_round(void) {
     switch (g_fast_mode) {
-    case FAST_MODE_CMD3:     return fast_round_cmd3();
+    case FAST_MODE_PID1:     return fast_round_pid1();
     case FAST_MODE_LISTSCAN: return fast_round_listscan();
     case FAST_MODE_SLEEP:
     case FAST_MODE_LEGACY:
@@ -3383,6 +3390,17 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
         diag_skip_note(dbid, dseq, DSK_BG_NOT_TRACKED, drnd, delp, (int)cur);
         return 0;
     }
+
+    /* 条件 7: 该 App 当前不在熔断/冷却期（BL-010：前移至 delay/fp/25s 死线之前，
+     * 使冷却期进后台首轮即记录 circuit_cooldown/escalated，避免无谓读 fp 与误报 PULSE_LATE） */
+    {
+        const char *cir = pulse_circuit_skip_reason(st, time(NULL), now_mono);
+        if (cir) {
+            diag_skip_note(dbid, dseq, cir, drnd, delp, (int)cur);
+            return 0;
+        }
+    }
+
     time_t elapsed_sec = now_mono - st->bg_start_mono;
     if (elapsed_sec < (time_t)rule->delay_s) {
         diag_skip_note(dbid, dseq, DSK_DELAY_NOT_MET, drnd, delp, (int)cur);
@@ -3426,15 +3444,6 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
         }
         diag_skip_too_late(dbid, dseq, drnd, elapsed_sec, (int)cur);
         return 0;
-    }
-
-    /* 条件 7: 该 App 当前不在熔断/冷却期（BL-010：布尔改为惰性时间谓词） */
-    {
-        const char *cir = pulse_circuit_skip_reason(st, time(NULL), now_mono);
-        if (cir) {
-            diag_skip_note(dbid, dseq, cir, drnd, delp, (int)cur);
-            return 0;
-        }
     }
 
     /* 检查是否命中频控 (条件 4 和 5)：命中频控者可作为对照组采样来源 (M5 / Q2) */
@@ -4334,6 +4343,7 @@ static void *pulse_worker_thread(void *arg) {
     int diag_ovr_seen = 0, diag_ovr_t = -1, diag_ovr_val = -1, diag_ovr_attr = 0;
     int diag_ovr_band = -1, diag_reassert_ok = -1;
     uint64_t diag_ovr_fp = 0;
+    int fg_interrupted = 0;
 
     /* 截止时间检查 (Place 3 worker 开头)：bg_start + 25 秒之前才能真正开始 (C2-T / D1-a) */
     char today_str[16] = {0};
@@ -4668,12 +4678,17 @@ static void *pulse_worker_thread(void *arg) {
                     }
                 } else {
                     /* 不满足条件：结束窗口，end_reason="OVERRIDDEN"，不恢复 */
+                    if (jp_is_foreground(band)) fg_interrupted = 1;
                     end_reason = "OVERRIDDEN";
                     should_restore = 0;
                     break;
                 }
             } else {
                 /* 重新设限之后又被改：结束窗口，end_reason="OVERRIDDEN"，不恢复，不再重新设限 */
+                int32_t band2 = -1;
+                if (pulse_get_cur_priority(pid, &band2) == 0 && jp_is_foreground(band2)) {
+                    fg_interrupted = 1;
+                }
                 end_reason = "OVERRIDDEN";
                 should_restore = 0;
                 break;
@@ -4766,6 +4781,7 @@ static void *pulse_worker_thread(void *arg) {
             if (cpu_calc_ok && cpu_ms == 0) {
                 end_reason = "SUSPENDED";
             } else {
+                if (jp_is_foreground(diag_ovr_band)) fg_interrupted = 1;
                 end_reason = "OVERRIDDEN";
             }
             snprintf(restore_verdict_str, sizeof(restore_verdict_str), "%s", end_reason);
@@ -4933,7 +4949,8 @@ static void *pulse_worker_thread(void *arg) {
         clock_gettime(CLOCK_MONOTONIC, &ts);
         st->last_pulse_mono = ts.tv_sec;
         st->day_count++;
-        if (strcmp(end_reason, "SUSPENDED") != 0 && strcmp(end_reason, "CPU_FAIL") != 0) {
+        int fg_ovr = (strcmp(end_reason, "OVERRIDDEN") == 0 && fg_interrupted);
+        if (strcmp(end_reason, "SUSPENDED") != 0 && strcmp(end_reason, "CPU_FAIL") != 0 && !fg_ovr) {
             st->total_pulses++;
         }
 
@@ -4964,11 +4981,13 @@ static void *pulse_worker_thread(void *arg) {
         /* 卡 P-4: 计算 fp_final: 有 ovr_t 且这次以 OVERRIDDEN 结束，fp_final = fp_ovr; 其他情况维持原取法 */
         uint64_t fp_final = (ovr_t > 0 && strcmp(end_reason, "OVERRIDDEN") == 0) ? fp_ovr
                             : (has_fp60 ? fp60 : (has_fp30 ? fp30 : (has_fp15 ? fp15 : fp0)));
-        /* 卡 P-4: 从 no_drop 排除列表去掉 OVERRIDDEN, OVERRIDDEN 照常计入 total_pulses 并参与 no_drop/unresponsive 判定 */
+        /* 卡 P-4: 后台系统改写 OVERRIDDEN 照常计入 total_pulses 并参与 no_drop/unresponsive 判定；
+         * 但用户切回前台 (band>=100) 引发的前台打断 fg_ovr 不属于后台释放无响应，予以排除 */
         if (strcmp(end_reason, "GONE") != 0 && !gone_post_restore &&
             strcmp(end_reason, "PID_REUSED") != 0 &&
             strcmp(end_reason, "SUSPENDED") != 0 &&
-            strcmp(end_reason, "CPU_FAIL") != 0) {
+            strcmp(end_reason, "CPU_FAIL") != 0 &&
+            !fg_ovr) {
             if (fp_final + 5 >= fp0) {
                 st->no_drop_pulses++;
                 if (st->total_pulses >= 2 && st->no_drop_pulses >= 2) {
@@ -5499,7 +5518,10 @@ static int pulse_fast_gate_open(time_t now_mono) {
     for (int i = 0; i < g_npulse_app_states; i++) {
         pulse_app_state_t *st = &g_pulse_app_states[i];
         if (!st->in_bg || st->tracked_pid <= 0 || st->bg_start_mono <= 0) continue;
-        if (st->pulsed_this_bg || st->ctrl_this_bg || st->pulse_late_this_bg) continue;
+        if (st->pulsed_this_bg || st->ctrl_this_bg || st->pulse_late_this_bg ||
+            st->restore_tripped_today) continue;
+        if (pulse_circuit_skip_reason(st, time(NULL) + PULSE_DEADLINE_BG_SEC,
+                                      now_mono + PULSE_DEADLINE_BG_SEC) != NULL) continue;
 
         int enabled = 0;
         for (int r = 0; r < g_npulse_rules; r++) {
