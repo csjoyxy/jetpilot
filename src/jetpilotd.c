@@ -1697,8 +1697,9 @@ static void rst_clear_rule_state(rst_rule_state_t *st) {
 #define PULSE_REASSERT_MAX_SEC 30 /* 卡 P-2: 窗口前 30 秒内允许重设限额一次 */
 /* D-003: 门控打开时快轮的唤醒上限，须显著小于 25s 死线，保证窗口内至少多次判定 */
 #define PULSE_FAST_GATE_POLL_SEC 5
-/* Ltarget: 水位窗口内允许的绝对涨幅下限（再按 fp0/4 取大），替代失效的比例守卫 */
-#define PULSE_LTARGET_GROWTH_CAP_MB 128
+/* XNU 黄金警告带越界前保护比例：L=ceil(fp/0.85) 使起始占用落在 ~85%×L，
+ * 涨至 95%×L 即提前恢复，绝不触碰 100%×L 引发 highwater 误杀 */
+#define PULSE_GUARD_PCT      95
 /* P1-1: 有启用 pulse 规则时慢轮周期上限，保证首次进后台 <=20s 被观测 */
 #define PULSE_FIRST_OBSERVE_MAX_SLOW 20
 #define PULSE_GLOBAL_DAYMAX   100
@@ -1792,6 +1793,8 @@ static int g_diag_cfg_file_absent = 1;
 #define BGKILL_MAX_MAX       30
 #define BGKILL_DEFAULT_MIN   60
 #define BGKILL_DEFAULT_MAX   5
+/* 系统 dasd 应用预热空壳识别兜底上限：仅对「自诞生从未进过前台 (ever_fg=0)」的进程生效 */
+#define BGKILL_PREWARM_MAX_FP_MB 40
 
 typedef struct {
     char    bid[128];
@@ -1806,6 +1809,9 @@ typedef struct {
     int    in_bg;
     time_t bg_start_mono;
     int    bg_rounds;
+    int    ever_fg;        /* 1: 当前 tracked_pid 曾观测到处于前台 (band>=100) */
+    int    prewarm_hold;   /* 1: 诞生于后台且初始 fp<40MB，按系统预热空壳暂缓清理 */
+    int    prewarm_logged; /* 1: 当前 tracked_pid 已输出过单次 prewarm_skip 日志 */
     int    today_count;
     int    today_y;
     int    today_m;
@@ -3621,16 +3627,18 @@ static void pulse_sort_queue(void) {
 /* =========================================================================
  * 后台内存释放：Pulse 写入、回读校验与统一 Restore 实现 (v0.7.8 C2-3)
  * ========================================================================= */
-/* Ltarget 语义（用户拍板）：L = 规则 target_mb；不要求把占用压到 target，
- * 只要求后台且 fp>=target 时向系统发出信号、把 memlimit_inactive 设为 target。
- * 去掉原 ceil(fp/0.85) / ceil(fp*1.1) 下限保护；非 FATAL 位、active 属性、
- * 身份校验与回读校验保持原样（见 :3633-3667）。两函数保留以维持调用点清晰。 */
-static inline uint64_t calc_hard_guard_limit(uint64_t target_mb) {
-    return target_mb;
+/* XNU 黄金警告带语义：rule->target_mb 仅作后台触发门槛（fp > target 才入队/执行）；
+ * 实际写入内核的非致命水位取 L = ceil(fp0 / 0.85)，使当前占用精准落在 ~85%×L，
+ * 命中 XNU ledger [80%×L, 100%×L) 警告区间（PHYS_FOOTPRINT_WARNING_LEVEL=80）：
+ * 1) !limit_exceeded 分支向 UIKit 投递 NOTE_MEMORYSTATUS_PRESSURE_WARN/CRITICAL，
+ *    真正触发 applicationDidReceiveMemoryWarning 释放可回收缓存；
+ * 2) fp0 < L 确保 memorystatus_kill_hiwat_proc 跳过该进程，杜绝 highwater 误杀保活 App。 */
+static inline uint64_t calc_hard_guard_limit(uint64_t fp_mb) {
+    return (fp_mb * 11 + 9) / 10;   /* ceil(fp * 1.10) */
 }
 
-static inline uint64_t calc_pulse_limit(uint64_t target_mb) {
-    return target_mb;
+static inline uint64_t calc_pulse_limit(uint64_t fp_mb) {
+    return (fp_mb * 100 + 84) / 85; /* ceil(fp / 0.85) */
 }
 
 static inline uint64_t calc_restore_floor(uint64_t fp_mb) {
@@ -4426,8 +4434,7 @@ static void *pulse_worker_thread(void *arg) {
         goto thread_done;
     }
 
-    /* Ltarget: L = 本规则 target_mb（不再取 fp 的 1.1 / 1.18 倍下限保护）。
-     * 只向系统发出非致命水位信号，不承诺把占用压到 target。 */
+    /* target_mb 作后台触发门槛，实际水位 L = ceil(fp0 / 0.85) 命中 XNU [80%,100%) 警告带 */
     pulse_rule_t pulse_rule_snap;
     uint64_t pulse_target_mb = 0;
     if (pulse_find_rule(bid, &pulse_rule_snap) && pulse_rule_snap.enabled) {
@@ -4439,14 +4446,29 @@ static void *pulse_worker_thread(void *arg) {
         pulse_clear_state_file(pid);
         goto thread_done;
     }
-    uint64_t L = calc_pulse_limit(pulse_target_mb);
-    uint64_t hard_guard = calc_hard_guard_limit(pulse_target_mb);
+    if (fp0 <= pulse_target_mb) {
+        /* 二次读 fp0 已自行回落至 target 以下：无需写水位，清理快照安全退出 */
+        diag_skip_note(bid, diag_bg_seq, DSK_FP_BELOW_TARGET, diag_round, -1, diag_band_in);
+        pulse_clear_state_file(pid);
+        goto thread_done;
+    }
+    uint64_t L = calc_pulse_limit(fp0);
+    uint64_t hard_guard = calc_hard_guard_limit(fp0);
     if (L < hard_guard) L = hard_guard;
 
     memorystatus_memlimit_properties_t cur_props;
     if (pulse_get_memlimit_props(pid, &cur_props) != 0) {
         JPLOG(JP_INFO, "RESTORE_REFUSED app=%s pid=%d reason=get", bid, (int)pid);
         pulse_note_restore_failed(bid, pid, "get");
+        pulse_clear_state_file(pid);
+        goto thread_done;
+    }
+    if (cur_props.memlimit_active > 0 && L > (uint64_t)cur_props.memlimit_active) {
+        L = (uint64_t)cur_props.memlimit_active;
+    }
+    if (fp0 * 100 >= (uint64_t)PULSE_GUARD_PCT * L) {
+        JPLOG(JP_INFO, "PULSE_SKIP_NEAR_CAP app=%s pid=%d fp=%llu active=%d",
+              bid, (int)pid, (unsigned long long)fp0, cur_props.memlimit_active);
         pulse_clear_state_file(pid);
         goto thread_done;
     }
@@ -4641,10 +4663,17 @@ static void *pulse_worker_thread(void *arg) {
                     reassert_count = 1;
                     proc_identity_t check_reassert_ident;
                     int reassert_ok = 0;
-                    if (pulse_get_proc_identity(pid, &check_reassert_ident) == 0 &&
+                    uint64_t r_L = calc_pulse_limit(fp_ovr);
+                    uint64_t r_guard = calc_hard_guard_limit(fp_ovr);
+                    if (r_L < r_guard) r_L = r_guard;
+                    if (loop_props.memlimit_active > 0 && r_L > (uint64_t)loop_props.memlimit_active) {
+                        r_L = (uint64_t)loop_props.memlimit_active;
+                    }
+                    if (fp_ovr * 100 < (uint64_t)PULSE_GUARD_PCT * r_L &&
+                        pulse_get_proc_identity(pid, &check_reassert_ident) == 0 &&
                         pulse_compare_proc_identity(&ident, &check_reassert_ident)) {
                         memorystatus_memlimit_properties_t r_props = loop_props;
-                        r_props.memlimit_inactive = (int32_t)L;
+                        r_props.memlimit_inactive = (int32_t)r_L;
                         r_props.memlimit_inactive_attr &= ~MEMORYSTATUS_MEMLIMIT_ATTR_FATAL;
                         if (pulse_set_memlimit_props(pid, &r_props) == 0) {
                             memorystatus_memlimit_properties_t rb;
@@ -4654,7 +4683,7 @@ static void *pulse_worker_thread(void *arg) {
                                 int rb_inact_fatal = (rb.memlimit_inactive_attr & MEMORYSTATUS_MEMLIMIT_ATTR_FATAL) ? 1 : 0;
                                 if (rb.memlimit_active == r_props.memlimit_active &&
                                     rb_act_fatal == exp_act_fatal &&
-                                    rb.memlimit_inactive == (int32_t)L &&
+                                    rb.memlimit_inactive == (int32_t)r_L &&
                                     rb_inact_fatal == 0) {
                                     reassert_ok = 1;
                                 }
@@ -4665,7 +4694,8 @@ static void *pulse_worker_thread(void *arg) {
                     diag_reassert_ok = reassert_ok;  /* DIAG2: 收尾统一输出 */
                     if (reassert_ok) {
                         reassert_val = 1;
-                        expected_inactive = (int32_t)L;
+                        L = r_L;
+                        expected_inactive = (int32_t)r_L;
                         state.orig_inactive = ovr_val;
                         state.orig_inactive_attr = ovr_attr;
                         pulse_save_state_file(&state);
@@ -4695,30 +4725,24 @@ static void *pulse_worker_thread(void *arg) {
             }
         }
 
-        /* P0 返工：旧比例守卫按 L≈1.18×fp0 设计；Ltarget 下 L=target 且入队保证
-         * fp>target=L，cur_fp*100>=95*L 首秒恒成立 → ARMED 后立刻 ABORT、水位 1s 撤销。
-         * 现停用比例守卫，改为相对 fp0 的绝对涨幅保护，并保留 60s 定时恢复。 */
-        uint64_t growth = (fp0 / 4 > (uint64_t)PULSE_LTARGET_GROWTH_CAP_MB)
-                          ? fp0 / 4 : (uint64_t)PULSE_LTARGET_GROWTH_CAP_MB;
-        uint64_t runaway_cap = fp0 + growth;
-        if (cur_fp > runaway_cap) {
-            /* 断言：fp>target 时不得出现 t_reach<=1 的 ABORT；若真在首秒触发，
-             * 只能是暴涨异常，打 WARN 供真机核对（正常路径须 60s 或 fp<=target 才结束）。 */
-            if (sec <= 1 && fp0 > pulse_target_mb) {
-                JPLOG(JP_WARN, "PULSE_ASSERT early_abort app=%s pid=%d fp=%llu fp0=%llu cap=%llu",
+        /* 95%×L 越界前保护：L = ceil(fp/0.85) 使起始占用落在 ~85%×L（处于 XNU [80%,100%)
+         * UIKit 警告带）。一旦后台异常暴涨达到 95%×L，立即在触碰 100%×L 之前恢复原限额，
+         * 从数学上杜绝越界触发 memorystatus_kill_hiwat_proc (highwater) 误杀保活 App。 */
+        if (cur_fp * 100 >= (uint64_t)PULSE_GUARD_PCT * L) {
+            if (sec <= 1) {
+                JPLOG(JP_WARN, "PULSE_ASSERT early_abort app=%s pid=%d fp=%llu fp0=%llu L=%llu",
                       bid, (int)pid, (unsigned long long)cur_fp,
-                      (unsigned long long)fp0, (unsigned long long)runaway_cap);
+                      (unsigned long long)fp0, (unsigned long long)L);
             }
-            JPLOG(JP_INFO, "ABORT runaway fp=%llu cap=%llu",
-                  (unsigned long long)cur_fp, (unsigned long long)runaway_cap);
+            JPLOG(JP_INFO, "ABORT guard95 fp=%llu L=%llu",
+                  (unsigned long long)cur_fp, (unsigned long long)L);
             end_reason = "ABORT";
             t_reach = sec;
             should_restore = 1;
             break;
         }
 
-        /* P0 返工：TARGET_REACHED 重定义为 fp 已降到 target 以下（App 自行收敛），
-         * 不再使用 Ltarget 下不可达的 fp<0.8*L。 */
+        /* TARGET_REACHED：占用已回落至规则 target_mb 以下，提前恢复并继续只读采样至 60s */
         if (cur_fp <= pulse_target_mb) {
             JPLOG(JP_INFO, "TARGET_REACHED fp=%llu <= target=%llu",
                   (unsigned long long)cur_fp, (unsigned long long)pulse_target_mb);
@@ -5177,6 +5201,7 @@ static rst_app_proc_t s_app_procs[RST_MAX_TRACKED_APPS];
 static int s_napp_procs = -1;
 
 static void rst_ensure_app_procs(memorystatus_priority_entry_t *list, int count);
+static void bgkill_observe_foreground_apps(void);
 
 static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     if (g_npulse_rules == 0 || g_pulse_cfg_file_absent) return;
@@ -5201,6 +5226,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     pulse_check_date_reset(today_str);
 
     rst_ensure_app_procs(list, count);
+    bgkill_observe_foreground_apps();
 
     pid_t best_ctrl_pid = 0;
     char best_ctrl_bid[128] = {0};
@@ -6779,6 +6805,8 @@ static int bgkill_load_config(void) {
 
 static int bgkill_read_current_band(pid_t pid, int32_t *band_out) {
     if (pid <= 0 || !band_out) return -1;
+    if (jp_read_current_band(pid, band_out) == 0) return 0;
+    if (errno == ESRCH) return -1;
     int count = 0;
     memorystatus_priority_entry_t *list = get_list(&count);
     if (!list) return -1;
@@ -6792,6 +6820,45 @@ static int bgkill_read_current_band(pid_t pid, int32_t *band_out) {
     }
     free(list);
     return found ? 0 : -1;
+}
+
+static void bgkill_clear_pid_tracking(bgkill_rule_state_t *st) {
+    if (!st) return;
+    st->tracked_pid = 0;
+    st->in_bg = 0;
+    st->bg_start_mono = 0;
+    st->bg_rounds = 0;
+    st->ever_fg = 0;
+    st->prewarm_hold = 0;
+    st->prewarm_logged = 0;
+}
+
+/* 同步观察 s_app_procs 中的前台出现记录（供门控快轮 pulse_round 顺带复用）：
+ * 一旦某规则主进程上过前台 (jp_is_foreground)，该 pid 生命周期内闩锁 ever_fg=1 并重置后台计时。 */
+static void bgkill_observe_foreground_apps(void) {
+    if (g_bgkill_cfg_file_absent || !g_bgkill_master || s_napp_procs <= 0) return;
+    for (int i = 0; i < g_nbgkill_rules; i++) {
+        bgkill_rule_t *rule = &g_bgkill_rules[i];
+        if (!rule->enabled) continue;
+        bgkill_rule_state_t *st = bgkill_get_rule_state(rule->bid);
+        if (!st) continue;
+        for (int j = 0; j < s_napp_procs; j++) {
+            if (strcmp(s_app_procs[j].bid, rule->bid) == 0) {
+                pid_t pid = s_app_procs[j].pid;
+                int32_t cur = s_app_procs[j].priority;
+                if (jp_is_foreground(cur)) {
+                    st->tracked_pid = pid;
+                    st->in_bg = 0;
+                    st->bg_start_mono = 0;
+                    st->bg_rounds = 0;
+                    st->ever_fg = 1;
+                    st->prewarm_hold = 0;
+                    st->prewarm_logged = 0;
+                }
+                break;
+            }
+        }
+    }
 }
 
 static void bgkill_log_skip(const bgkill_rule_t *rule, bgkill_rule_state_t *st,
@@ -6814,10 +6881,7 @@ static void bgkill_log_skip(const bgkill_rule_t *rule, bgkill_rule_state_t *st,
 static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
     if (g_bgkill_cfg_file_absent || !g_bgkill_master) {
         for (int i = 0; i < g_nbgkill_rule_states; i++) {
-            g_bgkill_rule_states[i].tracked_pid = 0;
-            g_bgkill_rule_states[i].in_bg = 0;
-            g_bgkill_rule_states[i].bg_start_mono = 0;
-            g_bgkill_rule_states[i].bg_rounds = 0;
+            bgkill_clear_pid_tracking(&g_bgkill_rule_states[i]);
         }
         return;
     }
@@ -6845,10 +6909,7 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
         bgkill_check_date_reset(st, &tm_now);
 
         if (!rule->enabled) {
-            st->in_bg = 0;
-            st->bg_start_mono = 0;
-            st->bg_rounds = 0;
-            st->tracked_pid = 0;
+            bgkill_clear_pid_tracking(st);
             continue;
         }
 
@@ -6864,20 +6925,38 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
         }
 
         if (main_pid <= 0) {
-            st->tracked_pid = 0;
-            st->in_bg = 0;
-            st->bg_start_mono = 0;
-            st->bg_rounds = 0;
+            bgkill_clear_pid_tracking(st);
             continue;
         }
 
-        /* pid 变了：清零，按新进程重新计时 */
+        /* pid 变了：清零，按新进程重新建账 */
         if (main_pid != st->tracked_pid) {
             st->tracked_pid = main_pid;
-            st->in_bg = (main_cur < BAND_PROTECT_DEFAULT) ? 1 : 0;
-            st->bg_start_mono = (main_cur < BAND_PROTECT_DEFAULT) ? now_mono : 0;
-            st->bg_rounds = (main_cur < BAND_PROTECT_DEFAULT) ? 1 : 0;
+            st->ever_fg = jp_is_foreground(main_cur) ? 1 : 0;
+            st->prewarm_logged = 0;
+            if (main_cur < BAND_PROTECT_DEFAULT) {
+                st->in_bg = 1;
+                st->bg_start_mono = now_mono;
+                st->bg_rounds = 1;
+                uint64_t init_fp_bytes = 0;
+                if (!st->ever_fg && memp_get_phys_footprint(main_pid, &init_fp_bytes) == 0 &&
+                    (init_fp_bytes / (1024ULL * 1024ULL)) < (uint64_t)BGKILL_PREWARM_MAX_FP_MB) {
+                    st->prewarm_hold = 1;
+                } else {
+                    st->prewarm_hold = 0;
+                }
+            } else {
+                st->in_bg = 0;
+                st->bg_start_mono = 0;
+                st->bg_rounds = 0;
+                st->prewarm_hold = 0;
+            }
         } else {
+            if (jp_is_foreground(main_cur)) {
+                st->ever_fg = 1;
+                st->prewarm_hold = 0;
+                st->prewarm_logged = 0;
+            }
             /* 档位 >= BAND_PROTECT_DEFAULT 清零; 低于该档进入记 bg_start_mono, 之后每轮 bg_rounds++ */
             if (main_cur >= BAND_PROTECT_DEFAULT) {
                 st->in_bg = 0;
@@ -6890,6 +6969,19 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
                     st->bg_rounds = 1;
                 } else {
                     st->bg_rounds++;
+                }
+                /* 预热暂缓中的进程若在两次慢轮间隙被用户短暂打开又切回后台（错过前台采样，
+                 * 但 UIKit 已初始化使内存跨过 40MB），立刻解除暂缓并从当前时刻起重新倒计时 */
+                if (st->prewarm_hold) {
+                    uint64_t chk_fp_bytes = 0;
+                    if (memp_get_phys_footprint(main_pid, &chk_fp_bytes) == 0 &&
+                        (chk_fp_bytes / (1024ULL * 1024ULL)) >= (uint64_t)BGKILL_PREWARM_MAX_FP_MB) {
+                        st->prewarm_hold = 0;
+                        st->ever_fg = 1;
+                        st->prewarm_logged = 0;
+                        st->bg_start_mono = now_mono;
+                        st->bg_rounds = 1;
+                    }
                 }
             }
         }
@@ -6936,6 +7028,11 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
         int32_t cur_band = -1;
         if (bgkill_read_current_band(main_pid, &cur_band) != 0 ||
             cur_band >= BAND_PROTECT_DEFAULT) {
+            if (cur_band >= 0 && jp_is_foreground(cur_band)) {
+                st->ever_fg = 1;
+                st->prewarm_hold = 0;
+                st->prewarm_logged = 0;
+            }
             st->in_bg = 0;
             st->bg_start_mono = 0;
             st->bg_rounds = 0;
@@ -6960,13 +7057,40 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
             }
         }
 
-        /* 全部满足，执行 kill */
         char fp_str[32] = "NA";
         uint64_t fp_bytes = 0;
-        if (memp_get_phys_footprint(main_pid, &fp_bytes) == 0) {
-            snprintf(fp_str, sizeof(fp_str), "%llu", (unsigned long long)(fp_bytes / (1024 * 1024)));
+        uint64_t fp_mb = 0;
+        int fp_ok = (memp_get_phys_footprint(main_pid, &fp_bytes) == 0);
+        if (fp_ok) {
+            fp_mb = fp_bytes / (1024ULL * 1024ULL);
+            snprintf(fp_str, sizeof(fp_str), "%llu", (unsigned long long)fp_mb);
         }
 
+        /* 触发条件 8: 跳过系统 dasd 应用预热空壳（从未进过前台且物理内存 < 40MB）。
+         * 只要进过前台 (ever_fg=1)，无论内存多小均照常按时清理，保持「不看内存、用过必清」性质；
+         * <40MB 兜底仅用于放行守护进程重启前已打开用过的后台存量进程。 */
+        if (!st->ever_fg) {
+            if (fp_ok && fp_mb < (uint64_t)BGKILL_PREWARM_MAX_FP_MB) {
+                st->prewarm_hold = 1;
+                if (!st->prewarm_logged) {
+                    st->prewarm_logged = 1;
+                    JPLOG(JP_INFO, "%-6s prewarm_skip pid=%d bid=%s bg_s=%d fp=%s",
+                          "BGK", (int)main_pid, rule->bid, bg_sec_elapsed, fp_str);
+                }
+                bgkill_log_skip(rule, st, "prewarm", now_mono);
+                continue;
+            }
+            if (st->prewarm_hold && fp_ok && fp_mb >= (uint64_t)BGKILL_PREWARM_MAX_FP_MB) {
+                st->prewarm_hold = 0;
+                st->ever_fg = 1;
+                st->prewarm_logged = 0;
+                st->bg_start_mono = now_mono;
+                st->bg_rounds = 1;
+                continue;
+            }
+        }
+
+        /* 全部满足，执行 kill */
         int krc = kill(main_pid, SIGKILL);
         int kill_errno = (krc == 0) ? 0 : errno;
         if (kill_errno == 0 || kill_errno == ESRCH) {
@@ -6979,10 +7103,7 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
               "BGK", (int)main_pid, rule->bid, bg_sec_elapsed, (int)rule->min,
               (int)cur_band, (int)sys_band, fp_str, today_n, kill_errno);
 
-        st->in_bg = 0;
-        st->bg_start_mono = 0;
-        st->bg_rounds = 0;
-        st->tracked_pid = 0;
+        bgkill_clear_pid_tracking(st);
     }
 }
 
