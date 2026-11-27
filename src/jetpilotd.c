@@ -242,10 +242,20 @@ extern int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 #define BANDS_TAKEN_PATH CONFIG_DIR "/bands.req.taken"
 #define BANDS_PATH       CONFIG_DIR "/bands.txt"
 #define BANDS_TMP_PATH   CONFIG_DIR "/bands.txt.tmp"
-#define JP_VERSION   "0.8.6"
+#define JP_VERSION   "0.8.7"
 #ifndef JP_COMMIT
 #define JP_COMMIT    "dev"
 #endif
+
+/* v0.8.7: AssertionServices BKSApplicationStateMonitor 状态常量（真机框架核实） */
+#define JP_BKS_STATE_TERMINATED   1U
+#define JP_BKS_STATE_BG_SUSPENDED 2U
+#define JP_BKS_STATE_BG_RUNNING   4U
+#define JP_BKS_STATE_FOREGROUND   8U
+#define JP_BKS_STATE_ALL          0xFFFFFFFFU
+#define APPMON_RING_CAP           64
+#define APPMON_MAX_BIDS           128
+#define APPMON_BG_PENDING_MAX_SEC 3
 #define LOG_PATH     CONFIG_DIR "/daemon.log"
 #define LOG_OLD_PATH CONFIG_DIR "/daemon.log.1"
 #define LOG_MAX_BYTES (256 * 1024)
@@ -1067,7 +1077,7 @@ static int jp_kill_allowed_with_state(int32_t natural_band, uint32_t state, int 
     return jp_is_frozen_idle(natural_band, state, state_known);
 }
 
-static int jp_kill_allowed(int32_t natural_band) {
+static inline int jp_kill_allowed(int32_t natural_band) {
     return jp_kill_allowed_with_state(natural_band, 0, 0);
 }
 
@@ -1649,7 +1659,34 @@ static volatile sig_atomic_t g_locked = 0;
 static int g_lock_token = -1;
 static int g_lock_fd = -1;
 
-/* 规则：lock_refresh() 只允许在 lockmon_init() 和 wait_lock_change() 里调用，
+/* v0.8.7 APPMON: BKSApplicationStateMonitor 事件环与自唤醒管道（严格叶锁 s_appmon_mutex） */
+typedef struct {
+    char     bid[128];
+    pid_t    pid;
+    uint32_t state;
+    time_t   mono;
+} appmon_event_t;
+
+static pthread_mutex_t s_appmon_mutex = PTHREAD_MUTEX_INITIALIZER;
+static appmon_event_t  s_appmon_ring[APPMON_RING_CAP];
+static unsigned        s_appmon_head = 0;
+static unsigned        s_appmon_count = 0;
+static int             s_appmon_pipe_pending = 0;
+static unsigned long   s_appmon_dropped = 0;
+static int             g_appmon_pipe[2] = { -1, -1 };
+static int             g_appmon_active = 0;
+
+static void appmon_drain_pipe(void) {
+    pthread_mutex_lock(&s_appmon_mutex);
+    if (g_appmon_pipe[0] >= 0) {
+        char buf[64];
+        while (read(g_appmon_pipe[0], buf, sizeof(buf)) > 0) {}
+    }
+    s_appmon_pipe_pending = 0;
+    pthread_mutex_unlock(&s_appmon_mutex);
+}
+
+/* 规则：lock_refresh() 只允许在 lockmon_init() 和 wait_events_ms() 里调用，
  * 别处一律不得调用。其余代码，不论哪个线程，都只读 g_locked。 */
 static void lock_refresh(void) {
     uint64_t st = 0;
@@ -1667,30 +1704,61 @@ static void lockmon_init(void) {
     lock_refresh();
 }
 
-/* 睡 secs 秒，锁屏状态一变就提前醒。返回 1 表示状态变了 */
-static int wait_lock_change(int secs) {
-    if (g_got_sigterm) return 0;
-    if (g_lock_fd < 0) {
-        for (int i = 0; i < secs && !g_got_sigterm; i++) {
-            sleep(1);
+/* 多路事件睡眠（毫秒精度）：同时监听锁屏状态变化 fd 与 APPMON 前后台推送管道。
+ * 任一事件到达立即唤醒；APPMON 唤醒后做 80ms 微聚合，待 runningboardd 完成
+ * XNU Jetsam 档位切换再返回主循环，兼顾毫秒响应与单次到位。 */
+static void wait_events_ms(int timeout_ms, int *lock_changed_out, int *appmon_woke_out) {
+    if (lock_changed_out) *lock_changed_out = 0;
+    if (appmon_woke_out) *appmon_woke_out = 0;
+    if (g_got_sigterm || timeout_ms <= 0) return;
+
+    int lfd = g_lock_fd;
+    int afd = g_appmon_pipe[0];
+    if (lfd < 0 && afd < 0) {
+        int rem_ms = timeout_ms;
+        while (rem_ms > 0 && !g_got_sigterm) {
+            int step_ms = (rem_ms > 1000) ? 1000 : rem_ms;
+            usleep((useconds_t)step_ms * 1000U);
+            rem_ms -= step_ms;
         }
-        return 0;
+        return;
     }
-    fd_set rf; FD_ZERO(&rf); FD_SET(g_lock_fd, &rf);
-    struct timeval tv = { secs, 0 };
-    if (select(g_lock_fd + 1, &rf, NULL, NULL, &tv) > 0) {
-        int tok;
-        while (read(g_lock_fd, &tok, sizeof(tok)) == sizeof(tok)) {
-            /* 一次可能来多条，读空即可 */
-            fd_set r2; FD_ZERO(&r2); FD_SET(g_lock_fd, &r2);
-            struct timeval z = {0, 0};
-            if (select(g_lock_fd + 1, &r2, NULL, NULL, &z) <= 0) break;
+
+    fd_set rf;
+    FD_ZERO(&rf);
+    int max_fd = -1;
+    if (lfd >= 0) {
+        FD_SET(lfd, &rf);
+        if (lfd > max_fd) max_fd = lfd;
+    }
+    if (afd >= 0) {
+        FD_SET(afd, &rf);
+        if (afd > max_fd) max_fd = afd;
+    }
+    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+    if (select(max_fd + 1, &rf, NULL, NULL, &tv) > 0) {
+        int lc = 0;
+        if (lfd >= 0 && FD_ISSET(lfd, &rf)) {
+            int tok;
+            while (read(lfd, &tok, sizeof(tok)) == sizeof(tok)) {
+                fd_set r2; FD_ZERO(&r2); FD_SET(lfd, &r2);
+                struct timeval z = {0, 0};
+                if (select(lfd + 1, &r2, NULL, NULL, &z) <= 0) break;
+            }
+            int was = g_locked;
+            lock_refresh();
+            lc = (was != g_locked);
+            if (lock_changed_out) *lock_changed_out = lc;
         }
-        int was = g_locked;
-        lock_refresh();
-        return was != g_locked;
+        if (afd >= 0 && FD_ISSET(afd, &rf)) {
+            appmon_drain_pipe();
+            if (appmon_woke_out) *appmon_woke_out = 1;
+            if (!g_got_sigterm && !lc) {
+                usleep(80 * 1000);
+                appmon_drain_pipe();
+            }
+        }
     }
-    return 0;
 }
 
 /* =========================================================================
@@ -3183,6 +3251,9 @@ typedef struct {
     int     diag_band_in;       /* 进入候选档时的档位整数 */
     time_t  diag_first_observe_s; /* 首次 pulse_round 观测到本段的相对秒，-1=NA */
     time_t  diag_gate_t_s;      /* 本段门控首次开门的相对秒，-1=NA */
+    /* v0.8.7 APPMON: 纯内存前后台事件追踪字段，不进磁盘结构 */
+    int     appmon_in_fg;           /* 1: BKSApplicationStateMonitor 最新回报在前台 */
+    time_t  appmon_bg_pending_mono; /* 已收到切后台推送、待 XNU 档位跌落 <100 的起点；0=无 */
 } pulse_app_state_t;
 
 #define PULSE_CTRL_APP_DAYMAX    10
@@ -5483,6 +5554,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->diag_round = 0;
             st->diag_first_observe_s = -1;
             st->diag_gate_t_s = -1;
+            st->appmon_in_fg = 0;
+            st->appmon_bg_pending_mono = 0;
             continue;
         }
 
@@ -5513,6 +5586,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->diag_round = 0;             /* DIAG2: 内存观测字段清零 */
             st->diag_first_observe_s = -1;
             st->diag_gate_t_s = -1;
+            st->appmon_in_fg = 0;
+            st->appmon_bg_pending_mono = 0;
             continue;
         }
 
@@ -5524,6 +5599,11 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->last_fg_seen_mono = now_mono;
             st->first_bg_seen_mono = 0;
             st->bg_lag_max = -1;
+            if (st->appmon_bg_pending_mono > 0 &&
+                (now_mono < st->appmon_bg_pending_mono ||
+                 (now_mono - st->appmon_bg_pending_mono) >= APPMON_BG_PENDING_MAX_SEC)) {
+                st->appmon_bg_pending_mono = 0;
+            }
         }
 
         if (main_cur == BAND_FOREGROUND) {
@@ -5567,6 +5647,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 st->pulsed_this_bg = 0;
                 st->ctrl_this_bg = 0;
                 st->pulse_late_this_bg = 0;
+                st->appmon_in_fg = 0;
+                st->appmon_bg_pending_mono = 0;
                 /* DIAG2: 新后台段：段序号+1，round 归零，band_in 快照，首观测=0 */
                 st->diag_bg_seq++;
                 st->diag_round = 0;
@@ -5577,6 +5659,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             } else if (!st->in_bg || st->bg_start_mono == 0) {
                 st->in_bg = 1;
                 st->pulse_late_this_bg = 0;
+                st->appmon_in_fg = 0;
+                st->appmon_bg_pending_mono = 0;
                 /* v0.8.6 B0: bg_lag 由 first_bg_seen-last_fg_seen 得出，不再受 15s
                  * 截断；bg_start_mono 仍=首次观测，25s 死线语义原样。 */
                 st->bg_start_mono = now_mono;
@@ -5618,6 +5702,8 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->diag_round = 0;             /* DIAG2 */
             st->diag_first_observe_s = -1;
             st->diag_gate_t_s = -1;
+            st->appmon_in_fg = 0;
+            st->appmon_bg_pending_mono = 0;
         }
 
         /* 检查 7 项触发条件 */
@@ -5789,45 +5875,89 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
     }
 }
 
-/* D-003: 门控式快轮 pulse 评估（F1）。
- * 快轮本身不取全表；仅当"有启用的 pulse 规则，且存在 in_bg、未 pulsed/ctrl/late、
- * 且距 bg_start < PULSE_DEADLINE_BG_SEC 的候选"时才返回 1，主循环据此临时恢复
- * 全表并调用 pulse_round。其余快轮继续走省电跳过路径。
- * 只读现有 pulse_app_state 条目（不新建），单次加锁/解锁，锁内无 return。 */
-static int pulse_fast_gate_open(time_t now_mono) {
-    if (g_npulse_rules <= 0 || g_pulse_cfg_file_absent) return 0;
+/* D-003 + v0.8.7: 门控评估与精确休眠时长计算（毫秒级）。
+ * 1. 若 APPMON 已收到切后台推送但 XNU 档位尚处 >=100 过渡期（<3s），开门并以 250ms 快检紧盯跌落；
+ * 2. 若候选已进后台且未满 delay_s，精确睡剩余秒数（<=5s），到点即发信号；
+ * 3. 若已满 delay_s 但仍在 25s 死线内，维持 <=5s 门控巡检。 */
+static int pulse_next_wait_ms(time_t now_mono, int default_secs, int *gate_open_out) {
+    int wait_ms = (default_secs > 0) ? (default_secs * 1000) : 1000;
+    if (gate_open_out) *gate_open_out = 0;
+    if (g_npulse_rules <= 0 || g_pulse_cfg_file_absent) return wait_ms;
 
     int open = 0;
+    time_t wall_now = time(NULL);
     pthread_mutex_lock(&s_pulse_mutex);
     for (int i = 0; i < g_npulse_app_states; i++) {
         pulse_app_state_t *st = &g_pulse_app_states[i];
-        if (!st->in_bg || st->tracked_pid <= 0 || st->bg_start_mono <= 0) continue;
         if (st->pulsed_this_bg || st->ctrl_this_bg || st->pulse_late_this_bg ||
-            st->restore_tripped_today) continue;
-        if (pulse_circuit_skip_reason(st, time(NULL) + PULSE_DEADLINE_BG_SEC,
-                                      now_mono + PULSE_DEADLINE_BG_SEC) != NULL) continue;
+            st->restore_tripped_today) {
+            st->appmon_bg_pending_mono = 0;
+            continue;
+        }
 
-        int enabled = 0;
+        const pulse_rule_t *rule = NULL;
         for (int r = 0; r < g_npulse_rules; r++) {
             if (g_pulse_rules[r].enabled && strcmp(g_pulse_rules[r].bid, st->bid) == 0) {
-                enabled = 1;
+                rule = &g_pulse_rules[r];
                 break;
             }
         }
-        if (!enabled) continue;
+        if (!rule) {
+            st->appmon_bg_pending_mono = 0;
+            continue;
+        }
+        if (pulse_circuit_skip_reason(st, wall_now + PULSE_DEADLINE_BG_SEC,
+                                      now_mono + PULSE_DEADLINE_BG_SEC) != NULL) {
+            st->appmon_bg_pending_mono = 0;
+            continue;
+        }
+
+        /* 分支 A: APPMON 已收到退后台通知，但 XNU 档位尚未跌下 100（过渡动画 <3s） */
+        if (!st->in_bg && st->appmon_bg_pending_mono > 0) {
+            if (now_mono >= st->appmon_bg_pending_mono &&
+                (now_mono - st->appmon_bg_pending_mono) < APPMON_BG_PENDING_MAX_SEC) {
+                open = 1;
+                if (wait_ms > 250) wait_ms = 250;
+            } else {
+                st->appmon_bg_pending_mono = 0;
+            }
+            continue;
+        }
+
+        /* 分支 B: 已处于候选档区间且在 25s 死线内 */
+        if (!st->in_bg || st->tracked_pid <= 0 || st->bg_start_mono <= 0) continue;
 
         time_t elapsed = now_mono - st->bg_start_mono;
         /* elapsed<0 视为时钟异常回拨，保守不打开门控 */
         if (elapsed >= 0 && elapsed < (time_t)PULSE_DEADLINE_BG_SEC) {
-            /* DIAG2: 本段门控首次开门时刻（相对 bg_start_mono 的非负秒），仅内存 */
             if (st->diag_gate_t_s < 0) {
                 st->diag_gate_t_s = elapsed;
             }
             open = 1;
-            break;
+            int gate_cap_ms = PULSE_FAST_GATE_POLL_SEC * 1000;
+            if (wait_ms > gate_cap_ms) wait_ms = gate_cap_ms;
+
+            time_t delay_elapsed = elapsed;
+            if (st->last_fg_seen_mono > 0 && st->first_bg_seen_mono >= st->last_fg_seen_mono) {
+                delay_elapsed = now_mono - st->last_fg_seen_mono;
+            }
+            if (delay_elapsed >= 0 && delay_elapsed < (time_t)rule->delay_s) {
+                time_t rem_s = (time_t)rule->delay_s - delay_elapsed;
+                int rem_ms = (int)(rem_s * 1000);
+                if (rem_ms > 0 && rem_ms < wait_ms) {
+                    wait_ms = rem_ms;
+                }
+            }
         }
     }
     pthread_mutex_unlock(&s_pulse_mutex);
+    if (gate_open_out) *gate_open_out = open;
+    return wait_ms;
+}
+
+static int pulse_fast_gate_open(time_t now_mono) {
+    int open = 0;
+    (void)pulse_next_wait_ms(now_mono, 60, &open);
     return open;
 }
 
@@ -7413,13 +7543,16 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
     }
 }
 
+static void appmon_sync_rules(void);
+
 static void mempressure_round(memorystatus_priority_entry_t *list, int count) {
-    /* 自动重启与后台释放配置及判定 (v0.7.7 C2, v0.7.8 C2, v0.8.0 K) */
+    /* 自动重启与后台释放配置及判定 (v0.7.7 C2, v0.7.8 C2, v0.8.0 K, v0.8.7 APPMON) */
     restart_load_config();
     pulse_load_config();
     diag_load_config();   /* DIAG2: 慢轮感知 diag.txt 变更（stat 去重，未变零开销） */
-    restart_round(list, count);
     bgkill_load_config();
+    appmon_sync_rules();
+    restart_round(list, count);
     bgkill_round(list, count);
     pulse_round(list, count);
 }
@@ -7545,6 +7678,555 @@ int rst_fbs_launch(const char *bid, const char **err_stage) {
     return 0;
 }
 
+/* ========================================================================= */
+/* --- v0.8.7 APPMON: 零轮询前后台事件推送监听 (BKSApplicationStateMonitor) --- */
+/* ========================================================================= */
+static jp_objc_id  s_appmon_obj = NULL;
+static void       *s_appmon_msgSend = NULL;
+static jp_objc_SEL s_sel_app_info = NULL;
+static jp_objc_SEL s_sel_update_bids = NULL;
+static jp_objc_SEL s_sel_invalidate = NULL;
+static void      *(*s_appmon_poolPush)(void) = NULL;
+static void       (*s_appmon_poolPop)(void *) = NULL;
+
+static CFStringRef s_cf_key_bid = NULL;
+static CFStringRef s_cf_key_pid = NULL;
+static CFStringRef s_cf_key_state = NULL;
+static CFStringRef s_cf_key_front = NULL;
+static CFStringRef s_cf_key_ext = NULL;
+static CFStringRef s_cf_sb_bid = NULL;
+
+static char s_appmon_bids[APPMON_MAX_BIDS][128];
+static int  s_nappmon_bids = -1; /* -1: 尚未首次同步 */
+
+static int appmon_parse_info_dict(jp_objc_id info, char *bid_out, size_t bid_sz,
+                                  pid_t *pid_out, uint32_t *state_out) {
+    if (!info || !bid_out || bid_sz == 0 || !s_cf_key_bid || !s_cf_key_pid || !s_cf_key_state) {
+        return -1;
+    }
+    if (CFGetTypeID((CFTypeRef)info) != CFDictionaryGetTypeID()) {
+        return -1;
+    }
+    CFDictionaryRef dict = (CFDictionaryRef)info;
+
+    /* 过滤 .appex XPC 扩展进程，绝不允许插件状态冒充主应用前后台切换 */
+    if (s_cf_key_ext) {
+        const void *ext_v = CFDictionaryGetValue(dict, s_cf_key_ext);
+        if (ext_v) {
+            CFTypeID tid = CFGetTypeID(ext_v);
+            if (tid == CFBooleanGetTypeID()) {
+                if (CFBooleanGetValue((CFBooleanRef)ext_v)) return -1;
+            } else if (tid == CFNumberGetTypeID()) {
+                int ext_i = 0;
+                if (CFNumberGetValue((CFNumberRef)ext_v, kCFNumberIntType, &ext_i) && ext_i != 0) {
+                    return -1;
+                }
+            }
+        }
+    }
+
+    const void *bid_v = CFDictionaryGetValue(dict, s_cf_key_bid);
+    if (!bid_v || CFGetTypeID(bid_v) != CFStringGetTypeID()) return -1;
+    bid_out[0] = '\0';
+    if (!CFStringGetCString((CFStringRef)bid_v, bid_out, (CFIndex)bid_sz, kCFStringEncodingUTF8) ||
+        bid_out[0] == '\0') {
+        return -1;
+    }
+
+    int pid_i = 0;
+    const void *pid_v = CFDictionaryGetValue(dict, s_cf_key_pid);
+    if (pid_v && CFGetTypeID(pid_v) == CFNumberGetTypeID()) {
+        (void)CFNumberGetValue((CFNumberRef)pid_v, kCFNumberIntType, &pid_i);
+    }
+
+    int st_i = 0;
+    const void *st_v = CFDictionaryGetValue(dict, s_cf_key_state);
+    if (st_v && CFGetTypeID(st_v) == CFNumberGetTypeID()) {
+        (void)CFNumberGetValue((CFNumberRef)st_v, kCFNumberIntType, &st_i);
+    }
+    uint32_t st_u = (st_i > 0) ? (uint32_t)st_i : 0U;
+
+    if (s_cf_key_front) {
+        const void *fr_v = CFDictionaryGetValue(dict, s_cf_key_front);
+        if (fr_v) {
+            CFTypeID ftid = CFGetTypeID(fr_v);
+            if ((ftid == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)fr_v)) ||
+                (ftid == CFNumberGetTypeID() && ({
+                    int fi = 0;
+                    CFNumberGetValue((CFNumberRef)fr_v, kCFNumberIntType, &fi) && fi != 0;
+                }))) {
+                st_u = JP_BKS_STATE_FOREGROUND;
+            }
+        }
+    }
+
+    if (pid_out) *pid_out = (pid_i > 0) ? (pid_t)pid_i : 0;
+    if (state_out) *state_out = st_u;
+    return 0;
+}
+
+static void appmon_on_bks_info(jp_objc_id info) {
+    void *pool = s_appmon_poolPush ? s_appmon_poolPush() : NULL;
+    char bid[128];
+    pid_t pid = 0;
+    uint32_t state = 0;
+    int rc = appmon_parse_info_dict(info, bid, sizeof(bid), &pid, &state);
+    if (pool && s_appmon_poolPop) s_appmon_poolPop(pool);
+    if (rc != 0 || state == 0) return;
+
+    time_t ev_mono = mono_now();
+    int need_write = 0;
+
+    pthread_mutex_lock(&s_appmon_mutex);
+    if (s_appmon_count > 0) {
+        unsigned last_idx = (s_appmon_head + s_appmon_count - 1U) % APPMON_RING_CAP;
+        appmon_event_t *last = &s_appmon_ring[last_idx];
+        if (last->pid == pid && last->state == state && strcmp(last->bid, bid) == 0) {
+            last->mono = ev_mono;
+            pthread_mutex_unlock(&s_appmon_mutex);
+            return;
+        }
+    }
+    unsigned idx;
+    if (s_appmon_count < APPMON_RING_CAP) {
+        idx = (s_appmon_head + s_appmon_count) % APPMON_RING_CAP;
+        s_appmon_count++;
+    } else {
+        /* 环满时覆盖最老条目，确保最新前后台状态绝不丢失 */
+        idx = s_appmon_head;
+        s_appmon_head = (s_appmon_head + 1U) % APPMON_RING_CAP;
+        s_appmon_dropped++;
+    }
+    rst_str_copy(s_appmon_ring[idx].bid, sizeof(s_appmon_ring[idx].bid), bid);
+    s_appmon_ring[idx].pid = pid;
+    s_appmon_ring[idx].state = state;
+    s_appmon_ring[idx].mono = ev_mono;
+    if (!s_appmon_pipe_pending) {
+        s_appmon_pipe_pending = 1;
+        need_write = 1;
+    }
+    pthread_mutex_unlock(&s_appmon_mutex);
+
+    if (need_write && g_appmon_pipe[1] >= 0) {
+        char ch = 'A';
+        ssize_t wr = write(g_appmon_pipe[1], &ch, 1);
+        (void)wr;
+    }
+}
+
+#ifdef __BLOCKS__
+static void (^s_appmon_block)(jp_objc_id) = ^(jp_objc_id info) {
+    appmon_on_bks_info(info);
+};
+#endif
+
+static void appmon_close_pipe(void) {
+    if (g_appmon_pipe[0] >= 0) { close(g_appmon_pipe[0]); g_appmon_pipe[0] = -1; }
+    if (g_appmon_pipe[1] >= 0) { close(g_appmon_pipe[1]); g_appmon_pipe[1] = -1; }
+}
+
+static void appmon_init(void) {
+    g_appmon_active = 0;
+#ifndef __BLOCKS__
+    (void)appmon_on_bks_info;
+    return;
+#else
+    if (pipe(g_appmon_pipe) != 0) {
+        g_appmon_pipe[0] = g_appmon_pipe[1] = -1;
+        JPLOG(JP_WARN, "%-6s fallback reason=pipe errno=%d", "APPMON", errno);
+        return;
+    }
+    for (int e = 0; e < 2; e++) {
+        int fd_flags = fcntl(g_appmon_pipe[e], F_GETFD, 0);
+        if (fd_flags >= 0) (void)fcntl(g_appmon_pipe[e], F_SETFD, fd_flags | FD_CLOEXEC);
+        int fl_flags = fcntl(g_appmon_pipe[e], F_GETFL, 0);
+        if (fl_flags >= 0) (void)fcntl(g_appmon_pipe[e], F_SETFL, fl_flags | O_NONBLOCK);
+    }
+
+    void *h_objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_LAZY);
+    void *h_as = dlopen("/System/Library/PrivateFrameworks/AssertionServices.framework/AssertionServices", RTLD_LAZY);
+    if (!h_as) {
+        h_as = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices", RTLD_LAZY);
+    }
+    if (!h_objc || !h_as) {
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=dlopen", "APPMON");
+        return;
+    }
+
+    jp_objc_Class (*fn_getClass)(const char *) =
+        (jp_objc_Class (*)(const char *))dlsym(h_objc, "objc_getClass");
+    jp_objc_SEL (*fn_sel)(const char *) =
+        (jp_objc_SEL (*)(const char *))dlsym(h_objc, "sel_registerName");
+    s_appmon_msgSend = dlsym(h_objc, "objc_msgSend");
+    s_appmon_poolPush = (void *(*)(void))dlsym(h_objc, "objc_autoreleasePoolPush");
+    s_appmon_poolPop = (void (*)(void *))dlsym(h_objc, "objc_autoreleasePoolPop");
+    if (!fn_getClass || !fn_sel || !s_appmon_msgSend) {
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=nosym", "APPMON");
+        return;
+    }
+
+    jp_objc_Class clsBKS = fn_getClass("BKSApplicationStateMonitor");
+    if (!clsBKS) {
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=noclass", "APPMON");
+        return;
+    }
+
+    jp_objc_SEL selAlloc = fn_sel("alloc");
+    jp_objc_SEL selInitBids = fn_sel("initWithBundleIDs:states:");
+    jp_objc_SEL selResponds = fn_sel("respondsToSelector:");
+    jp_objc_SEL selInstancesRespond = fn_sel("instancesRespondToSelector:");
+    jp_objc_SEL selSetHandler = fn_sel("setHandler:");
+    s_sel_app_info = fn_sel("applicationInfoForApplication:");
+    s_sel_update_bids = fn_sel("updateInterestedBundleIDs:");
+    s_sel_invalidate = fn_sel("invalidate");
+    if (!selAlloc || !selInitBids || !selResponds || !selInstancesRespond ||
+        !selSetHandler || !s_sel_app_info || !s_sel_update_bids || !s_sel_invalidate) {
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=noselector", "APPMON");
+        return;
+    }
+
+    bool ok_init = ((bool (*)(jp_objc_id, jp_objc_SEL, jp_objc_SEL))s_appmon_msgSend)(
+        (jp_objc_id)clsBKS, selInstancesRespond, selInitBids);
+    bool ok_upd = ((bool (*)(jp_objc_id, jp_objc_SEL, jp_objc_SEL))s_appmon_msgSend)(
+        (jp_objc_id)clsBKS, selInstancesRespond, s_sel_update_bids);
+    bool ok_hdl = ((bool (*)(jp_objc_id, jp_objc_SEL, jp_objc_SEL))s_appmon_msgSend)(
+        (jp_objc_id)clsBKS, selInstancesRespond, selSetHandler);
+    bool ok_info = ((bool (*)(jp_objc_id, jp_objc_SEL, jp_objc_SEL))s_appmon_msgSend)(
+        (jp_objc_id)clsBKS, selInstancesRespond, s_sel_app_info);
+    if (!ok_init || !ok_upd || !ok_hdl || !ok_info) {
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=abi_mismatch", "APPMON");
+        return;
+    }
+
+    if (!s_cf_key_bid)   s_cf_key_bid   = CFStringCreateWithCString(kCFAllocatorDefault, "SBApplicationStateDisplayIDKey", kCFStringEncodingUTF8);
+    if (!s_cf_key_pid)   s_cf_key_pid   = CFStringCreateWithCString(kCFAllocatorDefault, "SBApplicationStateProcessIDKey", kCFStringEncodingUTF8);
+    if (!s_cf_key_state) s_cf_key_state = CFStringCreateWithCString(kCFAllocatorDefault, "SBApplicationStateKey", kCFStringEncodingUTF8);
+    if (!s_cf_key_front) s_cf_key_front = CFStringCreateWithCString(kCFAllocatorDefault, "BKSApplicationStateAppIsFrontmost", kCFStringEncodingUTF8);
+    if (!s_cf_key_ext)   s_cf_key_ext   = CFStringCreateWithCString(kCFAllocatorDefault, "BKSApplicationStateExtensionKey", kCFStringEncodingUTF8);
+    if (!s_cf_sb_bid)    s_cf_sb_bid    = CFStringCreateWithCString(kCFAllocatorDefault, "com.apple.springboard", kCFStringEncodingUTF8);
+    if (!s_cf_key_bid || !s_cf_key_pid || !s_cf_key_state || !s_cf_sb_bid) {
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=cfstr", "APPMON");
+        return;
+    }
+
+    /* 初始传空数组 @[]（注意：传 nil 会订阅全机所有进程，空数组则订阅 0 个进程） */
+    CFArrayRef empty_arr = CFArrayCreate(kCFAllocatorDefault, NULL, 0, &kCFTypeArrayCallBacks);
+    if (!empty_arr) {
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=cfarr", "APPMON");
+        return;
+    }
+
+    void *pool = s_appmon_poolPush ? s_appmon_poolPush() : NULL;
+    jp_objc_id raw = ((jp_objc_id (*)(jp_objc_id, jp_objc_SEL))s_appmon_msgSend)(
+        (jp_objc_id)clsBKS, selAlloc);
+    jp_objc_id mon = NULL;
+    if (raw) {
+        mon = ((jp_objc_id (*)(jp_objc_id, jp_objc_SEL, jp_objc_id, unsigned int))s_appmon_msgSend)(
+            raw, selInitBids, (jp_objc_id)empty_arr, JP_BKS_STATE_ALL);
+    }
+    CFRelease(empty_arr);
+    if (!mon) {
+        if (pool && s_appmon_poolPop) s_appmon_poolPop(pool);
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=init_nil", "APPMON");
+        return;
+    }
+
+    /* 启动自检：向 runningboardd 试查 com.apple.springboard。
+     * 若权限缺失或服务不可达，返回 nil / pid<=0，立即销毁并回退 20s 慢轮兜底。 */
+    jp_objc_id sb_info = ((jp_objc_id (*)(jp_objc_id, jp_objc_SEL, jp_objc_id))s_appmon_msgSend)(
+        mon, s_sel_app_info, (jp_objc_id)s_cf_sb_bid);
+    char sb_bid[128] = {0};
+    pid_t sb_pid = 0;
+    uint32_t sb_state = 0;
+    int probe_ok = (appmon_parse_info_dict(sb_info, sb_bid, sizeof(sb_bid), &sb_pid, &sb_state) == 0 &&
+                    sb_pid > 0);
+    if (!probe_ok) {
+        ((void (*)(jp_objc_id, jp_objc_SEL))s_appmon_msgSend)(mon, s_sel_invalidate);
+        CFRelease((CFTypeRef)mon);
+        if (pool && s_appmon_poolPop) s_appmon_poolPop(pool);
+        appmon_close_pipe();
+        JPLOG(JP_WARN, "%-6s fallback reason=probe_denied", "APPMON");
+        return;
+    }
+
+    ((void (*)(jp_objc_id, jp_objc_SEL, jp_objc_id))s_appmon_msgSend)(
+        mon, selSetHandler, (jp_objc_id)s_appmon_block);
+    if (pool && s_appmon_poolPop) s_appmon_poolPop(pool);
+
+    s_appmon_obj = mon;
+    g_appmon_active = 1;
+    JPLOG(JP_INFO, "%-6s init ok sb_pid=%d sb_state=%u", "APPMON", (int)sb_pid, (unsigned)sb_state);
+#endif
+}
+
+static void appmon_apply_single_event(const appmon_event_t *ev, const char *today_str,
+                                      int from_seed, int *need_bg_scan_io) {
+    if (!ev || ev->bid[0] == '\0') return;
+
+    if (!from_seed) {
+        DIAGLOG(DIAG_DETAILED, "DIAG event=APPMON bid=%s pid=%d bks_state=%u",
+                ev->bid, (int)ev->pid, (unsigned)ev->state);
+    }
+
+    if (ev->state == JP_BKS_STATE_FOREGROUND && ev->pid > 0) {
+        /* 1. bgkill: 毫秒级闩锁 ever_fg=1，即使点开 0.3 秒划走也不漏记 */
+        if (!g_bgkill_cfg_file_absent && g_bgkill_master) {
+            for (int i = 0; i < g_nbgkill_rules; i++) {
+                if (g_bgkill_rules[i].enabled && strcmp(g_bgkill_rules[i].bid, ev->bid) == 0) {
+                    bgkill_rule_state_t *bst = bgkill_get_rule_state(ev->bid);
+                    if (bst) {
+                        bst->tracked_pid = ev->pid;
+                        bst->in_bg = 0;
+                        bst->bg_start_mono = 0;
+                        bst->bg_rounds = 0;
+                        bst->ever_fg = 1;
+                        bst->prewarm_hold = 0;
+                        bst->prewarm_logged = 0;
+                    }
+                    break;
+                }
+            }
+        }
+        /* 2. pulse: 移出待处理队列并标记实时前台态 */
+        for (int q = g_npulse_queue - 1; q >= 0; q--) {
+            if (g_pulse_queue[q].pid == ev->pid ||
+                strcmp(g_pulse_queue[q].bid, ev->bid) == 0) {
+                pulse_queue_remove_at(q);
+            }
+        }
+        if (!g_pulse_cfg_file_absent && g_npulse_rules > 0) {
+            pthread_mutex_lock(&s_pulse_mutex);
+            for (int i = 0; i < g_npulse_rules; i++) {
+                if (g_pulse_rules[i].enabled && strcmp(g_pulse_rules[i].bid, ev->bid) == 0) {
+                    pulse_app_state_t *pst = pulse_get_app_state(ev->bid, today_str);
+                    if (pst) {
+                        pst->tracked_pid = ev->pid;
+                        pst->in_bg = 0;
+                        pst->bg_start_mono = 0;
+                        pst->last_fg_seen_mono = ev->mono;
+                        pst->first_bg_seen_mono = 0;
+                        pst->bg_lag = -1;
+                        pst->bg_lag_max = -1;
+                        pst->pulsed_this_bg = 0;
+                        pst->ctrl_this_bg = 0;
+                        pst->pulse_late_this_bg = 0;
+                        pst->diag_round = 0;
+                        pst->diag_first_observe_s = -1;
+                        pst->diag_gate_t_s = -1;
+                        pst->appmon_in_fg = 1;
+                        pst->appmon_bg_pending_mono = 0;
+                    }
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&s_pulse_mutex);
+        }
+    } else if ((ev->state == JP_BKS_STATE_BG_RUNNING ||
+                ev->state == JP_BKS_STATE_BG_SUSPENDED) && ev->pid > 0) {
+        if (!from_seed && need_bg_scan_io) {
+            *need_bg_scan_io = 1;
+        }
+        if (!g_pulse_cfg_file_absent && g_npulse_rules > 0 && !from_seed) {
+            pthread_mutex_lock(&s_pulse_mutex);
+            for (int i = 0; i < g_npulse_rules; i++) {
+                if (g_pulse_rules[i].enabled && strcmp(g_pulse_rules[i].bid, ev->bid) == 0) {
+                    pulse_app_state_t *pst = pulse_get_app_state(ev->bid, today_str);
+                    if (pst) {
+                        if (pst->tracked_pid == ev->pid && pst->appmon_in_fg) {
+                            /* 零滞后真切换时刻：刷新前台终点与后台起点为同一退后台瞬间 */
+                            pst->last_fg_seen_mono = ev->mono;
+                            pst->first_bg_seen_mono = ev->mono;
+                            pst->appmon_bg_pending_mono = ev->mono;
+                        } else if (!pst->in_bg) {
+                            if (pst->tracked_pid == ev->pid && pst->first_bg_seen_mono <= 0) {
+                                pst->first_bg_seen_mono = ev->mono;
+                            }
+                            pst->appmon_bg_pending_mono = ev->mono;
+                        }
+                        pst->appmon_in_fg = 0;
+                    }
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&s_pulse_mutex);
+        }
+    } else if (ev->state == JP_BKS_STATE_TERMINATED) {
+        if (!g_pulse_cfg_file_absent && g_npulse_rules > 0) {
+            pthread_mutex_lock(&s_pulse_mutex);
+            for (int i = 0; i < g_npulse_app_states; i++) {
+                if (strcmp(g_pulse_app_states[i].bid, ev->bid) == 0) {
+                    g_pulse_app_states[i].appmon_in_fg = 0;
+                    g_pulse_app_states[i].appmon_bg_pending_mono = 0;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&s_pulse_mutex);
+        }
+    }
+}
+
+static int appmon_drain_events(int *need_bg_scan_out) {
+    if (need_bg_scan_out) *need_bg_scan_out = 0;
+    if (!g_appmon_active) return 0;
+
+    appmon_event_t batch[APPMON_RING_CAP];
+    unsigned n = 0;
+
+    pthread_mutex_lock(&s_appmon_mutex);
+    while (s_appmon_count > 0 && n < APPMON_RING_CAP) {
+        batch[n++] = s_appmon_ring[s_appmon_head];
+        s_appmon_head = (s_appmon_head + 1U) % APPMON_RING_CAP;
+        s_appmon_count--;
+    }
+    pthread_mutex_unlock(&s_appmon_mutex);
+
+    if (n == 0) return 0;
+
+    char today_str[16] = {0};
+    pulse_get_local_date_str(today_str, sizeof(today_str));
+    pulse_check_date_reset(today_str);
+
+    int need_bg = 0;
+    for (unsigned i = 0; i < n; i++) {
+        appmon_apply_single_event(&batch[i], today_str, 0, &need_bg);
+    }
+    if (need_bg_scan_out) *need_bg_scan_out = need_bg;
+    return (int)n;
+}
+
+static void appmon_add_unique_bid(char list[][128], int *cnt_io, const char *bid) {
+    if (!bid || bid[0] == '\0' || *cnt_io >= APPMON_MAX_BIDS) return;
+    for (int i = 0; i < *cnt_io; i++) {
+        if (strcmp(list[i], bid) == 0) return;
+    }
+    rst_str_copy(list[*cnt_io], 128, bid);
+    (*cnt_io)++;
+}
+
+static int appmon_bid_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+static int appmon_bid_in_prev(const char *bid) {
+    if (s_nappmon_bids <= 0) return 0;
+    for (int i = 0; i < s_nappmon_bids; i++) {
+        if (strcmp(s_appmon_bids[i], bid) == 0) return 1;
+    }
+    return 0;
+}
+
+static void appmon_sync_rules(void) {
+    if (!g_appmon_active || !s_appmon_obj || !s_appmon_msgSend || !s_sel_update_bids) return;
+
+    char next_bids[APPMON_MAX_BIDS][128];
+    int n_next = 0;
+
+    if (!g_pulse_cfg_file_absent) {
+        for (int i = 0; i < g_npulse_rules; i++) {
+            if (g_pulse_rules[i].enabled) {
+                appmon_add_unique_bid(next_bids, &n_next, g_pulse_rules[i].bid);
+            }
+        }
+    }
+    if (!g_bgkill_cfg_file_absent && g_bgkill_master) {
+        for (int i = 0; i < g_nbgkill_rules; i++) {
+            if (g_bgkill_rules[i].enabled) {
+                appmon_add_unique_bid(next_bids, &n_next, g_bgkill_rules[i].bid);
+            }
+        }
+    }
+    if (!g_restart_cfg_file_absent) {
+        for (int i = 0; i < g_nrestart_rules; i++) {
+            appmon_add_unique_bid(next_bids, &n_next, g_restart_rules[i].bid);
+        }
+    }
+    for (int i = 0; i < g_nprotect; i++) {
+        if (g_protect[i].is_bid && strncmp(g_protect[i].frag, "bid:", 4) == 0) {
+            appmon_add_unique_bid(next_bids, &n_next, g_protect[i].frag + 4);
+        }
+    }
+    for (int i = 0; i < g_ndemote; i++) {
+        if (g_demote[i].is_bid && strncmp(g_demote[i].frag, "bid:", 4) == 0) {
+            appmon_add_unique_bid(next_bids, &n_next, g_demote[i].frag + 4);
+        }
+    }
+
+    if (n_next > 1) {
+        qsort(next_bids, (size_t)n_next, sizeof(next_bids[0]), appmon_bid_cmp);
+    }
+
+    if (s_nappmon_bids == n_next) {
+        int same = 1;
+        for (int i = 0; i < n_next; i++) {
+            if (strcmp(s_appmon_bids[i], next_bids[i]) != 0) {
+                same = 0;
+                break;
+            }
+        }
+        if (same) return; /* 订阅集合未变，零 XPC 开销 */
+    }
+
+    CFStringRef cf_strs[APPMON_MAX_BIDS];
+    int n_cf = 0;
+    for (int i = 0; i < n_next; i++) {
+        CFStringRef s = CFStringCreateWithCString(kCFAllocatorDefault, next_bids[i], kCFStringEncodingUTF8);
+        if (s) cf_strs[n_cf++] = s;
+    }
+
+    CFArrayRef arr = CFArrayCreate(kCFAllocatorDefault,
+                                   n_cf > 0 ? (const void **)cf_strs : NULL,
+                                   (CFIndex)n_cf, &kCFTypeArrayCallBacks);
+    if (arr) {
+        void *pool = s_appmon_poolPush ? s_appmon_poolPush() : NULL;
+        ((void (*)(jp_objc_id, jp_objc_SEL, jp_objc_id))s_appmon_msgSend)(
+            s_appmon_obj, s_sel_update_bids, (jp_objc_id)arr);
+
+        /* 对新加入订阅的 bid 做一次即时前台态快照，防止配置新增瞬间该 App 已在前台而漏记 */
+        if (s_sel_app_info && n_cf > 0) {
+            char today_str[16] = {0};
+            pulse_get_local_date_str(today_str, sizeof(today_str));
+            pulse_check_date_reset(today_str);
+            time_t now_m = mono_now();
+            for (int i = 0; i < n_cf; i++) {
+                char chk_bid[128] = {0};
+                if (!CFStringGetCString(cf_strs[i], chk_bid, sizeof(chk_bid), kCFStringEncodingUTF8) ||
+                    appmon_bid_in_prev(chk_bid)) {
+                    continue;
+                }
+                jp_objc_id info = ((jp_objc_id (*)(jp_objc_id, jp_objc_SEL, jp_objc_id))s_appmon_msgSend)(
+                    s_appmon_obj, s_sel_app_info, (jp_objc_id)cf_strs[i]);
+                appmon_event_t seed_ev;
+                memset(&seed_ev, 0, sizeof(seed_ev));
+                if (appmon_parse_info_dict(info, seed_ev.bid, sizeof(seed_ev.bid),
+                                           &seed_ev.pid, &seed_ev.state) == 0 &&
+                    seed_ev.state == JP_BKS_STATE_FOREGROUND && seed_ev.pid > 0) {
+                    seed_ev.mono = now_m;
+                    appmon_apply_single_event(&seed_ev, today_str, 1, NULL);
+                }
+            }
+        }
+        if (pool && s_appmon_poolPop) s_appmon_poolPop(pool);
+        CFRelease(arr);
+    }
+    for (int i = 0; i < n_cf; i++) {
+        CFRelease(cf_strs[i]);
+    }
+
+    s_nappmon_bids = n_next;
+    for (int i = 0; i < n_next; i++) {
+        rst_str_copy(s_appmon_bids[i], sizeof(s_appmon_bids[i]), next_bids[i]);
+    }
+    JPLOG(JP_INFO, "%-6s sync bids=%d", "APPMON", n_next);
+}
+
 int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strcmp(argv[i], "--probe") == 0) {
@@ -7621,23 +8303,30 @@ int main(int argc, char *argv[]) {
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
     init_loglevel();  /* 从启动第一行起按配置 loglevel 过滤 (P1) */
     lockmon_init();  /* 锁屏监听（失败则保持常速轮询，不影响保护） */
+    appmon_init();   /* v0.8.7: 前后台事件推送监听（失败自动回退 20s 慢轮兜底） */
     load_old_targets();  /* 启动时导入旧 status.txt 记录供首轮认领 */
     restart_state_load();  /* 启动时载入重启计数状态 (v0.7.7 C2) */
     pulse_startup_recovery();  /* 启动时脉冲状态恢复 (v0.7.8 C2-5) */
-    JPLOG(JP_INFO, "%-6s v%s commit=%s pid=%d old_records=%d locked=%d",
-           "START", JP_VERSION, JP_COMMIT, (int)getpid(), g_nold_targets, g_locked);
+    JPLOG(JP_INFO, "%-6s v%s commit=%s pid=%d old_records=%d locked=%d appmon=%d",
+           "START", JP_VERSION, JP_COMMIT, (int)getpid(), g_nold_targets, g_locked, g_appmon_active);
     mempressure_init();  /* 前台 App 内存压力触发初始化 (v0.7.0) */
 
     /* E4: 启动探测定向查询命令，决定快轮初始模式（三级兜底见 fast_scan_probe） */
     fast_scan_probe();
 
     int lock_changed_prev = 0;  /* E1: 休眠期间锁屏状态是否变化（触发下一轮慢轮） */
+    time_t last_appmon_slow_mono = 0;
 
     while (!should_stop()) {
         /* v0.8.6 C3: 每轮推进 epoch；上轮缓存自动失效，rst_ensure_app_procs
          * 只在同轮内复用主扫描缓存，杜绝陈旧 pid→bid 映射跨轮使用。 */
         s_round_epoch++;
         if (load_config() != 0) { sleep(BACKOFF_BASE_SECS); continue; }  /* E2: 基础间隔 */
+        pulse_load_config();
+        bgkill_load_config();
+
+        int appmon_need_bg_scan = 0;
+        (void)appmon_drain_events(&appmon_need_bg_scan);
 
         char bands_token[128] = {0};
         int handle_bands_req = 0;
@@ -7688,16 +8377,23 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* ---- E1: 慢轮判定（任一满足即本轮走慢轮）----
-         * 首轮 / 周期到期 / 锁屏状态变化 / config 变化 / bands.req；
+        /* ---- E1 + v0.8.7: 慢轮判定（任一满足即本轮走慢轮）----
+         * 首轮 / 周期到期 / 锁屏状态变化 / config 变化 / bands.req / APPMON 退后台事件（2s 节流）；
          * E4 最坏兜底 FAST_MODE_LEGACY 时每轮都是慢轮（回退现状） */
         time_t now_mono_start = mono_now();
         int config_changed = jp_file_stat_changed(CONFIG_PATH, &s_config_stamp, NULL);
+        int appmon_force_slow = 0;
+        if (appmon_need_bg_scan && (last_appmon_slow_mono == 0 ||
+            (now_mono_start - last_appmon_slow_mono) >= 2)) {
+            appmon_force_slow = 1;
+            last_appmon_slow_mono = now_mono_start;
+        }
         int slow_round_now =
             (g_fast_mode == FAST_MODE_LEGACY) ||
             (g_slow_due_mono == 0) ||
             (now_mono_start >= g_slow_due_mono) ||
-            lock_changed_prev || config_changed || handle_bands_req;
+            lock_changed_prev || config_changed || handle_bands_req ||
+            appmon_force_slow;
 
         int slow_actions = 0;              /* E2: 本轮 RAISE/LOWER/DEMOTE/RETURN 成功次数 */
         unsigned long creates_before = g_applied_creates;
@@ -7713,9 +8409,7 @@ int main(int argc, char *argv[]) {
         if (!slow_round_now) {
             /* E1 快轮：不调 proc_pidpath / mempressure_round / write_status */
             fast_round_actions = fast_round();
-            /* P1-2: 门控判定前重载 pulse.txt（内部 stat 去重，未变则零开销），
-             * 避免 App 改配置后 daemon 常驻最长 240s 仍按旧规则写水位。 */
-            pulse_load_config();
+            appmon_sync_rules();
             diag_load_config();   /* DIAG2: 快轮仅 stat 感知，未变零日志/零写盘，≤5s 生效 */
             /* D-003 (F1): 门控打开才临时恢复全表，仅跑 pulse 状态推进/候选评估。
              * 拿不到全表时按 S12 用 NULL 调用（pulse_round 安全跳过且不清状态）；
@@ -8045,42 +8739,30 @@ int main(int argc, char *argv[]) {
                 g_interval    = BACKOFF_BASE_SECS;
                 g_slow_period = SLOW_BASE_SECS;
             }
-            /* P1-1: 有启用的 pulse 规则时慢轮周期钳到 <=20s——bg_start_mono 只在
-             * pulse_round 内首次观测时设置，不钳周期则首次进后台仍要等 30~240s，
-             * 短后台段完全漏掉。20s < 25s 死线；首次观测后由门控快轮（<=5s）接续。
-             * 省电权衡：pulse 开启期间全表慢轮最多 20s 一次，部分回吐 E2 退避收益；
-             * 无 pulse 规则时维持原 30~240s 不变。 */
-            if (pulse_any_enabled_rule() && g_slow_period > PULSE_FIRST_OBSERVE_MAX_SLOW) {
+            /* P1-1 + v0.8.7: APPMON 启用时前后台切换由系统事件毫秒级直推，无需再把慢轮锁在 <=20s，
+             * 恢复 30~240s 自适应长退避；仅当 APPMON 未启用时保留 <=20s 慢轮兜底。 */
+            if (!g_appmon_active && pulse_any_enabled_rule() &&
+                g_slow_period > PULSE_FIRST_OBSERVE_MAX_SLOW) {
                 g_slow_period = PULSE_FIRST_OBSERVE_MAX_SLOW;
             }
             /* 慢轮到期时间只在慢轮收尾推进：空转时慢轮仍按 g_slow_period 兜底 */
             if (slow_round_now) g_slow_due_mono = mono_now() + g_slow_period;
         }
 
-        /* v0.8.6 A3: 每轮收尾统一重算门控，快轮/慢轮都参与休眠钳制。
-         * 快轮 :7414 的执行前计算保留（门控快轮必须触发 pulse_round）；
-         * 这里只读 pulse_app_state + 单次 s_pulse_mutex 加锁，无 syscall、
-         * 无额外唤醒，位置在 pulse_round 之后且 s_pulse_mutex 之外，
-         * 不嵌套 s_log_mutex / s_diag_mutex，沿用现有锁序。 */
-        pulse_gate_active = pulse_fast_gate_open(mono_now());
+        /* v0.8.6 A3 + v0.8.7: 统一重算门控与精确等待毫秒数（含 250ms 档位跌落快检与 delay_s 到点唤醒） */
+        int base_secs = g_locked ? ((g_locked_passes < 2) ? 10 : 60) : g_interval;
+        int wait_ms = pulse_next_wait_ms(mono_now(), base_secs, &pulse_gate_active);
 
         if (should_stop() || g_got_sigterm) break;
 
         if (g_locked) {
-            /* 刚锁屏的前两轮用 10 秒间隔，盖住系统降档的窗口；之后 60 秒 */
-            int secs = (g_locked_passes < 2) ? 10 : 60;
-            /* D-003: 门控打开时把锁屏轮询压到 <=5s，保证 25s 死线内多次判定 */
-            if (pulse_gate_active && secs > PULSE_FAST_GATE_POLL_SEC) secs = PULSE_FAST_GATE_POLL_SEC;
             g_locked_passes++;
-            lock_changed_prev = wait_lock_change(secs);       /* 解锁会立刻唤醒 */
         } else {
             g_locked_passes = 0;
-            /* E2: 亮屏用退避后的间隔（5~60s）；一锁屏立刻醒来补一轮抬档
-             * D-003: 门控打开时忽略退避上探，压到 <=5s */
-            int secs = g_interval;
-            if (pulse_gate_active && secs > PULSE_FAST_GATE_POLL_SEC) secs = PULSE_FAST_GATE_POLL_SEC;
-            lock_changed_prev = wait_lock_change(secs);
         }
+        int appmon_woke = 0;
+        wait_events_ms(wait_ms, &lock_changed_prev, &appmon_woke);
+        (void)appmon_woke;
         /* 注意：锁屏时最长 60 秒才发现 running.flag 被删（停止变慢），
          * 但点「停止」时人在用手机、是亮屏状态，实际不影响。 */
     }
@@ -8096,6 +8778,7 @@ int main(int argc, char *argv[]) {
         g_pulse_thread_has_handle = 0;
     }
 
+    appmon_close_pipe();
     act_dedup_flush_all();
     JPLOG(JP_INFO, "STOP");
     FILE *pf = fopen(PID_PATH, "r");

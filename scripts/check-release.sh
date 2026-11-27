@@ -130,11 +130,19 @@ ENTITLEMENTS_FILE="$REPO_ROOT/src/entitlements-daemon.plist"
 if [ ! -f "$ENTITLEMENTS_FILE" ]; then
     echo "[FAIL] Missing entitlements file at $ENTITLEMENTS_FILE"
     FAILED=1
-elif grep -q "com.apple.frontboard.launchapplications" "$ENTITLEMENTS_FILE" 2>/dev/null; then
-    echo "[OK] entitlements-daemon.plist contains com.apple.frontboard.launchapplications"
 else
-    echo "[FAIL] entitlements-daemon.plist missing com.apple.frontboard.launchapplications"
-    FAILED=1
+    if grep -q "com.apple.frontboard.launchapplications" "$ENTITLEMENTS_FILE" 2>/dev/null; then
+        echo "[OK] entitlements-daemon.plist contains com.apple.frontboard.launchapplications"
+    else
+        echo "[FAIL] entitlements-daemon.plist missing com.apple.frontboard.launchapplications"
+        FAILED=1
+    fi
+    if grep -q "com.apple.assertiond.app-state-monitor" "$ENTITLEMENTS_FILE" 2>/dev/null; then
+        echo "[OK] entitlements-daemon.plist contains com.apple.assertiond.app-state-monitor"
+    else
+        echo "[FAIL] entitlements-daemon.plist missing com.apple.assertiond.app-state-monitor"
+        FAILED=1
+    fi
 fi
 
 if [ -n "$ARTIFACT_PATH" ]; then

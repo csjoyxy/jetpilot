@@ -8,5 +8,8 @@
 	<key>com.apple.private.jetsam.modify-priority</key><true/>
 	<key>com.apple.private.security.storage.AppBundles</key><true/>
 	<key>com.apple.frontboard.launchapplications</key><true/>
+	<key>com.apple.assertiond.app-state-monitor</key><true/>
+	<key>com.apple.runningboard.process-state</key><true/>
+	<key>com.apple.backboard.client</key><true/>
 </dict>
 </plist>

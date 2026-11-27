@@ -37,7 +37,7 @@ jobs:
       - name: Build daemon
         working-directory: src
         run: |
-          xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall \
+          xcrun -sdk iphoneos clang -arch arm64 -O2 -Wall -fblocks \
             -miphoneos-version-min=15.0 \
             -DJP_COMMIT=\"${{ env.JP_COMMIT }}\" \
             -framework CoreFoundation \
