@@ -18,6 +18,7 @@ theos 真实 SDK，见 `.github/workflows/build-jetpilot.yml`），也不进入 
 | `test_m1_commit.c` | 批次1 T3 · M1 原子写统一 | `jp_atomic_commit` 全行为：成功写入（fsync→rename→目录 fsync）、覆盖、rename 失败（tmp 清理+旧文件完整）、空指针防御、目录 fsync 可用性 |
 | `test_e1e4.c` | 批次2 E1/E4（+P2/P3 修复） | A applied 语义回归（set/set_ex/find/prune/remove/creates 计数）；B/B2 快轮漂移矩阵（RAISE/DEMOTE/系统抬档 SKIP/无身份只确认存活）与 sys_band 动作前记录；C/C2 cmd3 立即与**部分进度**异常降级（seen 残留清零、不 prune、下一轮死条目剪除）；D listscan（只遍历已知 pid、get_list 失败→SLEEP）；E 启动探测与 JP_E4_PROBE_FAIL / JP_FAST_SCAN 注入；F SLEEP/LEGACY 纯休眠分发；G P2 恢复路径（慢轮成功回升 LISTSCAN、env 强制除外） |
 | `test_v083.c` | v0.8.3 审计返工（自包含逻辑模型） | Ltarget 窗口守卫（含返工前 95%L 首秒 ABORT 负向对照）、self_written 魔数与非法值拒绝、delay_s=0 判定、按 bid 恢复熔断 streak、门控快轮开合。非源码逐字提取，真机行为仍需真机验收 |
+| `test_v086_batch1.c` | v0.8.6-batch1（自包含逻辑模型 + 负向对照） | A1 回退链（TTL 过期 + trusted + cur==band 各真假组合）、A2 只取证行格式与零判定字段、A3 慢轮收尾重算后休眠钳 <=5s、A4 off 规则无 BG_EST/rule_off、B0 delay 起点与 too_late 不互相污染、`bg_lag_max=0` 渲染非 NA、C2 两路计数和值兼容、C3 epoch 缓存复用/失效；每项均有"修复前"负向对照。不替代真机日志验收 |
 
 ## 二、负向 / 文档性用例
 
@@ -57,6 +58,10 @@ gcc -O2 -std=gnu11 -Wall -Wextra -Wno-unused-variable -Wno-unused-function \
     test_e1e4.c -o /tmp/jp_test_bin/e1e4
 /tmp/jp_test_bin/e1e4     # 九场景 A/B/B2/C/C2/D/E/F/G 全过
 # （-Wno-unused-*：E1 块里主循环在用的全局在 harness 内不可达，属提取边界，非告警信号）
+
+# --- v0.8.6-batch1 逻辑模型 + 负向对照 ---
+gcc -O2 -std=gnu11 -Wall -Wextra test_v086_batch1.c -o /tmp/jp_test_bin/v086
+/tmp/jp_test_bin/v086          # ALL v0.8.6-batch1 MODEL TESTS OK
 
 # --- 批次2 P2 文档性用例 ---
 gcc -O2 -std=gnu11 -Wall -Wextra jp_stale_seen.c -o /tmp/jp_test_bin/stale
