@@ -185,14 +185,23 @@ extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buf
 
 /* iOS 16+ 档位参考值 —— T3-IMP: 档位数值的唯一权威来源（模块内零字面量） */
 #define BAND_IDLE            0
-#define BAND_BACKGROUND      30  /* 自然后台上界 / kill 允许上界 */
+#define BAND_BACKGROUND      30  /* 自然后台上界 / 无状态 kill 允许上界 */
+#define BAND_FREEZER         75  /* XNU JETSAM_PRIORITY_FREEZER（冷冻室） */
 #define BAND_PROTECT_DEFAULT 90  /* 保护规则默认目标 (= BAND_FOREGROUND - 10) */
 #define BAND_MAX_PROTECT     95  /* 保护封顶，永不触及前台档与系统抬升档 */
 #define BAND_FOREGROUND      100 /* 前台：保护环绝不触碰 */
 #define BAND_SYSTEM_ELEVATED 120 /* 系统抬升档（原字面量 120） */
 
+/* XNU bsd/sys/kern_memorystatus.h entry.state 位掩码（真机 121 进程全集核实） */
+#define JP_MEMSTAT_SUSPENDED 0x001U /* kMemorystatusSuspended */
+#define JP_MEMSTAT_FROZEN    0x002U /* kMemorystatusFrozen */
+#define JP_MEMSTAT_ASSERTION 0x040U /* kMemorystatusAssertion */
+#define JP_MEMSTAT_ACTIVE    0x080U /* kMemorystatusActive */
+
 /* 常量关系固化，防后续模块漂移 */
-_Static_assert(BAND_MAX_PROTECT < BAND_FOREGROUND &&
+_Static_assert(BAND_BACKGROUND < BAND_FREEZER &&
+               BAND_FREEZER < BAND_PROTECT_DEFAULT &&
+               BAND_MAX_PROTECT < BAND_FOREGROUND &&
                BAND_PROTECT_DEFAULT == BAND_FOREGROUND - 10,
                "band constants drift: protect/candidate/foreground mismatch");
 
@@ -433,6 +442,20 @@ static void diag_sec_str(char *buf, size_t sz, time_t sec) {
     else snprintf(buf, sz, "NA");
 }
 
+/* v0.8.6 A2 —— memorystatus_priority_entry_t.state 状态跳变观测缓存。
+ * 扩容至 256 槽并按轮次 epoch 优先回收已退出 pid，且仅追踪主应用进程、不挤占公共
+ * 64 槽 g_diag_dedup 环，根治进程数 >64 时每轮慢扫全量淘汰重打耗尽 600 条日配额问题。 */
+#define JETSAM_STATE_CACHE_SLOTS 256
+typedef struct {
+    pid_t         pid;
+    int32_t       band;
+    uint32_t      state;
+    unsigned long seen_epoch;
+    int           used;
+} jetsam_state_slot_t;
+static jetsam_state_slot_t s_jetsam_state_cache[JETSAM_STATE_CACHE_SLOTS];
+static unsigned s_jetsam_state_head = 0;
+
 /* 跨日重置：复用 pulse_check_date_reset 的触发点；重置预算、去重表与闩锁，
  * 等级本身不清零（用户设置持续有效）。调用方可持 s_pulse_mutex，锁序安全。 */
 static void diag_reset_day(void) {
@@ -446,6 +469,8 @@ static void diag_reset_day(void) {
     g_diag_dedup_head = 0;
     memset(g_diag_skip_latch, 0, sizeof(g_diag_skip_latch));
     g_diag_skip_latch_head = 0;
+    memset(s_jetsam_state_cache, 0, sizeof(s_jetsam_state_cache));
+    s_jetsam_state_head = 0;
     pthread_mutex_unlock(&s_diag_mutex);
 }
 
@@ -508,23 +533,13 @@ static void diag_log_emit(int minlv, const char *fmt, ...) {
     } \
 } while (0)
 
-/* v0.8.6 A2 —— memorystatus_priority_entry_t.state 只取证、零行为变更。
- * 只在慢轮主扫描调用；(pid,band,state) 三元组变化才输出一行，走 DIAGLOG 三闸
- * 与同样式 dedup key；缓存纯内存（64 槽），不落盘、不进 pulse_saved_state_t。
- * state 绝不见于 jp_kill_allowed / jp_natural_band / jp_is_candidate /
- * 任何 skip 判定；XNU FREEZER=75 / frozen=0x02 为外部推测，真机未确认。 */
-#define JETSAM_STATE_CACHE_SLOTS 64
-typedef struct {
-    pid_t    pid;
-    int32_t  band;
-    uint32_t state;
-    int      used;
-} jetsam_state_slot_t;
-static jetsam_state_slot_t s_jetsam_state_cache[JETSAM_STATE_CACHE_SLOTS];
-static unsigned s_jetsam_state_head = 0;
-
-static void diag_jetsam_state_note(pid_t pid, const char *bid, int32_t band, uint32_t state) {
+static void diag_jetsam_state_note(pid_t pid, const char *bid, int32_t band,
+                                   uint32_t state, unsigned long round_epoch) {
     if (diag_level_now() < DIAG_DETAILED) return;   /* off/basic 零开销 */
+    int changed = 1;
+    int latch = 0, budget = 0;
+
+    pthread_mutex_lock(&s_diag_mutex);
     jetsam_state_slot_t *slot = NULL;
     for (int i = 0; i < JETSAM_STATE_CACHE_SLOTS; i++) {
         if (s_jetsam_state_cache[i].used && s_jetsam_state_cache[i].pid == pid) {
@@ -532,12 +547,27 @@ static void diag_jetsam_state_note(pid_t pid, const char *bid, int32_t band, uin
             break;
         }
     }
-    int changed = 1;
     if (!slot) {
         for (int i = 0; i < JETSAM_STATE_CACHE_SLOTS; i++) {
-            if (!s_jetsam_state_cache[i].used) { slot = &s_jetsam_state_cache[i]; break; }
+            if (!s_jetsam_state_cache[i].used) {
+                slot = &s_jetsam_state_cache[i];
+                break;
+            }
         }
-        if (!slot) slot = &s_jetsam_state_cache[s_jetsam_state_head++ % JETSAM_STATE_CACHE_SLOTS];
+        /* 槽满时优先回收非本轮出现的陈旧槽（已退出进程），绝不盲淘本轮活跃进程 */
+        if (!slot) {
+            for (int i = 0; i < JETSAM_STATE_CACHE_SLOTS; i++) {
+                unsigned idx = (s_jetsam_state_head + (unsigned)i) % JETSAM_STATE_CACHE_SLOTS;
+                if (s_jetsam_state_cache[idx].seen_epoch != round_epoch) {
+                    slot = &s_jetsam_state_cache[idx];
+                    s_jetsam_state_head = idx + 1;
+                    break;
+                }
+            }
+        }
+        if (!slot) {
+            slot = &s_jetsam_state_cache[s_jetsam_state_head++ % JETSAM_STATE_CACHE_SLOTS];
+        }
         slot->used = 1;
         slot->pid = pid;
     } else if (slot->band == band && slot->state == state) {
@@ -545,21 +575,21 @@ static void diag_jetsam_state_note(pid_t pid, const char *bid, int32_t band, uin
     }
     slot->band = band;
     slot->state = state;
+    slot->seen_epoch = round_epoch;
+    if (changed) {
+        latch = diag_latch_now();
+        budget = diag_budget_now();
+    }
+    pthread_mutex_unlock(&s_diag_mutex);
+
     if (!changed) return;
 
     char key[96], s_state[24];
     snprintf(key, sizeof(key), "%d|%d|%u", (int)pid, (int)band, (unsigned)state);
-    int suppressed = 0, latch = 0, budget = 0;
-    pthread_mutex_lock(&s_diag_mutex);
-    suppressed = diag_dedup_check_locked(key);
-    latch = diag_latch_now();
-    budget = diag_budget_now();
-    pthread_mutex_unlock(&s_diag_mutex);
-    if (suppressed) return;
     snprintf(s_state, sizeof(s_state), "0x%x", (unsigned)state);
     DIAGLOG(DIAG_DETAILED,
             "DIAG event=JETSAM_STATE bid=%s pid=%d band=%d state=%s state_raw=0x%x dedup_key=%s diag_dropped=%d diag_latch=%d diag_budget=%d",
-            bid ? bid : "-", (int)pid, (int)band, s_state, (unsigned)state, key,
+            (bid && bid[0]) ? bid : "-", (int)pid, (int)band, s_state, (unsigned)state, key,
             latch + budget, latch, budget);
 }
 
@@ -981,10 +1011,10 @@ static int jp_snapshot_fresh(time_t seen_mono, time_t now_mono) {
            (now_mono - seen_mono) <= JP_SNAPSHOT_TTL_SECS;
 }
 
-/* 定向现读当前有效档位（XNU memorystatus_cmd_get_priority_list 单 pid 分支，O(1)）；
+/* 定向现读当前有效档位与内核状态位（XNU memorystatus_get_priority_pid 单 pid 分支，O(1)）；
  * 严格校验返回字节数 == sizeof(entry) 且 entry.pid == pid，杜绝未写入缓冲区假阳性；
  * 失败返回 -1 并保留内核原始 errno（进程退出为 ESRCH，协议不符置 EPROTO）。 */
-static int jp_read_current_band(pid_t pid, int32_t *band_out) {
+static int jp_read_current_entry(pid_t pid, int32_t *band_out, uint32_t *state_out) {
     if (pid <= 0 || !band_out) {
         errno = EINVAL;
         return -1;
@@ -999,15 +1029,19 @@ static int jp_read_current_band(pid_t pid, int32_t *band_out) {
         return -1;
     }
     *band_out = entry.priority;
+    if (state_out) *state_out = entry.state;
     return 0;
+}
+
+static int jp_read_current_band(pid_t pid, int32_t *band_out) {
+    return jp_read_current_entry(pid, band_out, NULL);
 }
 
 /* =========================================================================
  * T3-IMP: 前后台 / kill 判定的唯一权威入口（模块调用点禁止档位字面量）
- * 阈值语义与原 v0.8.1 逐点等价：前台保护环用 BAND_FOREGROUND，
- * 重启/bgkill 的"可操作"快筛用 BAND_PROTECT_DEFAULT，kill 下界用 BAND_BACKGROUND。
- * 注意：本组判定保持 I4 —— "保护环可操作(BAND_FOREGROUND)" 与
- * "自然后台可杀(BAND_BACKGROUND)" 不得互相替代。
+ * 阈值语义：前台保护环用 BAND_FOREGROUND，重启/bgkill 的"可操作"快筛用
+ * BAND_PROTECT_DEFAULT，kill 允许条件为 natural_band <= BAND_BACKGROUND
+ * 或经实时 state 确认为 XNU 冷冻室闲置冻结态 (BAND_FREEZER=75, Suspended|Frozen, 无 Assertion/Active)。
  * ========================================================================= */
 static int jp_is_foreground(int32_t band) {
     return band >= BAND_FOREGROUND;
@@ -1017,8 +1051,24 @@ static int jp_is_candidate(int32_t band) {
     return band >= BAND_IDLE && band <= BAND_MAX_PROTECT;
 }
 
+/* XNU 冷冻室闲置态判定（真机 121 进程全集实测核实）：
+ * 仅当自然档位 == BAND_FREEZER(75)、持有实时读取的 state（state_known!=0）、
+ * 同时置位 Suspended(0x1)|Frozen(0x2) 且无 Assertion(0x40)|Active(0x80) 时放行；
+ * 缺状态或带活跃断言一律返回 0（fail-closed）。 */
+static int jp_is_frozen_idle(int32_t natural_band, uint32_t state, int state_known) {
+    if (!state_known || natural_band != BAND_FREEZER) return 0;
+    const uint32_t req_mask = JP_MEMSTAT_SUSPENDED | JP_MEMSTAT_FROZEN;
+    const uint32_t forbid_mask = JP_MEMSTAT_ASSERTION | JP_MEMSTAT_ACTIVE;
+    return ((state & req_mask) == req_mask) && ((state & forbid_mask) == 0);
+}
+
+static int jp_kill_allowed_with_state(int32_t natural_band, uint32_t state, int state_known) {
+    if (natural_band <= BAND_BACKGROUND) return 1;
+    return jp_is_frozen_idle(natural_band, state, state_known);
+}
+
 static int jp_kill_allowed(int32_t natural_band) {
-    return natural_band <= BAND_BACKGROUND;
+    return jp_kill_allowed_with_state(natural_band, 0, 0);
 }
 
 /* 归属判定可信条件：有明确来源（E1 身份缓存或旧实例 CLAIM）
@@ -5293,7 +5343,7 @@ ctrl_done:
 typedef struct {
     pid_t pid;
     int32_t priority;
-    uint32_t state;             /* v0.8.6 A2/C3: JETSAM entry.state，仅取证，不进判定 */
+    uint32_t state;             /* v0.8.6: JETSAM entry.state（供 A2 观测与 75 档冷冻室核验） */
     char path[PROC_PIDPATHINFO_MAXSIZE];
     char bid[128];
 } rst_app_proc_t;
@@ -5309,6 +5359,7 @@ static void rst_ensure_app_procs(memorystatus_priority_entry_t *list, int count)
 static void rst_app_procs_invalidate(void);
 static void rst_cache_app_proc_from_scan(pid_t pid, int32_t priority,
                                          uint32_t state, const char *path);
+static void rst_update_cached_priority(pid_t pid, int32_t priority);
 
 /* v0.8.6 C3: 显式失效（保留 P0 门控快轮强制失效语义），bump epoch + 清 token */
 static void rst_app_procs_invalidate(void) {
@@ -5334,6 +5385,21 @@ static void rst_cache_app_proc_from_scan(pid_t pid, int32_t priority,
     e->state = state;
     rst_str_copy(e->path, sizeof(e->path), path);
     rst_str_copy(e->bid, sizeof(e->bid), bid);
+}
+
+/* 慢轮改档成功后同步更新同轮共享缓存中的 priority，防止后续 restart/bgkill/pulse 读到改档前旧值 */
+static void rst_update_cached_priority(pid_t pid, int32_t priority) {
+    if (s_napp_procs <= 0 || s_app_proc_epoch != s_round_epoch) return;
+    if (s_app_procs[s_napp_procs - 1].pid == pid) {
+        s_app_procs[s_napp_procs - 1].priority = priority;
+        return;
+    }
+    for (int j = 0; j < s_napp_procs; j++) {
+        if (s_app_procs[j].pid == pid) {
+            s_app_procs[j].priority = priority;
+            return;
+        }
+    }
 }
 
 static void bgkill_observe_foreground_apps(void);
@@ -6494,11 +6560,15 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
         /* 查找该 bid 的用户 App 主进程 */
         pid_t main_pid = 0;
         int32_t main_cur = 0;
+        uint32_t main_state = 0;
+        int main_state_known = 0;
         if (!restart_is_blocked_bid(rule->bid)) {
             for (int j = 0; j < s_napp_procs; j++) {
                 if (strcmp(s_app_procs[j].bid, rule->bid) == 0) {
                     main_pid = s_app_procs[j].pid;
                     main_cur = s_app_procs[j].priority;
+                    main_state = s_app_procs[j].state;
+                    main_state_known = 1;
                     break;
                 }
             }
@@ -6547,10 +6617,10 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
             }
         }
 
-        /* 判定 2: 系统自然档位（统一回退链 jp_natural_band；<= BAND_BACKGROUND 才允许杀） */
+        /* 判定 2: 系统自然档位（<= BAND_BACKGROUND 或 BAND_FREEZER 挂起冷冻态允许杀） */
         int32_t sys_band = jp_natural_band(main_pid, main_cur);
 
-        if (!skip_reason && !jp_kill_allowed(sys_band)) {
+        if (!skip_reason && !jp_kill_allowed_with_state(sys_band, main_state, main_state_known)) {
             skip_reason = "band";
             r_state->sample_count = 0;
         }
@@ -6617,6 +6687,26 @@ static void restart_round(memorystatus_priority_entry_t *list, int count) {
                 restart_log_skip(rule, r_state, skip_reason, sys_band, now_mono);
             }
             continue;
+        }
+
+        /* 动手前实时复核一次档位与冷冻状态，杜绝解冻/回前台瞬间误杀 */
+        int32_t rechk_band = -1;
+        uint32_t rechk_state = 0;
+        if (jp_read_current_entry(main_pid, &rechk_band, &rechk_state) == 0) {
+            if (rechk_band >= BAND_PROTECT_DEFAULT) {
+                r_state->in_bg = 0;
+                r_state->bg_start_mono = 0;
+                r_state->sample_count = 0;
+                restart_log_skip(rule, r_state, "fg", rechk_band, now_mono);
+                continue;
+            }
+            int32_t rechk_nat = jp_natural_band(main_pid, rechk_band);
+            if (!jp_kill_allowed_with_state(rechk_nat, rechk_state, 1)) {
+                r_state->sample_count = 0;
+                restart_log_skip(rule, r_state, "band", rechk_nat, now_mono);
+                continue;
+            }
+            sys_band = rechk_nat;
         }
 
         /* 全部条件满足：触发重启！ */
@@ -6999,9 +7089,16 @@ static int bgkill_load_config(void) {
     return 0;
 }
 
-static int bgkill_read_current_band(pid_t pid, int32_t *band_out) {
+static int bgkill_read_current_entry(pid_t pid, int32_t *band_out,
+                                     uint32_t *state_out, int *state_known_out) {
+    if (state_known_out) *state_known_out = 0;
     if (pid <= 0 || !band_out) return -1;
-    if (jp_read_current_band(pid, band_out) == 0) return 0;
+    uint32_t st_val = 0;
+    if (jp_read_current_entry(pid, band_out, &st_val) == 0) {
+        if (state_out) *state_out = st_val;
+        if (state_known_out) *state_known_out = 1;
+        return 0;
+    }
     if (errno == ESRCH) return -1;
     int count = 0;
     memorystatus_priority_entry_t *list = get_list(&count);
@@ -7010,6 +7107,8 @@ static int bgkill_read_current_band(pid_t pid, int32_t *band_out) {
     for (int i = 0; i < count; i++) {
         if (list[i].pid == pid) {
             *band_out = list[i].priority;
+            if (state_out) *state_out = list[i].state;
+            if (state_known_out) *state_known_out = 1;
             found = 1;
             break;
         }
@@ -7228,9 +7327,11 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
             continue;
         }
 
-        /* 触发条件 6: 现读一次档位（前台快筛） */
+        /* 触发条件 6: 现读一次档位与状态位（前台快筛 + 冷冻室实时核验） */
         int32_t cur_band = -1;
-        if (bgkill_read_current_band(main_pid, &cur_band) != 0 ||
+        uint32_t cur_state = 0;
+        int cur_state_known = 0;
+        if (bgkill_read_current_entry(main_pid, &cur_band, &cur_state, &cur_state_known) != 0 ||
             cur_band >= BAND_PROTECT_DEFAULT) {
             if (cur_band >= 0 && jp_is_foreground(cur_band)) {
                 st->ever_fg = 1;
@@ -7244,13 +7345,14 @@ static void bgkill_round(memorystatus_priority_entry_t *list, int count) {
             continue;
         }
 
-        /* 触发条件 7 (T3-IMP 3.2): 系统自然档位安全门槛，与 restart 共用回退链。
-         * 自然档 > BAND_BACKGROUND（如微信/支付宝稳态 75、后台播放、通话）不杀。
+        /* 触发条件 7 (T3-IMP 3.2 + v0.8.6): 系统自然档位安全门槛，与 restart 共用回退链。
+         * <= BAND_BACKGROUND(30) 或经实时 state 确认为 XNU 冷冻室闲置冻结态 (BAND_FREEZER=75,
+         * Suspended|Frozen 且无 Assertion/Active) 放行；真正后台活跃播放/通话/任务仍拦截。
          * bandgate=0 时整段短路，行为回到 v0.8.1（无需重编包）。 */
         int32_t sys_band = cur_band;
         if (g_bgkill_bandgate) {
             sys_band = jp_natural_band(main_pid, cur_band);
-            if (!jp_kill_allowed(sys_band)) {
+            if (!jp_kill_allowed_with_state(sys_band, cur_state, cur_state_known)) {
                 st->in_bg = 0;
                 st->bg_start_mono = 0;
                 st->bg_rounds = 0;
@@ -7720,9 +7822,11 @@ int main(int argc, char *argv[]) {
                 if (g_has_bid_rules) {
                     app_bid = app_bid_for_path(path);
                 }
-                /* v0.8.6 A2: 只取证（band/state 变化时一行 DIAG_DETAILED），
-                 * state 绝不参与 jp_kill_allowed / jp_natural_band / skip 判定。 */
-                diag_jetsam_state_note(pid, app_bid, cur, list[i].state);
+                /* v0.8.6 A2: 仅追踪主应用进程 (band,state) 状态跳变，避免 .appex 插件海量噪音 */
+                if (diag_level_now() >= DIAG_DETAILED && memp_is_main_app_binary(path)) {
+                    const char *diag_bid = app_bid ? app_bid : app_bid_for_path(path);
+                    diag_jetsam_state_note(pid, diag_bid, cur, list[i].state, s_round_epoch);
+                }
                 if (path_matches(path, app_bid, g_protect, g_nprotect, &target, &frag)) {
                     protected_now++;
                     if (!app_bid) {
@@ -7750,6 +7854,7 @@ int main(int argc, char *argv[]) {
                             applied_fill_identity(applied_find(pid), path, frag, target, 0, app_bid);
                             act_log_success(ACT_KIND_RAISE, pid, path, frag, cur, target);
                             cur = target;
+                            rst_update_cached_priority(pid, cur);
                         } else {
                             /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
                             JPLOG(JP_ERR, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
@@ -7770,6 +7875,7 @@ int main(int argc, char *argv[]) {
                                 JPLOG(JP_INFO, "%-6s pid=%d %s %s %d->%d ok",
                                        "LOWER", (int)pid, proc_label_log(path), frag, (int)cur, (int)target);
                                 cur = target;
+                                rst_update_cached_priority(pid, cur);
                             } else {
                                 /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
                                 JPLOG(JP_ERR, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
@@ -7815,6 +7921,7 @@ int main(int argc, char *argv[]) {
                             applied_fill_identity(applied_find(pid), path, demote_frag, demote_target, 1, app_bid);
                             act_log_success(ACT_KIND_DEMOTE, pid, path, demote_frag, cur, demote_target);
                             cur = demote_target;
+                            rst_update_cached_priority(pid, cur);
                         } else {
                             /* errno 已被 set_priority 失败分支的日志调用污染，用 g_last_err_no */
                             JPLOG(JP_ERR, "%-6s pid=%d %s %s %d->%d FAIL errno=%d %s",
@@ -7834,6 +7941,7 @@ int main(int argc, char *argv[]) {
                             prev = NULL;           /* 指针已失效 */
                             int32_t old_cur = cur;
                             cur = BAND_BACKGROUND;
+                            rst_update_cached_priority(pid, cur);
                             JPLOG(JP_INFO, "%-6s pid=%d %s %d->%d ok",
                                    "RETURN", (int)pid, proc_label_log(path), (int)old_cur, BAND_BACKGROUND);
                         } else {
