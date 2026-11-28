@@ -376,6 +376,7 @@ enum { DIAG_OFF = 0, DIAG_BASIC = 1, DIAG_DETAILED = 2, DIAG_FULL = 3 };
 #define DSK_DAYMAX            "daymax"
 #define DSK_GLOBAL_CAP        "global_cap"
 #define DSK_QUEUE_FULL        "queue_full"
+#define DSK_SUSPENDED         "suspended"
 
 typedef struct {
     char   key[DIAG_DEDUP_KEY_SZ];
@@ -994,6 +995,9 @@ typedef struct {
     char    label[64];      /* proc_label 结果（日志/status 用） */
     char    bid[128];       /* 主 App Bundle ID（status 用） */
     char    frag[256];      /* 匹配的规则片段（act_log_success 去重/日志用） */
+    int      has_proc_start;/* v0.8.7: 1 = start_tvsec/usec 有效，供深睡醒后同实例核验 */
+    uint64_t start_tvsec;
+    uint64_t start_tvusec;
 } applied_t;
 static applied_t g_applied[MAX_APPLIED];
 static int g_napplied = 0;
@@ -1004,6 +1008,39 @@ static applied_t *applied_find(pid_t pid) {
     for (int i = 0; i < g_napplied; i++)
         if (g_applied[i].pid == pid) return &g_applied[i];
     return NULL;
+}
+
+static int jp_proc_start_read(pid_t pid, uint64_t *sec_out, uint64_t *usec_out) {
+    struct proc_bsdinfo bi;
+    memset(&bi, 0, sizeof(bi));
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) == (int)sizeof(bi)) {
+        if (sec_out) *sec_out = bi.pbi_start_tvsec;
+        if (usec_out) *usec_out = bi.pbi_start_tvusec;
+        return 0;
+    }
+    return -1;
+}
+
+static void applied_capture_proc_start(applied_t *a) {
+    if (!a || a->pid <= 0) return;
+    uint64_t sec = 0, usec = 0;
+    if (jp_proc_start_read(a->pid, &sec, &usec) == 0) {
+        a->start_tvsec = sec;
+        a->start_tvusec = usec;
+        a->has_proc_start = 1;
+    } else {
+        a->has_proc_start = 0;
+    }
+}
+
+/* v0.8.7 深睡唤醒同进程实例核验：
+ * iOS 的 CLOCK_MONOTONIC 在 AP 深度休眠期间继续走字，锁屏深睡 >4 分钟即超过 240s TTL。
+ * 若内核 proc_bsdinfo 启动时间与建账时一致，证明绝非 PID 复用，安全恢复归属新鲜度。 */
+static int applied_same_proc_instance(const applied_t *a) {
+    if (!a || !a->has_proc_start || a->pid <= 0) return 0;
+    uint64_t sec = 0, usec = 0;
+    if (jp_proc_start_read(a->pid, &sec, &usec) != 0) return 0;
+    return (sec == a->start_tvsec && usec == a->start_tvusec);
 }
 
 /* =========================================================================
@@ -1082,12 +1119,12 @@ static inline int jp_kill_allowed(int32_t natural_band) {
 }
 
 /* 归属判定可信条件：有明确来源（E1 身份缓存或旧实例 CLAIM）
- * 且本次 band 观察在 TTL 内；禁止仅凭数值相等推断"档位是我们设的"。
+ * 且本次 band 观察在 TTL 内（或深睡醒后经内核启动时间核验为同一进程实例）。
  * v0.8.6 A1: jp_natural_band 在其定义之前需要调用，故前置声明。 */
 static int jp_attribution_trusted(const applied_t *a, time_t now_mono);
 
 /* 自然档位回退链 sys_band -> orig -> cur（restart 与 bgkill 共用）。
- * 3.3: 每段快照过 TTL 才可用；过期/缺失时现读 cmd3 兜底，
+ * 3.3: 每段快照过 TTL 才可用；过期/缺失时现读兜底，
  * 现读失败才退回手头 cur（保守：cur 是我方 protect 值时门禁更严）。 */
 static int32_t jp_natural_band(pid_t pid, int32_t cur_now) {
     time_t now = applied_mono_now();
@@ -1118,26 +1155,28 @@ static void applied_note_sys_band(applied_t *a, int32_t cur) {
 
 /* 档位只读观察：仅在系统把档位漂移离己方设定值 (cur != band) 时记 sys_band，
  * 避免把自己设的 protect/demote 档位污染进自然档位门控；仍停留在己方设定档
- * (cur == band) 时仅在 TTL 内续期 band_seen_mono，既防稳态 >240s 后 LOWER/RETURN
- * 失灵，又保留休眠/停顿超时后的归属保护。 */
+ * (cur == band) 时在 TTL 内直接续期，若因 AP 深睡超 240s 则核验同进程启动时间后续期，
+ * 彻底杜绝夜间深睡 >4 分钟后 band_seen_mono 永久锁死过期。 */
 static void applied_observe_band(applied_t *a, int32_t cur) {
     if (!a) return;
     if (cur != a->band) {
         applied_note_sys_band(a, cur);
     } else {
         time_t now_m = applied_mono_now();
-        if (jp_snapshot_fresh(a->band_seen_mono, now_m)) {
+        if (jp_snapshot_fresh(a->band_seen_mono, now_m) ||
+            applied_same_proc_instance(a)) {
             a->band_seen_mono = now_m;
         }
     }
 }
 
 /* 归属判定可信条件：有明确来源（E1 身份缓存或旧实例 CLAIM）
- * 且本次 band 观察在 TTL 内；禁止仅凭数值相等推断"档位是我们设的"。 */
+ * 且本次 band 观察在 TTL 内，或经进程启动时间核验仍为同一进程实例。 */
 static int jp_attribution_trusted(const applied_t *a, time_t now_mono) {
     if (!a) return 0;
     if (!a->has_identity && !a->claim_origin) return 0;
-    return jp_snapshot_fresh(a->band_seen_mono, now_mono);
+    if (jp_snapshot_fresh(a->band_seen_mono, now_mono)) return 1;
+    return applied_same_proc_instance(a);
 }
 
 /* applied_set_ex:
@@ -1159,7 +1198,11 @@ static void applied_set_ex(pid_t pid, int32_t band, int32_t cur_before) {
         a->sys_band_seen_mono = now;
         a->claim_origin = 0;
         a->has_identity = 0;   /* E1: 身份缓存由慢轮调用点随后填充 */
+        a->has_proc_start = 0;
+        applied_capture_proc_start(a);
         g_applied_creates++;   /* E2: 空转判定（仅计数，不改既有语义） */
+    } else if (!a->has_proc_start) {
+        applied_capture_proc_start(a);
     }
     a->band = band;
     a->band_seen_mono = now;   /* T3-IMP 3.3: 归属判定新鲜度 */
@@ -1181,7 +1224,11 @@ static void applied_set(pid_t pid, int32_t band) {
         a->sys_band_seen_mono = now;
         a->claim_origin = 0;
         a->has_identity = 0;   /* E1: 同上 */
+        a->has_proc_start = 0;
+        applied_capture_proc_start(a);
         g_applied_creates++;   /* E2: 同上 */
+    } else if (!a->has_proc_start) {
+        applied_capture_proc_start(a);
     }
     a->band = band;
     a->band_seen_mono = now;
@@ -3254,6 +3301,7 @@ typedef struct {
     /* v0.8.7 APPMON: 纯内存前后台事件追踪字段，不进磁盘结构 */
     int     appmon_in_fg;           /* 1: BKSApplicationStateMonitor 最新回报在前台 */
     time_t  appmon_bg_pending_mono; /* 已收到切后台推送、待 XNU 档位跌落 <100 的起点；0=无 */
+    int     suspended_this_bg;      /* 1: 本后台段已确认内核挂起 (0x1)，跳过 pulse 并关快轮门控 */
 } pulse_app_state_t;
 
 #define PULSE_CTRL_APP_DAYMAX    10
@@ -3444,7 +3492,8 @@ static int diag_is_final_reason(const char *r) {
            strcmp(r, DSK_FP_BELOW_TARGET) == 0 ||
            strcmp(r, DSK_GONE) == 0 ||
            strcmp(r, DSK_CIRCUIT_COOLDOWN) == 0 ||
-           strcmp(r, DSK_CIRCUIT_ESCALATED) == 0;
+           strcmp(r, DSK_CIRCUIT_ESCALATED) == 0 ||
+           strcmp(r, DSK_SUSPENDED) == 0;
 }
 
 static void diag_skip_note(const char *bid, int bg_seq, const char *reason,
@@ -3626,10 +3675,24 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
         return 0;
     }
 
-    /* 每次进入后台最多做 1 次 pulse (与对照组二选一) (M5 / Q2)；本段已超时的不再尝试 (C2-T) */
-    if (st->pulsed_this_bg || st->ctrl_this_bg || st->pulse_late_this_bg) {
+    /* 每次进入后台最多做 1 次 pulse (与对照组二选一) (M5 / Q2)；本段已超时或已挂起不再尝试 (C2-T) */
+    if (st->pulsed_this_bg || st->ctrl_this_bg || st->pulse_late_this_bg ||
+        st->suspended_this_bg) {
         diag_skip_note(dbid, dseq, DSK_ALREADY_DONE, drnd, delp, (int)cur);
         return 0;
+    }
+
+    /* v0.8.7: 目标进程已被内核挂起 (kMemorystatusSuspended=0x1) 时用户态线程停摆，
+     * 注入内存压力水位无法触发 UIKit 释放缓存（只会空转 60s cpu_ms=1）；当场跳过并关门控。 */
+    {
+        int32_t live_prio = cur;
+        uint32_t live_state = 0;
+        if (jp_read_current_entry(pid, &live_prio, &live_state) == 0 &&
+            (live_state & JP_MEMSTAT_SUSPENDED) != 0) {
+            st->suspended_this_bg = 1;
+            diag_skip_note(dbid, dseq, DSK_SUSPENDED, drnd, delp, (int)live_prio);
+            return 0;
+        }
     }
 
     /* 条件 3: 当前 fp > target */
@@ -3678,7 +3741,8 @@ static int pulse_check_candidate(const pulse_rule_t *rule, pulse_app_state_t *st
     if (cooldown_hit || daymax_hit) {
         /* 满 delay 那一刻，因 n 或 daymax 跳过才记对照组；全局上限不记；每段后台最多 1 个 (Q2)
          * 仅标记候选，不在此处置 ctrl_this_bg；只有真正启动采样时才标记 (C2R2-N1) */
-        if (!global_hit && !st->pulsed_this_bg && !st->ctrl_this_bg && !st->pulse_late_this_bg &&
+        if (!global_hit && !st->pulsed_this_bg && !st->ctrl_this_bg &&
+            !st->pulse_late_this_bg && !st->suspended_this_bg &&
             st->ctrl_day_count < PULSE_CTRL_APP_DAYMAX &&
             g_pulse_ctrl_global_today_count < PULSE_CTRL_GLOBAL_DAYMAX) {
             if (out_skip_ctrl) *out_skip_ctrl = 1;
@@ -3758,6 +3822,23 @@ static int pulse_revalidate_conditions(pid_t pid, const char *bid, uint64_t *out
         return 0;
     }
     pthread_mutex_unlock(&s_pulse_mutex);
+
+    /* v0.8.7: 出队/worker 启动前复核内核挂起态，防入队后瞬间挂起导致空转 60s */
+    {
+        int32_t live_prio = -1;
+        uint32_t live_state = 0;
+        if (jp_read_current_entry(pid, &live_prio, &live_state) == 0 &&
+            (live_state & JP_MEMSTAT_SUSPENDED) != 0) {
+            pthread_mutex_lock(&s_pulse_mutex);
+            pulse_app_state_t *st_s = pulse_get_app_state(bid, today_str);
+            if (st_s && st_s->tracked_pid == pid) {
+                st_s->suspended_this_bg = 1;
+            }
+            pthread_mutex_unlock(&s_pulse_mutex);
+            diag_skip_note(dbid, dseq, DSK_SUSPENDED, drnd, delp, (int)live_prio);
+            return 0;
+        }
+    }
 
     uint64_t cur_fp = 0;
     if (pulse_get_footprint_mb(pid, &cur_fp) != 0) {
@@ -5551,6 +5632,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->pulsed_this_bg = 0;
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
+            st->suspended_this_bg = 0;
             st->diag_round = 0;
             st->diag_first_observe_s = -1;
             st->diag_gate_t_s = -1;
@@ -5583,6 +5665,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->pulsed_this_bg = 0;
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
+            st->suspended_this_bg = 0;
             st->diag_round = 0;             /* DIAG2: 内存观测字段清零 */
             st->diag_first_observe_s = -1;
             st->diag_gate_t_s = -1;
@@ -5616,6 +5699,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->pulsed_this_bg = 0;
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
+            st->suspended_this_bg = 0;
             st->tracked_pid = main_pid;
             st->diag_round = 0;             /* DIAG2 */
             st->diag_first_observe_s = -1;
@@ -5631,6 +5715,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->bg_lag_max = -1;         /* v0.8.6 B0 */
             st->ctrl_this_bg = 0;
             st->pulse_late_this_bg = 0;
+            st->suspended_this_bg = 0;
             st->tracked_pid = main_pid;
             st->diag_round = 0;             /* DIAG2 */
             st->diag_first_observe_s = -1;
@@ -5647,6 +5732,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
                 st->pulsed_this_bg = 0;
                 st->ctrl_this_bg = 0;
                 st->pulse_late_this_bg = 0;
+                st->suspended_this_bg = 0;
                 st->appmon_in_fg = 0;
                 st->appmon_bg_pending_mono = 0;
                 /* DIAG2: 新后台段：段序号+1，round 归零，band_in 快照，首观测=0 */
@@ -5659,6 +5745,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             } else if (!st->in_bg || st->bg_start_mono == 0) {
                 st->in_bg = 1;
                 st->pulse_late_this_bg = 0;
+                st->suspended_this_bg = 0;
                 st->appmon_in_fg = 0;
                 st->appmon_bg_pending_mono = 0;
                 /* v0.8.6 B0: bg_lag 由 first_bg_seen-last_fg_seen 得出，不再受 15s
@@ -5698,6 +5785,7 @@ static void pulse_round(memorystatus_priority_entry_t *list, int count) {
             st->bg_lag = -1;
             st->bg_lag_max = -1;         /* v0.8.6 B0 */
             st->pulse_late_this_bg = 0;
+            st->suspended_this_bg = 0;
             st->tracked_pid = main_pid;
             st->diag_round = 0;             /* DIAG2 */
             st->diag_first_observe_s = -1;
@@ -5890,7 +5978,7 @@ static int pulse_next_wait_ms(time_t now_mono, int default_secs, int *gate_open_
     for (int i = 0; i < g_npulse_app_states; i++) {
         pulse_app_state_t *st = &g_pulse_app_states[i];
         if (st->pulsed_this_bg || st->ctrl_this_bg || st->pulse_late_this_bg ||
-            st->restore_tripped_today) {
+            st->suspended_this_bg || st->restore_tripped_today) {
             st->appmon_bg_pending_mono = 0;
             continue;
         }
@@ -8018,6 +8106,7 @@ static void appmon_apply_single_event(const appmon_event_t *ev, const char *toda
                         pst->pulsed_this_bg = 0;
                         pst->ctrl_this_bg = 0;
                         pst->pulse_late_this_bg = 0;
+                        pst->suspended_this_bg = 0;
                         pst->diag_round = 0;
                         pst->diag_first_observe_s = -1;
                         pst->diag_gate_t_s = -1;
@@ -8045,6 +8134,7 @@ static void appmon_apply_single_event(const appmon_event_t *ev, const char *toda
                             pst->last_fg_seen_mono = ev->mono;
                             pst->first_bg_seen_mono = ev->mono;
                             pst->appmon_bg_pending_mono = ev->mono;
+                            pst->suspended_this_bg = 0;
                         } else if (!pst->in_bg) {
                             if (pst->tracked_pid == ev->pid && pst->first_bg_seen_mono <= 0) {
                                 pst->first_bg_seen_mono = ev->mono;
@@ -8143,11 +8233,8 @@ static void appmon_sync_rules(void) {
             }
         }
     }
-    if (!g_restart_cfg_file_absent) {
-        for (int i = 0; i < g_nrestart_rules; i++) {
-            appmon_add_unique_bid(next_bids, &n_next, g_restart_rules[i].bid);
-        }
-    }
+    /* v0.8.7: 仅在 restart.txt 中的慢周期规则（10~20 分钟级，如输入法宿主 com.tencent.wetype）
+     * 不需要毫秒级前后台推送，排除订阅以消除每次弹出键盘带来的无谓唤醒。 */
     for (int i = 0; i < g_nprotect; i++) {
         if (g_protect[i].is_bid && strncmp(g_protect[i].frag, "bid:", 4) == 0) {
             appmon_add_unique_bid(next_bids, &n_next, g_protect[i].frag + 4);

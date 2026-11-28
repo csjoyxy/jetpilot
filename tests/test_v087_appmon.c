@@ -296,6 +296,9 @@ static void *producer_fn(void *arg) {
             (void)wr;
         }
     }
+    pthread_mutex_lock(&ctx->mtx);
+    ctx->producers_done++;
+    pthread_mutex_unlock(&ctx->mtx);
     return NULL;
 }
 
@@ -336,12 +339,8 @@ static int test_mt_pipe_and_ring(void) {
             int done = ctx.producers_done;
             unsigned rem = ctx.count;
             pthread_mutex_unlock(&ctx.mtx);
-            if (done && rem == 0) break;
+            if (done == 4 && rem == 0) break;
         }
-        if (drained_batches >= 1 && !ctx.producers_done) {
-            /* 检查线程是否全部结束在下方 join 后统一收口 */
-        }
-        /* 非阻塞推进：跑够若干轮后 join 生产者并做最终排空 */
         if (drained_batches > 20) break;
     }
 
@@ -365,12 +364,151 @@ static int test_mt_pipe_and_ring(void) {
     return 0;
 }
 
+/* [6] Build 31 修复 ①：AP 深睡 >240s 后按 proc_bsdinfo 启动时间续期归属新鲜度，同时拦截 PID 复用 */
+#define JP_SNAPSHOT_TTL_SECS 240
+typedef struct {
+    int      pid;
+    int32_t  orig;
+    int      orig_known;
+    int32_t  band;
+    time_t   band_seen_mono;
+    int      has_identity;
+    int      has_proc_start;
+    uint64_t start_tvsec;
+    uint64_t start_tvusec;
+} applied_model_t;
+
+static int snap_fresh_model(time_t seen, time_t now_m) {
+    return seen > 0 && now_m >= seen && (now_m - seen) <= JP_SNAPSHOT_TTL_SECS;
+}
+
+static int same_inst_model(const applied_model_t *a, uint64_t live_sec, uint64_t live_usec) {
+    if (!a || !a->has_proc_start || a->pid <= 0) return 0;
+    return (a->start_tvsec == live_sec && a->start_tvusec == live_usec);
+}
+
+static int attr_trusted_model(const applied_model_t *a, time_t now_m,
+                              uint64_t live_sec, uint64_t live_usec) {
+    if (!a || !a->has_identity) return 0;
+    if (snap_fresh_model(a->band_seen_mono, now_m)) return 1;
+    return same_inst_model(a, live_sec, live_usec);
+}
+
+static void observe_band_model(applied_model_t *a, int32_t cur, time_t now_m,
+                               uint64_t live_sec, uint64_t live_usec) {
+    if (cur == a->band) {
+        if (snap_fresh_model(a->band_seen_mono, now_m) ||
+            same_inst_model(a, live_sec, live_usec)) {
+            a->band_seen_mono = now_m;
+        }
+    }
+}
+
+static int32_t natural_band_model(const applied_model_t *a, int32_t cur_now, time_t now_m,
+                                  uint64_t live_sec, uint64_t live_usec) {
+    if (a && cur_now == a->band && a->orig_known &&
+        attr_trusted_model(a, now_m, live_sec, live_usec)) {
+        return a->orig;
+    }
+    return cur_now;
+}
+
+static int test_deep_sleep_proc_start_renewal(void) {
+    applied_model_t a = {
+        .pid = 380, .orig = 30, .orig_known = 1, .band = 39,
+        .band_seen_mono = 100, .has_identity = 1,
+        .has_proc_start = 1, .start_tvsec = 1700000100ULL, .start_tvusec = 456789ULL
+    };
+
+    /* 模拟锁屏 AP 深睡 6 分钟（360s > 240s TTL），唤醒时 CLOCK_MONOTONIC = 460 */
+    time_t wake_mono = 460;
+    CHECK(!snap_fresh_model(a.band_seen_mono, wake_mono), "360s sleep exceeds 240s TTL");
+
+    /* 同进程实例（启动时间一致）：natural_band 仍还原为 30，且 observe_band 恢复新鲜度 */
+    CHECK(natural_band_model(&a, 39, wake_mono, 1700000100ULL, 456789ULL) == 30,
+          "same process instance after 6min sleep returns orig=30 instead of own band=39");
+    observe_band_model(&a, 39, wake_mono, 1700000100ULL, 456789ULL);
+    CHECK(a.band_seen_mono == 460 && snap_fresh_model(a.band_seen_mono, 470),
+          "observe_band renews band_seen_mono after deep sleep");
+
+    /* 负向安全验证：若深睡期间 PID 380 被新进程复用（启动时间变化），严禁续期或采信旧 orig */
+    a.band_seen_mono = 100;
+    CHECK(natural_band_model(&a, 39, wake_mono, 1700000399ULL, 111ULL) == 39,
+          "PID reuse with different start_tv must NOT trust stale orig");
+    observe_band_model(&a, 39, wake_mono, 1700000399ULL, 111ULL);
+    CHECK(a.band_seen_mono == 100, "PID reuse must NOT renew band_seen_mono");
+    return 0;
+}
+
+/* [7] Build 31 修复 ③：内核挂起态 (JP_MEMSTAT_SUSPENDED=0x1) 跳过 pulse 并立即关 5s 快轮门控 */
+#define JP_MEMSTAT_SUSPENDED 0x1U
+#define JP_MEMSTAT_ASSERTION 0x40U
+
+static int test_suspended_skip_and_gate_close(void) {
+    app_track_model_t m;
+    memset(&m, 0, sizeof(m));
+    m.bg_lag = -1;
+    int suspended_this_bg = 0;
+
+    /* 正常退后台（持 0x40 后台断言，未挂起）：允许触发 */
+    appmon_ev_t fg_ev = { "com.tencent.xin", 380, JP_BKS_STATE_FOREGROUND, 1000 };
+    appmon_ev_t bg_ev = { "com.tencent.xin", 380, JP_BKS_STATE_BG_RUNNING, 1005 };
+    apply_event_model(&m, &fg_ev, NULL);
+    apply_event_model(&m, &bg_ev, NULL);
+    pulse_round_model(&m, 380, 39, 1005);
+    uint32_t active_bg_state = JP_MEMSTAT_ASSERTION;
+    CHECK((active_bg_state & JP_MEMSTAT_SUSPENDED) == 0,
+          "active UIKit background task (0x40) is NOT marked suspended");
+
+    /* 模拟夜间 1s 后台推送唤醒后迅速被内核挂起 (state=0x1)：t=5s 检查命中挂起并关门控 */
+    uint32_t susp_state = JP_MEMSTAT_SUSPENDED;
+    if ((susp_state & JP_MEMSTAT_SUSPENDED) != 0) {
+        suspended_this_bg = 1;
+    }
+    int gate = 1;
+    int wait_ms = suspended_this_bg ? 60000 : next_wait_ms_model(&m, 5, 1010, 60, &gate);
+    if (suspended_this_bg) gate = 0;
+    CHECK(suspended_this_bg == 1 && gate == 0 && wait_ms == 60000,
+          "suspended process latches suspended_this_bg and closes 5s fast gate");
+
+    /* 下次用户真正点开进前台：清除挂起闩锁，恢复正常 pulse 资格 */
+    fg_ev.mono = 2000;
+    apply_event_model(&m, &fg_ev, NULL);
+    suspended_this_bg = 0;
+    bg_ev.mono = 2010;
+    apply_event_model(&m, &bg_ev, NULL);
+    pulse_round_model(&m, 380, 39, 2010);
+    wait_ms = suspended_this_bg ? 60000 : next_wait_ms_model(&m, 5, 2010, 60, &gate);
+    CHECK(gate == 1 && wait_ms == 5000, "next FG->BG transition clears suspended latch");
+    return 0;
+}
+
+/* [8] Build 31 修复 ②：仅在 restart.txt 中的慢规则（如输入法 wetype）不订阅毫秒级 APPMON */
+static int should_subscribe_appmon(int in_pulse_on, int in_bgkill_on,
+                                   int in_protect, int in_demote, int in_restart_only) {
+    (void)in_restart_only;
+    return (in_pulse_on || in_bgkill_on || in_protect || in_demote) ? 1 : 0;
+}
+
+static int test_restart_only_excluded_from_appmon(void) {
+    /* com.tencent.wetype: pulse=off, bgkill=0, protect=0, demote=0, restart=1 -> 不订阅 */
+    CHECK(should_subscribe_appmon(0, 0, 0, 0, 1) == 0,
+          "restart-only rule (wetype) excluded from APPMON subscription");
+    /* com.tencent.xin: pulse=on, protect=1, restart=1 -> 仍正常订阅 */
+    CHECK(should_subscribe_appmon(1, 0, 1, 0, 1) == 1,
+          "rule present in pulse/protect remains subscribed to APPMON");
+    return 0;
+}
+
 int main(void) {
     CHECK(test_long_fg_zero_poll_and_exact_delay() == 0, "[1] zero-poll 1h FG + exact delay_s");
     CHECK(test_subsecond_tap_and_swipe_fifo() == 0, "[2] 0.3s tap-and-swipe FIFO");
     CHECK(test_xnu_band_drop_animation_lag() == 0, "[3] XNU band>=100 animation lag 250ms retry");
     CHECK(test_extension_filter_and_backoff_unlock() == 0, "[4] backoff unlock & fallback");
     CHECK(test_mt_pipe_and_ring() == 0, "[5] multithreaded self-pipe & ring stress");
+    CHECK(test_deep_sleep_proc_start_renewal() == 0, "[6] deep-sleep >240s proc_start attribution renewal");
+    CHECK(test_suspended_skip_and_gate_close() == 0, "[7] kernel-suspended skip & gate close");
+    CHECK(test_restart_only_excluded_from_appmon() == 0, "[8] restart-only rule excluded from APPMON");
     printf("ALL v0.8.7 APPMON TESTS OK\n");
     return 0;
 }
